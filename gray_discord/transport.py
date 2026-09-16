@@ -12,16 +12,16 @@ def client():
 
 
 async def send(channel, text):
-    if not text.strip() or len(text) > 20000:
+    if not isinstance(text, str) or not text.strip() or len(text) > 20000:
         raise ValueError('Reply must contain 1–20000 characters')
     for chunk in split_message(text):
         await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def rest_send(config, text):
+    """REST only, with cleanup even when authentication or sending fails."""
     if not isinstance(text, str) or not text.strip() or len(text) > 20000:
         raise ValueError('Content must contain 1–20000 characters')
-    # login initializes only REST. No connect()/start(): no second gateway.
     async with client() as bot:
         await bot.login(config['token'])
         channel = await bot.fetch_channel(int(config['channel_id']))
