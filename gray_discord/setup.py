@@ -2,6 +2,7 @@
 import asyncio
 import getpass
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,11 +19,13 @@ async def setup(path):
     if not sys.stdin.isatty() or not sys.stderr.isatty():
         raise ValueError('Setup needs a terminal for hidden token input')
     if path.exists() and input('Replace existing configuration? [y/N] ').lower() != 'y':
-        return
-    gray = shutil.which(input('gray binary [gray]: ').strip() or 'gray')
+        return False
+    default_gray = os.environ.get('GRAY_BIN', 'gray')
+    gray = shutil.which(input(f'gray binary [{default_gray}]: ').strip() or default_gray)
     if not gray:
         raise ValueError('Install gray first; executable not found')
-    gray_home = Path(input('Gray provider home [~/.gray]: ').strip() or '~/.gray').expanduser().resolve()
+    default_home = os.environ.get('GRAY_HOME', '~/.gray')
+    gray_home = Path(input(f'Gray provider home [{default_home}]: ').strip() or default_home).expanduser().resolve()
     provider = json.loads((gray_home / 'config.json').read_text())
     if not provider.get('model'):
         raise ValueError('Configure a model in gray before setup')
@@ -66,4 +69,5 @@ async def setup(path):
     save_config(path, dict(token=token, owner_id=owner, channel_id=channel,
                            gray_bin=str(Path(gray).absolute()), gray_home=str(gray_home),
                            workdir=str(path.parent.resolve())))
-    print('Configuration saved privately. Run gray-discord doctor, then gray-discord install.')
+    print('Configuration saved privately.')
+    return True

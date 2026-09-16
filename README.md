@@ -15,10 +15,9 @@ Requires a working Python 3.11+, gray on PATH, and gray's provider/model already
 configured in `~/.gray/config.json`. Use a separate Discord bot application.
 
 ```sh
-pipx install git+https://github.com/vstaln/gray-discord-plugin.git
-gray-discord setup
-gray-discord doctor
-gray-discord install
+gray install plugin discord
+gray discord setup
+gray discord status
 ```
 
 Setup reads the bot token with hidden terminal input, validates it, prints an
@@ -38,31 +37,34 @@ For operation after logout/reboot, enable user lingering if permitted:
 
 ```sh
 loginctl enable-linger "$USER"
-gray-discord status
-gray-discord restart
-gray-discord stop
+gray discord status
+gray discord restart
+gray discord stop
 # Or run in the foreground without systemd:
-gray-discord run
+gray discord run
 ```
 
 No inbound port is opened. Do not run a second instance with the same config.
 Different configurations using the same token are not protected by this lock.
 
-## Install the outgoing tool into gray
+## Outgoing tool registration
 
 ```sh
-gray-discord register
+gray discord register
 ```
 
-This registers a protocol-1.1 stdio sidecar in gray's existing plugin lock,
+Setup does this automatically; the command above can repeat it. It registers a protocol-1.1 stdio sidecar in gray's existing plugin lock,
 preserving other entries. Restart existing gray sessions. `discord_send`
 accepts `{ "content": "hello" }` and only sends to the configured destination;
 it does not open a gateway connection. Its calls do not require the background
 service to be running. Long messages are split, with all mentions suppressed.
 
-**Current host limitation:** `gray discord setup` is not implemented in gray.
-Use `gray-discord setup`. The host's Git importer extracts skills rather than
-installing this Python executable; use pipx above, not `gray plugin install`.
+Requires a gray build with catalog installation and plugin command dispatch.
+Older releases that reject `gray install` must be upgraded first. Gray creates
+a private venv and installs the catalog's pinned source; Python's venv/pip support
+and Git must be available. No global Python packages or separate CLI are required.
+Setup automatically registers the outgoing tool and offers to enable/start the
+background service. Declining service startup leaves foreground use available.
 
 ## Scheduled messages
 
@@ -71,11 +73,11 @@ to your home channel. Stop the service to edit schedules (the command refuses
 concurrent writes). Intervals are seconds, minimum 60.
 
 ```sh
-gray-discord stop
-gray-discord schedule add --every 3600 'Check the public project status and give a short update.'
-gray-discord schedule list
-gray-discord schedule remove JOB_ID
-gray-discord restart
+gray discord stop
+gray discord schedule add --every 3600 'Check the public project status and give a short update.'
+gray discord schedule list
+gray discord schedule remove JOB_ID
+gray discord restart
 ```
 
 Jobs persist next-run time and `scheduled/running/sent/failed` status. The

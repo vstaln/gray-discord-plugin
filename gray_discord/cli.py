@@ -14,7 +14,7 @@ from . import service
 
 
 def parser():
-    p = argparse.ArgumentParser(prog='gray-discord')
+    p = argparse.ArgumentParser(prog='gray discord')
     p.add_argument('--config', type=Path, default=default_path())
     sub = p.add_subparsers(dest='command', required=True)
     for name in ('setup', 'run', 'sidecar', 'register', 'install', 'status', 'stop', 'restart', 'doctor', 'uninstall'):
@@ -74,7 +74,15 @@ def main():
     try:
         if args.command == 'setup':
             from .setup import setup
-            asyncio.run(setup(path))
+            if asyncio.run(setup(path)):
+                register(load_config(path), path)
+                print('Outgoing tool registered with gray.')
+                if input('Enable and start the background service now? [Y/n] ').strip().lower() in ('', 'y', 'yes'):
+                    service.install(path)
+                    print('Service enabled. Run gray discord status to check it.')
+                    print('For operation after logout: loginctl enable-linger "$USER"')
+                else:
+                    print('Run gray discord install when ready, or gray discord run in the foreground.')
         elif args.command == 'sidecar':
             from .sidecar import serve
             serve(path)
