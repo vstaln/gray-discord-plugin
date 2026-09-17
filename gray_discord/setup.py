@@ -29,6 +29,15 @@ async def setup(path):
     provider = json.loads((gray_home / 'config.json').read_text())
     if not provider.get('model'):
         raise ValueError('Configure a model in gray before setup')
+    from .budget import validate
+    print('Set a daily allowance and conservative model prices. Unknown pricing is not free.')
+    print('Client limits stop subsequent requests; configure provider-side caps for a hard invoice limit.')
+    policy = dict(model=provider['model'],
+                  daily_usd=input('Daily budget USD: ').strip(),
+                  turn_usd=input('Per-turn budget USD: ').strip(),
+                  input_per_million=input('Input USD per million tokens (0 only if genuinely free): ').strip(),
+                  output_per_million=input('Output USD per million tokens (include reasoning): ').strip())
+    validate(policy, provider['model'])
     token = getpass.getpass('Discord BOT token (hidden): ').strip()
     async with client() as bot:
         await asyncio.wait_for(bot.login(token), 30)
@@ -66,7 +75,7 @@ async def setup(path):
     channel = input(f'Home channel ID [your DM: {dm}]: ').strip() or dm
     if not snowflake(channel):
         raise ValueError('Invalid channel ID')
-    save_config(path, dict(token=token, owner_id=owner, channel_id=channel,
+    save_config(path, dict(token=token, owner_id=owner, channel_id=channel, budget=policy,
                            gray_bin=str(Path(gray).absolute()), gray_home=str(gray_home),
                            workdir=str(path.parent.resolve())))
     print('Configuration saved privately.')

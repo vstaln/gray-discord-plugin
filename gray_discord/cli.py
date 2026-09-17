@@ -1,7 +1,6 @@
 """Self-service entry point. No AI or credentials in command-line arguments."""
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import signal
@@ -9,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from .config import default_path, load_config, atomic_json
+from .config import default_path, load_config, atomic_json, save_config
 from . import service
 
 
@@ -19,6 +18,24 @@ def parser():
     sub = p.add_subparsers(dest='command', required=True)
     for name in ('setup', 'run', 'sidecar', 'register', 'install', 'status', 'stop', 'restart', 'doctor', 'uninstall'):
         sub.add_parser(name)
+    limits = sub.add_parser('limits')
+    limits.add_argument('--timeout-seconds', type=int)
+    limits.add_argument('--concurrency', type=int)
+    limits.add_argument('--max-requests', type=int)
+    budget = sub.add_parser('budget').add_subparsers(dest='action', required=True)
+    budget.add_parser('status')
+    set_budget = budget.add_parser('set')
+    for flag in ('daily-usd', 'turn-usd', 'input-per-million', 'output-per-million'):
+        set_budget.add_argument('--' + flag, type=float, required=True)
+    share = sub.add_parser('share')
+    share.add_argument('--skill', action='append', default=[])
+    share.add_argument('--context', action='append', default=[])
+    share.add_argument('--plugin-argv', action='append', default=[], help='JSON argv array, e.g. ["python3","-m","memory_plugin"]')
+    share.add_argument('--clear', action='store_true')
+    queue = sub.add_parser('queue').add_subparsers(dest='action', required=True)
+    queue.add_parser('list')
+    cancel = queue.add_parser('cancel')
+    cancel.add_argument('id')
     jobs = sub.add_parser('schedule').add_subparsers(dest='action', required=True)
     add = jobs.add_parser('add')
     add.add_argument('--every', required=True, type=int, help='Interval in seconds (minimum 60)')
@@ -93,7 +110,37 @@ def main():
             print('Service removed. Private configuration and sessions retained; registered outgoing tool retained.')
         else:
             config = load_config(path)
-            if args.command == 'register':
+            if args.command == 'share':
+                from .capabilities import prepare
+                import tempfile
+                if args.clear:
+                    for key in ('shared_skills', 'shared_context', 'shared_plugins'):
+                        config[key] = []
+                config['shared_skills'] = list(dict.fromkeys(config.get('shared_skills', []) + args.skill))
+                config['shared_context'] = list(dict.fromkeys(config.get('shared_context', []) + args.context))
+                config['shared_plugins'] = config.get('shared_plugins', []) + [json.loads(value) for value in args.plugin_argv]
+                with tempfile.TemporaryDirectory() as tmp:
+                    prepare(config, Path(tmp))
+                save_config(path, config)
+                print('Shared capabilities saved. Only select trusted code/non-secret context. Restart to apply.')
+            elif args.command == 'limits':
+                for key in ('timeout_seconds', 'concurrency', 'max_requests'):
+                    if getattr(args, key) is not None:
+                        config[key] = getattr(args, key)
+                save_config(path, config)
+                print('Limits saved; restart the gateway to apply.')
+            elif args.command == 'budget':
+                from .budget import Budget
+                if args.action == 'set':
+                    provider = json.loads((Path(config['gray_home']) / 'config.json').read_text())
+                    config['budget'] = dict(model=provider.get('model'), daily_usd=args.daily_usd,
+                        turn_usd=args.turn_usd, input_per_million=args.input_per_million,
+                        output_per_million=args.output_per_million)
+                    save_config(path, config)
+                    print('Budget saved for selected model; restart the gateway to apply.')
+                else:
+                    print('Accounted/reserved micro-USD:', Budget(path.parent/'budget.sqlite').total())
+            elif args.command == 'register':
                 register(config, path)
                 print('Outgoing tool registered. Restart existing gray sessions to load it.')
             elif args.command == 'install':
@@ -108,30 +155,24 @@ def main():
                     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
                     await run(config, path)
                 asyncio.run(start())
-            elif args.command == 'schedule':
-                from .gateway import jobs_path, jobs_read
-                with (path.parent / 'gateway.lock').open('a') as lock:
-                    try:
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        raise ValueError('Stop the plugin before editing/listing schedules') from None
-                    jobs = jobs_read(jobs_path(path))
-                    if args.action == 'add':
-                        if args.every < 60 or not args.prompt.strip() or len(args.prompt) > 32000:
-                            raise ValueError('Interval must be >=60s and prompt 1–32000 characters')
-                        job = dict(id=uuid.uuid4().hex, interval=args.every, prompt=args.prompt,
-                                   next_at=time.time() + args.every, status='scheduled')
-                        jobs.append(job)
-                        atomic_json(jobs_path(path), jobs)
-                        print(job['id'])
-                    elif args.action == 'remove':
-                        remaining = [job for job in jobs if job['id'] != args.id]
-                        if len(remaining) == len(jobs):
-                            raise ValueError('Schedule not found')
-                        atomic_json(jobs_path(path), remaining)
+            elif args.command in ('schedule', 'queue'):
+                from .gateway import open_store
+                store = open_store(path)
+                if args.command == 'queue':
+                    if args.action == 'cancel':
+                        store.cancel(args.id)
                     else:
-                        for job in jobs:
-                            print(job['id'], job['interval'], job['status'])
+                        for item in store.items():
+                            print(item['id'], item['channel'], item['state'], item['error'] or '')
+                elif args.action == 'add':
+                    job_id = uuid.uuid4().hex
+                    store.schedule_add(job_id, args.every, args.prompt)
+                    print(job_id)
+                elif args.action == 'remove':
+                    store.schedule_remove(args.id)
+                else:
+                    for job in store.schedules():
+                        print(job['id'], job['interval'], job['status'])
     except (KeyboardInterrupt, asyncio.CancelledError):
         return
     except Exception as exc:

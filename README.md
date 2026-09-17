@@ -5,7 +5,11 @@ its own setup wizard and background service. Public source, no Discord code
 added to gray. Uses discord.py like Hermes and ports selected Hermes helpers
 and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
 
-**Status: experimental text-only release.** Offline tests and real-gray
+**Status: isolated runtime-reliability development branch.** Requires the matching
+gray core `--json` implementation; do not upgrade an active service independently.
+See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
+
+**Experimental text-only integration.** Offline tests and real-gray
 session integration pass. Live Discord login, interactive pairing, and
 systemd deployment have not been exercised by the author in this release.
 
@@ -69,15 +73,13 @@ background service. Declining service startup leaves foreground use available.
 ## Scheduled messages
 
 Plugin-owned interval jobs run the real gray agent and deliver its final reply
-to your home channel. Stop the service to edit schedules (the command refuses
-concurrent writes). Intervals are seconds, minimum 60.
+to your home channel. Schedule edits are transactional and work while the service
+is running. Intervals are seconds, minimum 60.
 
 ```sh
-gray discord stop
 gray discord schedule add --every 3600 'Check the public project status and give a short update.'
 gray discord schedule list
 gray discord schedule remove JOB_ID
-gray discord restart
 ```
 
 Jobs persist next-run time and `scheduled/running/sent/failed` status. The
@@ -95,15 +97,19 @@ Tools run on the server, not your desktop. This is **not a sandbox**: allowliste
 users and model tool execution have the OS user's permissions. Prefer a dedicated
 unprivileged service account; do not give it broad SSH/cloud credentials.
 
-A per-conversation file lock prevents overlapping turns; the gateway admits at
-most two chat turns plus one scheduled turn. Each child has a 600-second deadline;
-timeout/shutdown kills its process group. This is not a dollar spending limit.
-Only assistant text from the completed saved turn is delivered—no CLI stdout,
-reasoning or tool output. Failed commands are not automatically retried.
+Accepted messages and outgoing replies are persisted in a transactional queue.
+Agent execution and delivery retries are separate; uncertain interrupted work
+is never automatically rerun. Deadlines/concurrency/model-call limits are
+configurable, and the gateway requires explicit model prices and spending
+allowances. These are client accounting controls, not provider invoice guarantees.
+The runner reads structured results rather than searching session JSONL.
 
-This is conversation history, **not semantic long-term memory**. Existing desktop
-skills/memories are not copied. Voice, attachments, slash-command UI, streaming
-edits, startup message backfill and full Hermes parity are not included.
+Use `gray discord share` for explicitly selected skills, non-secret context and
+memory sidecars. Conversation histories remain isolated. Large compacted histories
+are archived without removing the original. See [runtime details](docs/RUNTIME.md)
+for exactly-once delivery limitations, unbounded archive retention, and the
+still-separate native cron scheduler. Voice, attachments and full Hermes parity
+are not included.
 
 `doctor` checks token, intent, channel permissions and local gray configuration;
 it does not test provider generation or prove gateway connectivity.

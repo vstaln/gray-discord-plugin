@@ -60,14 +60,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await run_gray(config,path,'chat:one','Remember a violet bicycle',timeout=40),'LOCAL-MARKER')
                 self.assertEqual(await run_gray(config,path,'chat:one','What did I ask you to remember?',timeout=40),'LOCAL-MARKER')
                 self.assertEqual(await run_gray(config,path,'chat:two','A different conversation',timeout=40),'LOCAL-MARKER')
-                self.assertEqual(len(requests),3)
+                self.assertEqual(await run_gray(config,path,'chat:redacted','API_KEY=fixture-sensitive-123456789',timeout=40),'LOCAL-MARKER')
+                self.assertEqual(len(requests),4)
                 def text(request):
                     return json.dumps([m for m in request['messages'] if m['role']!='system'])
                 self.assertIn('Remember a violet bicycle',text(requests[1]))
                 self.assertIn('LOCAL-MARKER',text(requests[1]))
                 self.assertNotIn('Remember a violet bicycle',text(requests[2]))
                 sessions=list((root/'conversations').glob('*/sessions/*.jsonl'))
-                self.assertEqual(len(sessions),2)
+                self.assertEqual(len(sessions),3)
         finally:
             server.close()
             await server.wait_closed()

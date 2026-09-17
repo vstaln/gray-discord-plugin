@@ -38,6 +38,14 @@ def validate_config(data):
     for key in ('gray_bin', 'gray_home', 'workdir'):
         if not isinstance(data.get(key), str) or not Path(data[key]).is_absolute():
             raise ValueError(f'{key} must be an absolute path')
+    for key, low, high in [('timeout_seconds', 1, 86400), ('concurrency', 1, 16),
+                           ('max_requests', 1, 1000), ('queue_capacity', 1, 100000)]:
+        if key in data and (type(data[key]) is not int or not low <= data[key] <= high):
+            raise ValueError(f'{key} must be an integer between {low} and {high}')
+    if 'budget' in data:
+        from .budget import validate
+        policy = data['budget']
+        validate(policy, policy.get('model') if isinstance(policy, dict) else None)
     return data
 
 
