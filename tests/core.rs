@@ -70,3 +70,47 @@ fn pairing_expires_and_consumes_once() {
     let qc = q.code.clone();
     assert!(!q.accept(&qc, 301.0));
 }
+
+#[test]
+fn slash_admission_checks_owner_and_allowlist() {
+    let allowed = vec!["777".to_string()];
+    // owner can invoke /ask with prompt
+    assert_eq!(
+        policy::slash_admission("123", "123", &allowed, "ask", Some("hello")),
+        Some("hello".into())
+    );
+    // allowed user can invoke /ask with trimmed prompt
+    assert_eq!(
+        policy::slash_admission("777", "123", &allowed, "ask", Some("  what is this  ")),
+        Some("what is this".into())
+    );
+    // unauthorized user rejected
+    assert_eq!(
+        policy::slash_admission("999", "123", &allowed, "ask", Some("hello")),
+        None
+    );
+    // /ask without prompt or empty prompt rejected
+    assert_eq!(
+        policy::slash_admission("123", "123", &allowed, "ask", None),
+        None
+    );
+    assert_eq!(
+        policy::slash_admission("123", "123", &allowed, "ask", Some("   ")),
+        None
+    );
+    // /reset, /status, /stop admitted for allowed users
+    for cmd in ["reset", "status", "stop"] {
+        assert_eq!(
+            policy::slash_admission("123", "123", &allowed, cmd, None),
+            Some(cmd.into())
+        );
+        assert_eq!(
+            policy::slash_admission("777", "123", &allowed, cmd, None),
+            Some(cmd.into())
+        );
+        assert_eq!(
+            policy::slash_admission("999", "123", &allowed, cmd, None),
+            None
+        );
+    }
+}

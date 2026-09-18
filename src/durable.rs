@@ -27,6 +27,12 @@ pub struct OutboxPart {
     pub content: String,
     pub channel: String,
     pub attempts: i64,
+    /// Slash followup routing (Task 9): `Some` when the row was enqueued from
+    /// `/ask`. The production deliver closure sends these via the interaction
+    /// webhook (`Rest::followup`) instead of the channel (`Rest::send`).
+    pub interaction_token: Option<String>,
+    /// Application id paired with `interaction_token` for webhook followups.
+    pub app_id: Option<String>,
 }
 
 /// One row of the `queue list` view.
@@ -135,6 +141,10 @@ fn row_item(r: &rusqlite::Row) -> Result<InboxItem, rusqlite::Error> {
 }
 
 /// Transactional inbox/outbox/schedule store.
+///
+/// `Clone` is cheap (path only — every method opens a fresh connection), so
+/// the gateway event loop and worker tasks can share one store handle.
+#[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
 }
@@ -325,12 +335,12 @@ impl Store {
     pub fn next_delivery(&self, now: f64) -> Result<Option<OutboxPart>, String> {
         with_conn(&self.path, |db| {
             db.query_row(
-                "SELECT o.id,o.part,o.content,i.channel,o.attempts FROM outbox o JOIN inbox i ON i.id=o.id
+                "SELECT o.id,o.part,o.content,i.channel,o.attempts,i.interaction_token,i.app_id FROM outbox o JOIN inbox i ON i.id=o.id
                  WHERE message_id IS NULL AND next_at<=?1 AND NOT EXISTS
                  (SELECT 1 FROM outbox p WHERE p.id=o.id AND p.part<o.part AND p.message_id IS NULL)
                  ORDER BY i.created,o.part LIMIT 1",
                 params![now],
-                |r| Ok(OutboxPart { id: r.get(0)?, part: r.get(1)?, content: r.get(2)?, channel: r.get(3)?, attempts: r.get(4)? }),
+                |r| Ok(OutboxPart { id: r.get(0)?, part: r.get(1)?, content: r.get(2)?, channel: r.get(3)?, attempts: r.get(4)?, interaction_token: r.get(5)?, app_id: r.get(6)? }),
             ).optional_str()
         })
     }
@@ -424,6 +434,66 @@ impl Store {
                 return Err("Schedule not found".to_string());
             }
             Ok(())
+        })
+    }
+
+    /// Read a `meta` key (slash-command sync hash lives here).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, String> {
+        with_conn(&self.path, |db| {
+            db.query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional_str()
+        })
+    }
+
+    /// Upsert a `meta` key.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store meta".to_string())
+        })
+    }
+
+    /// Attach slash followup routing to an enqueued row (`/ask` path).
+    pub fn set_interaction(&self, id: &str, token: &str, app_id: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "UPDATE inbox SET interaction_token=?1,app_id=?2 WHERE id=?3",
+                params![token, app_id, id],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store interaction".to_string())
+        })
+    }
+
+    /// Flag the running row of `conversation` for cancellation (`/stop`).
+    /// Returns true when a running turn was flagged.
+    pub fn cancel_conversation(&self, conversation: &str) -> Result<bool, String> {
+        with_conn(&self.path, |db| {
+            let n = db
+                .execute(
+                    "UPDATE inbox SET cancel=1 WHERE conversation=?1 AND state='running'",
+                    params![conversation],
+                )
+                .map_err(|_| "cannot cancel".to_string())?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Queued + running + delivery rows (`/status` queue depth).
+    pub fn pending_count(&self) -> Result<i64, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                "SELECT count(*) FROM inbox WHERE state IN ('queued','running','delivery')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| "cannot count queue".to_string())
         })
     }
 
@@ -536,7 +606,7 @@ pub(crate) fn cap_chunks(chunks: Vec<String>, dropped_chars: usize) -> Vec<Strin
     kept
 }
 
-fn now_secs() -> f64 {
+pub fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())

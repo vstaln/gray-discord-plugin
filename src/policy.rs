@@ -16,7 +16,7 @@ pub fn incoming(
     if owner.is_empty() || bot {
         return None;
     }
-    if author != owner && !allowed.iter().any(|id| id == author) {
+    if !is_allowed_user(author, owner, allowed) {
         return None;
     }
     let mut cleaned = text.to_string();
@@ -33,6 +33,43 @@ pub fn incoming(
         return None;
     }
     Some(cleaned)
+}
+
+/// Check if an author is authorized (owner or in allowed_users list).
+pub fn is_allowed_user(author: &str, owner: &str, allowed: &[String]) -> bool {
+    if owner.is_empty() || author.is_empty() {
+        return false;
+    }
+    author == owner || allowed.iter().any(|id| id == author)
+}
+
+/// Admit one slash command invocation.
+///
+/// Sender must be owner or in `allowed_users`.
+/// For `/ask`, requires a non-empty string prompt and returns `Some(prompt)`.
+/// For `/reset`, `/status`, and `/stop`, returns `Some(cmd_name)`.
+pub fn slash_admission(
+    user_id: &str,
+    owner_id: &str,
+    allowed: &[String],
+    command_name: &str,
+    prompt: Option<&str>,
+) -> Option<String> {
+    if !is_allowed_user(user_id, owner_id, allowed) {
+        return None;
+    }
+    match command_name {
+        "ask" => {
+            let p = prompt?.trim();
+            if p.is_empty() {
+                None
+            } else {
+                Some(p.to_string())
+            }
+        }
+        "reset" | "status" | "stop" => Some(command_name.to_string()),
+        _ => None,
+    }
 }
 
 /// One-shot local pairing code (Hermes-inspired). Single-use, 300 s expiry.

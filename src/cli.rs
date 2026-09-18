@@ -221,6 +221,13 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             }
             Ok(())
         }
+        Command::Run => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "cannot start gateway runtime".to_string())?;
+            rt.block_on(crate::gateway::run(config_path))
+        }
         _ => Err("not yet implemented".to_string()),
     }
 }
