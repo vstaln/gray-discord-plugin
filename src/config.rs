@@ -1,11 +1,115 @@
-//! Port of gray_discord/config.py — see implementation plan Task list.
-use std::path::PathBuf;
+//! Port of gray_discord/config.py: private config load/save/validate.
+//! Errors never contain config values.
+use serde_json::Value;
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
-/// Default config path: ~/.config/gray-discord/config.json (Task 1 stub;
-/// full module with validation lands in Task 2).
+/// Default config path: ~/.config/gray-discord/config.json.
 pub fn default_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".config/gray-discord/config.json")
+}
+
+/// Write JSON (pretty + trailing newline) atomically: parents 0700,
+/// temp file + rename, replacement mode 0600.
+pub fn atomic_json(path: &Path, data: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|_| "cannot create config directory".to_string())?;
+        }
+    }
+    let mut text =
+        serde_json::to_string_pretty(data).map_err(|_| "cannot encode config".to_string())?;
+    text.push('\n');
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, text.as_bytes()).map_err(|_| "cannot write config".to_string())?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot protect config".to_string())?;
+    fs::rename(&tmp_path, path).map_err(|_| "cannot replace config".to_string())?;
+    Ok(())
+}
+
+/// Discord snowflake: ASCII digits, 0 < n < 2^64.
+pub fn snowflake(v: &Value) -> bool {
+    match v.as_str() {
+        Some(s) => {
+            !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && s.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
+fn int_in(data: &Value, key: &str, low: u64, high: u64) -> Result<(), String> {
+    if let Some(v) = data.get(key) {
+        let ok = v.as_u64().is_some_and(|n| (low..=high).contains(&n));
+        if !ok {
+            return Err(format!("{key} must be an integer between {low} and {high}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a config object. Error texts match config.py verbatim.
+pub fn validate_config(data: &Value) -> Result<(), String> {
+    if !data.is_object() {
+        return Err("Configuration must be an object".to_string());
+    }
+    match data.get("token").and_then(Value::as_str) {
+        Some(t) if !t.trim().is_empty() => {}
+        _ => return Err("Bot token is missing; run setup".to_string()),
+    }
+    for key in ["owner_id", "channel_id"] {
+        if !data.get(key).is_some_and(snowflake) {
+            return Err(format!("{key} must be a Discord ID"));
+        }
+    }
+    if let Some(users) = data.get("allowed_users") {
+        let ok = users.as_array().is_some_and(|a| a.iter().all(snowflake));
+        if !ok {
+            return Err("allowed_users must be an array of Discord IDs".to_string());
+        }
+    }
+    for key in ["gray_bin", "gray_home", "workdir"] {
+        let ok = data
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| Path::new(s).is_absolute());
+        if !ok {
+            return Err(format!("{key} must be an absolute path"));
+        }
+    }
+    int_in(data, "timeout_seconds", 1, 86400)?;
+    int_in(data, "concurrency", 1, 16)?;
+    int_in(data, "max_requests", 1, 1000)?;
+    int_in(data, "queue_capacity", 1, 100000)?;
+    if let Some(policy) = data.get("budget") {
+        let model = policy.get("model").and_then(Value::as_str).unwrap_or("");
+        crate::budget::validate(policy, model)?;
+    }
+    Ok(())
+}
+
+/// Load + validate. Any IO/parse failure maps to the setup hint.
+pub fn load_config(path: &Path) -> Result<Value, String> {
+    let data: Value = fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| "Configuration missing or invalid; run setup".to_string())?;
+    validate_config(&data)?;
+    Ok(data)
+}
+
+/// Validate + atomic save.
+pub fn save_config(path: &Path, data: &Value) -> Result<(), String> {
+    validate_config(data)?;
+    atomic_json(path, data)
 }

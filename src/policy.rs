@@ -1,1 +1,124 @@
-//! Port of gray_discord/policy.py — see implementation plan Task list.
+//! Port of gray_discord/policy.py: owner/allowlist admission + one-shot pairing.
+use std::hint::black_box;
+
+/// Admit one inbound message. Returns the cleaned prompt, or `None` to drop:
+/// unknown/empty owner, bots, non-allowlisted senders, guild messages without
+/// an @mention of the bot, and empty text after mention-stripping.
+pub fn incoming(
+    author: &str,
+    owner: &str,
+    bot: bool,
+    dm: bool,
+    text: &str,
+    bot_id: &str,
+    allowed: &[String],
+) -> Option<String> {
+    if owner.is_empty() || bot {
+        return None;
+    }
+    if author != owner && !allowed.iter().any(|id| id == author) {
+        return None;
+    }
+    let mut cleaned = text.to_string();
+    if !dm {
+        let plain = format!("<@{bot_id}>");
+        let nick = format!("<@!{bot_id}>");
+        if !text.contains(&plain) && !text.contains(&nick) {
+            return None;
+        }
+        cleaned = cleaned.replace(&plain, "").replace(&nick, "");
+    }
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// One-shot local pairing code (Hermes-inspired). Single-use, 300 s expiry.
+pub struct Pairing {
+    pub code: String,
+    pub expires: f64,
+    pub used: bool,
+}
+
+impl Pairing {
+    pub fn new(now: f64) -> Self {
+        Self {
+            code: random_code(),
+            expires: now + 300.0,
+            used: false,
+        }
+    }
+
+    pub fn accept(&mut self, text: &str, now: f64) -> bool {
+        if self.used || now >= self.expires || !constant_eq(text, &self.code) {
+            return false;
+        }
+        self.used = true;
+        true
+    }
+}
+
+/// 18 random bytes, base64url without padding — like secrets.token_urlsafe(18).
+fn random_code() -> String {
+    let mut buf = [0u8; 18];
+    let mut ok = false;
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            ok = f.read_exact(&mut buf).is_ok();
+        }
+    }
+    if !ok {
+        // Degraded entropy path (no OS RNG readable): hash pid + time so the
+        // code is still unpredictable to a remote peer. Documented fallback.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(std::process::id().to_be_bytes());
+        h.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        let d = h.finalize();
+        buf.copy_from_slice(&d[..18]);
+    }
+    base64_nopad(&buf)
+}
+
+fn base64_nopad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(24);
+    for chunk in bytes.chunks(3) {
+        let mut n: u32 = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            n |= (b as u32) << (16 - 8 * i);
+        }
+        let chars = match chunk.len() {
+            3 => 4,
+            2 => 3,
+            _ => 2,
+        };
+        for i in 0..chars {
+            out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Constant-time string equality: no early exit on first mismatch.
+fn constant_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= black_box(a[i] ^ b[i]);
+    }
+    black_box(diff) == 0
+}

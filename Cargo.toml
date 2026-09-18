@@ -32,3 +32,4 @@ twilight-model = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
