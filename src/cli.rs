@@ -228,6 +228,258 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .map_err(|_| "cannot start gateway runtime".to_string())?;
             rt.block_on(crate::gateway::run(config_path))
         }
-        _ => Err("not yet implemented".to_string()),
+        Command::Status => crate::service::control(&["status", crate::service::NAME]),
+        Command::Stop => crate::service::control(&["stop", crate::service::NAME]),
+        Command::Restart => crate::service::control(&["restart", crate::service::NAME]),
+        Command::Uninstall => {
+            crate::service::uninstall()?;
+            println!("Service removed. Private configuration and sessions retained; registered outgoing tool retained.");
+            Ok(())
+        }
+        Command::Install => {
+            crate::service::install(config_path)?;
+            println!("Service enabled. To survive logout, enable user linger: loginctl enable-linger \"$USER\"");
+            Ok(())
+        }
+        Command::Doctor => {
+            let config = crate::config::load_config(config_path)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "cannot start runtime".to_string())?;
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    crate::doctor::doctor(&config),
+                )
+                .await
+                .map_err(|_| "doctor timed out after 30s".to_string())?
+            })
+        }
+        Command::Share {
+            skill,
+            context,
+            plugin_argv,
+            clear,
+        } => {
+            let mut config = crate::config::load_config(config_path)?;
+            if *clear {
+                config["shared_skills"] = Value::Array(Vec::new());
+                config["shared_context"] = Value::Array(Vec::new());
+                config["shared_plugins"] = Value::Array(Vec::new());
+            }
+            let mut skills: Vec<String> = config
+                .get("shared_skills")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for s in skill {
+                if !skills.contains(s) {
+                    skills.push(s.clone());
+                }
+            }
+            config["shared_skills"] = Value::Array(skills.into_iter().map(Value::String).collect());
+
+            let mut contexts: Vec<String> = config
+                .get("shared_context")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for c in context {
+                if !contexts.contains(c) {
+                    contexts.push(c.clone());
+                }
+            }
+            config["shared_context"] =
+                Value::Array(contexts.into_iter().map(Value::String).collect());
+
+            let mut plugins: Vec<Value> = config
+                .get("shared_plugins")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for p_str in plugin_argv {
+                let parsed: Value = serde_json::from_str(p_str)
+                    .map_err(|_| "Invalid plugin-argv JSON".to_string())?;
+                plugins.push(parsed);
+            }
+            config["shared_plugins"] = Value::Array(plugins);
+
+            let tmp_dir = std::env::temp_dir().join(format!("gray-cap-{}", uuid_hex()));
+            std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create tempdir: {e}"))?;
+            let res = crate::capabilities::prepare(&config, &tmp_dir);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            res?;
+            crate::config::save_config(config_path, &config)?;
+            println!("Shared capabilities saved. Only select trusted code/non-secret context. Restart to apply.");
+            Ok(())
+        }
+        Command::Limits {
+            timeout_seconds,
+            concurrency,
+            max_requests,
+        } => {
+            let mut config = crate::config::load_config(config_path)?;
+            if let Some(n) = timeout_seconds {
+                config["timeout_seconds"] = Value::from(*n);
+            }
+            if let Some(n) = concurrency {
+                config["concurrency"] = Value::from(*n);
+            }
+            if let Some(n) = max_requests {
+                config["max_requests"] = Value::from(*n);
+            }
+            crate::config::save_config(config_path, &config)?;
+            println!("Limits saved; restart the gateway to apply.");
+            Ok(())
+        }
+        Command::Budget { action } => match action {
+            BudgetAction::Set {
+                daily_usd,
+                turn_usd,
+                input_per_million,
+                output_per_million,
+            } => {
+                let mut config = crate::config::load_config(config_path)?;
+                let gray_home = config
+                    .get("gray_home")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "gray_home missing".to_string())?;
+                let provider_bytes = std::fs::read(Path::new(gray_home).join("config.json"))
+                    .map_err(|_| "gray provider configuration is missing".to_string())?;
+                let provider: Value = serde_json::from_slice(&provider_bytes)
+                    .map_err(|_| "Invalid gray config.json".to_string())?;
+                let model = provider
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "model missing".to_string())?;
+
+                let new_budget = serde_json::json!({
+                    "model": model,
+                    "daily_usd": daily_usd,
+                    "turn_usd": turn_usd,
+                    "input_per_million": input_per_million,
+                    "output_per_million": output_per_million,
+                });
+                crate::budget::validate(&new_budget, model)?;
+                config["budget"] = new_budget;
+                crate::config::save_config(config_path, &config)?;
+                println!("Budget saved for selected model; restart the gateway to apply.");
+                Ok(())
+            }
+            BudgetAction::Status => {
+                let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+                let b = crate::budget::Budget::new(&parent.join("budget.sqlite"))?;
+                println!("Accounted/reserved micro-USD: {}", b.total());
+                Ok(())
+            }
+        },
+        Command::Schedule { action } => {
+            let store = crate::gateway::open_store(config_path)?;
+            match action {
+                ScheduleAction::Add { every, prompt } => {
+                    let job_id = uuid_hex();
+                    store.schedule_add(&job_id, *every, prompt, crate::durable::now_secs())?;
+                    println!("{job_id}");
+                    Ok(())
+                }
+                ScheduleAction::List => {
+                    for job in store.schedules()? {
+                        println!("{} {} {}", job.id, job.interval, job.status);
+                    }
+                    Ok(())
+                }
+                ScheduleAction::Remove { id } => {
+                    store.schedule_remove(id)?;
+                    Ok(())
+                }
+            }
+        }
+        Command::Queue { action } => {
+            let store = crate::gateway::open_store(config_path)?;
+            match action {
+                QueueAction::List => {
+                    for item in store.items()? {
+                        println!(
+                            "{} {} {} {}",
+                            item.0,
+                            item.1,
+                            item.2,
+                            item.3.as_deref().unwrap_or("")
+                        );
+                    }
+                    Ok(())
+                }
+                QueueAction::Cancel { id } => {
+                    store.cancel(id)?;
+                    Ok(())
+                }
+            }
+        }
+        Command::Allowlist { action } => {
+            let mut config = crate::config::load_config(config_path)?;
+            let mut allowed: Vec<String> = config
+                .get("allowed_users")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match action {
+                AllowlistAction::Add { id } => {
+                    if !crate::config::snowflake(&Value::String(id.clone())) {
+                        return Err("Invalid snowflake ID".to_string());
+                    }
+                    if !allowed.contains(id) {
+                        allowed.push(id.clone());
+                        config["allowed_users"] =
+                            Value::Array(allowed.into_iter().map(Value::String).collect());
+                        crate::config::save_config(config_path, &config)?;
+                    }
+                    Ok(())
+                }
+                AllowlistAction::Remove { id } => {
+                    if !crate::config::snowflake(&Value::String(id.clone())) {
+                        return Err("Invalid snowflake ID".to_string());
+                    }
+                    allowed.retain(|x| x != id);
+                    config["allowed_users"] =
+                        Value::Array(allowed.into_iter().map(Value::String).collect());
+                    crate::config::save_config(config_path, &config)?;
+                    Ok(())
+                }
+                AllowlistAction::List => {
+                    for id in allowed {
+                        println!("{id}");
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
+}
+
+fn uuid_hex() -> String {
+    let mut buf = [0u8; 16];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut buf);
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }

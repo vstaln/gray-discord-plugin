@@ -65,17 +65,52 @@ pub fn unit(config_path: &Path) -> Result<String, String> {
     ))
 }
 
-/// systemctl passthrough (Task 11).
-pub fn control(_args: &[String]) -> Result<(), String> {
-    Err("not yet implemented".to_string())
+/// systemctl passthrough.
+pub fn control<S: AsRef<str>>(args: &[S]) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.arg("--user");
+    for a in args {
+        cmd.arg(a.as_ref());
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err("systemctl failed; check the user session and service status".to_string()),
+    }
 }
 
-/// Install + enable the user unit (Task 11).
-pub fn install(_path: &Path) -> Result<(), String> {
-    Err("not yet implemented".to_string())
+/// Install + enable the user unit.
+pub fn install(path: &Path) -> Result<(), String> {
+    let target = unit_path();
+    let body = unit(path)?;
+    if target.exists() {
+        let existing =
+            std::fs::read_to_string(&target).map_err(|_| "cannot read unit".to_string())?;
+        if existing != body {
+            return Err(
+                "A different plugin service already exists; uninstall it first".to_string(),
+            );
+        }
+    }
+    if let Some(p) = target.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(p)
+            .map_err(|_| "cannot create systemd unit directory".to_string())?;
+    }
+    std::fs::write(&target, body).map_err(|_| "cannot write unit file".to_string())?;
+    control(&["daemon-reload"])?;
+    control(&["enable", "--now", NAME])?;
+    Ok(())
 }
 
-/// Disable + remove the user unit (Task 11).
+/// Disable + remove the user unit.
 pub fn uninstall() -> Result<(), String> {
-    Err("not yet implemented".to_string())
+    let target = unit_path();
+    if !target.exists() {
+        return Ok(());
+    }
+    control(&["disable", "--now", NAME])?;
+    let _ = std::fs::remove_file(&target);
+    control(&["daemon-reload"])?;
+    Ok(())
 }
