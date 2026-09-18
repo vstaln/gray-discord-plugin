@@ -54,6 +54,10 @@ pub fn slash_commands_json() -> Value {
     ])
 }
 
+pub type ReactionHook = std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+pub type TypingHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+pub type ClockFn = std::sync::Arc<dyn Fn() -> f64 + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Runtime<R, D> {
     pub config: Value,
@@ -61,6 +65,11 @@ pub struct Runtime<R, D> {
     pub store: Store,
     pub deliver: D,
     pub runner: R,
+    pub rest: Option<Rest>,
+    pub reaction_hook: Option<ReactionHook>,
+    pub typing_hook: Option<TypingHook>,
+    pub clock: Option<ClockFn>,
+    last_typing: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -71,6 +80,96 @@ impl<R, D> Runtime<R, D> {
             store,
             deliver,
             runner,
+            rest: None,
+            reaction_hook: None,
+            typing_hook: None,
+            clock: None,
+            last_typing: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        }
+    }
+
+    pub fn with_rest(mut self, rest: Rest) -> Self {
+        self.rest = Some(rest);
+        self
+    }
+
+    pub fn with_reaction_hook(mut self, hook: ReactionHook) -> Self {
+        self.reaction_hook = Some(hook);
+        self
+    }
+
+    pub fn with_typing_hook(mut self, hook: TypingHook) -> Self {
+        self.typing_hook = Some(hook);
+        self
+    }
+
+    pub fn with_clock(mut self, clock: ClockFn) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    pub fn now_secs(&self) -> f64 {
+        self.clock
+            .as_ref()
+            .map(|c| c())
+            .unwrap_or_else(crate::durable::now_secs)
+    }
+
+    pub async fn report_progress(&self, channel: &str) {
+        let now = self.now_secs();
+        let mut map = self.last_typing.lock().await;
+        let last = map.get(channel).copied().unwrap_or(-10.0);
+        if now - last >= 8.0 {
+            map.insert(channel.to_string(), now);
+            drop(map);
+            if let Ok(ch) = channel.parse::<u64>() {
+                if let Some(ref rest) = self.rest {
+                    rest.typing(ch).await;
+                }
+                if let Some(ref hook) = self.typing_hook {
+                    hook(ch);
+                }
+            }
+        }
+    }
+
+    pub async fn add_reaction(&self, channel: &str, message_id: &str, emoji: &str) {
+        let enabled = self
+            .config
+            .get("reactions")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            return;
+        }
+        if let Ok(ch) = channel.parse::<u64>() {
+            if let Some(ref rest) = self.rest {
+                rest.add_reaction(ch, message_id, emoji).await;
+            }
+            if let Some(ref hook) = self.reaction_hook {
+                hook("add", message_id, emoji);
+            }
+        }
+    }
+
+    pub async fn remove_reaction(&self, channel: &str, message_id: &str, emoji: &str) {
+        let enabled = self
+            .config
+            .get("reactions")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            return;
+        }
+        if let Ok(ch) = channel.parse::<u64>() {
+            if let Some(ref rest) = self.rest {
+                rest.remove_reaction(ch, message_id, emoji).await;
+            }
+            if let Some(ref hook) = self.reaction_hook {
+                hook("remove", message_id, emoji);
+            }
         }
     }
 }
@@ -87,6 +186,10 @@ where
             Some(it) => it,
             None => return Ok(false),
         };
+
+        self.add_reaction(&item.channel, &item.id, "👀").await;
+        self.report_progress(&item.channel).await;
+
         let run_fut = (self.runner)(
             &self.config,
             &self.config_path,
@@ -104,9 +207,12 @@ where
                     break Some(res);
                 }
                 _ = ticker.tick() => {
+                    self.report_progress(&item.channel).await;
                     if let Ok(Some(cur)) = self.store.get(&item.id) {
                         if cur.cancel {
                             self.store.fail(&item.id, "cancelled")?;
+                            self.remove_reaction(&item.channel, &item.id, "👀").await;
+                            self.add_reaction(&item.channel, &item.id, "❌").await;
                             return Ok(true);
                         }
                     }
@@ -121,12 +227,18 @@ where
             }
             Some(Err(RunError::Budget(_))) => {
                 self.store.fail(&item.id, "budget_blocked")?;
+                self.remove_reaction(&item.channel, &item.id, "👀").await;
+                self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Some(Err(RunError::Timeout)) => {
                 self.store.fail(&item.id, "timeout")?;
+                self.remove_reaction(&item.channel, &item.id, "👀").await;
+                self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Some(Err(_)) => {
                 self.store.fail(&item.id, "agent_failed")?;
+                self.remove_reaction(&item.channel, &item.id, "👀").await;
+                self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             None => {}
         }
@@ -134,17 +246,23 @@ where
     }
 
     pub async fn deliver_one(&self) -> Result<bool, String> {
-        let part = match self.store.next_delivery(crate::durable::now_secs())? {
+        let part = match self.store.next_delivery(self.now_secs())? {
             Some(p) => p,
             None => return Ok(false),
         };
         match (self.deliver)(part.clone()).await {
             Ok(msg_id) if !msg_id.trim().is_empty() => {
                 self.store.ack(&part.id, part.part, &msg_id)?;
+                if let Ok(Some(row)) = self.store.get(&part.id) {
+                    if row.state == "sent" {
+                        self.remove_reaction(&part.channel, &part.id, "👀").await;
+                        self.add_reaction(&part.channel, &part.id, "✅").await;
+                    }
+                }
             }
             _ => {
                 self.store
-                    .delivery_failed(&part, "delivery_failed", crate::durable::now_secs())?;
+                    .delivery_failed(&part, "delivery_failed", self.now_secs())?;
             }
         }
         Ok(true)
@@ -342,7 +460,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         store.clone(),
         deliver,
         runner,
-    );
+    )
+    .with_rest(rest.clone());
 
     let runtime_task = runtime.run();
     tokio::pin!(runtime_task);

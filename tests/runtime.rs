@@ -174,3 +174,197 @@ async fn slash_followup_routing_marks_part_as_interaction() {
     assert_eq!(recorded[0].app_id.as_deref(), Some("app_id_xyz"));
     assert_eq!(store.get("slash1").unwrap().unwrap().state, "sent");
 }
+
+#[tokio::test]
+async fn reaction_call_sequence_on_success_and_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+
+    let reactions_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reactions_log_clone = reactions_log.clone();
+    let hook = std::sync::Arc::new(move |op: &str, msg_id: &str, emoji: &str| {
+        reactions_log_clone.lock().unwrap().push((
+            op.to_string(),
+            msg_id.to_string(),
+            emoji.to_string(),
+        ));
+    });
+
+    let runner =
+        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
+            Box::pin(async move { Ok("done".to_string()) })
+        };
+
+    let deliver = move |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async move { Ok("m1".to_string()) })
+    };
+
+    let runtime = gray_discord::gateway::Runtime::new(
+        serde_json::json!({"reactions": true}),
+        path.clone(),
+        store.clone(),
+        deliver,
+        runner,
+    )
+    .with_reaction_hook(hook.clone());
+
+    // Test success sequence
+    store
+        .enqueue("msg_success", "42", "hello", None, 100)
+        .unwrap();
+    assert!(runtime.generate_one().await.unwrap());
+    assert!(runtime.deliver_one().await.unwrap());
+
+    let log = reactions_log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec![
+            (
+                "add".to_string(),
+                "msg_success".to_string(),
+                "👀".to_string()
+            ),
+            (
+                "remove".to_string(),
+                "msg_success".to_string(),
+                "👀".to_string()
+            ),
+            (
+                "add".to_string(),
+                "msg_success".to_string(),
+                "✅".to_string()
+            ),
+        ]
+    );
+
+    // Test failure sequence
+    reactions_log.lock().unwrap().clear();
+    let failing_runner =
+        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
+            Box::pin(async move { Err(gray_discord::runner::RunError::Timeout) })
+        };
+    let deliver2 = move |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async move { Ok("m2".to_string()) })
+    };
+    let runtime_fail = gray_discord::gateway::Runtime::new(
+        serde_json::json!({"reactions": true}),
+        path,
+        store.clone(),
+        deliver2,
+        failing_runner,
+    )
+    .with_reaction_hook(hook);
+
+    store.enqueue("msg_fail", "42", "hello", None, 100).unwrap();
+    assert!(runtime_fail.generate_one().await.unwrap());
+
+    let log_fail = reactions_log.lock().unwrap().clone();
+    assert_eq!(
+        log_fail,
+        vec![
+            ("add".to_string(), "msg_fail".to_string(), "👀".to_string()),
+            (
+                "remove".to_string(),
+                "msg_fail".to_string(),
+                "👀".to_string()
+            ),
+            ("add".to_string(), "msg_fail".to_string(), "❌".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn typing_cadence_throttles_within_8_seconds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+
+    let typing_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let typing_calls_clone = typing_calls.clone();
+    let hook = std::sync::Arc::new(move |ch: u64| {
+        typing_calls_clone.lock().unwrap().push(ch);
+    });
+
+    let fake_time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fake_time_clone = fake_time.clone();
+    let clock = std::sync::Arc::new(move || {
+        fake_time_clone.load(std::sync::atomic::Ordering::SeqCst) as f64
+    });
+
+    let dummy_runner =
+        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
+            Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
+        };
+    let dummy_deliver = move |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async move { Ok::<String, String>("".to_string()) })
+    };
+
+    let runtime = gray_discord::gateway::Runtime::new(
+        serde_json::json!({}),
+        path,
+        store,
+        dummy_deliver,
+        dummy_runner,
+    )
+    .with_typing_hook(hook)
+    .with_clock(clock);
+
+    // t = 0: first tick triggers typing
+    fake_time.store(0, std::sync::atomic::Ordering::SeqCst);
+    runtime.report_progress("42").await;
+    assert_eq!(typing_calls.lock().unwrap().len(), 1);
+
+    // t = 3: within 8 seconds, throttled
+    fake_time.store(3, std::sync::atomic::Ordering::SeqCst);
+    runtime.report_progress("42").await;
+    assert_eq!(typing_calls.lock().unwrap().len(), 1);
+
+    // t = 9: elapsed 9 seconds >= 8s cadence, triggers second typing call
+    fake_time.store(9, std::sync::atomic::Ordering::SeqCst);
+    runtime.report_progress("42").await;
+    assert_eq!(typing_calls.lock().unwrap().len(), 2);
+    assert_eq!(*typing_calls.lock().unwrap(), vec![42, 42]);
+}
+
+#[tokio::test]
+async fn reactions_disabled_when_config_flag_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+
+    let reactions_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reactions_log_clone = reactions_log.clone();
+    let hook = std::sync::Arc::new(move |op: &str, msg_id: &str, emoji: &str| {
+        reactions_log_clone.lock().unwrap().push((
+            op.to_string(),
+            msg_id.to_string(),
+            emoji.to_string(),
+        ));
+    });
+
+    let runner =
+        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
+            Box::pin(async move { Ok("done".to_string()) })
+        };
+    let deliver = move |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async move { Ok("m1".to_string()) })
+    };
+
+    let runtime = gray_discord::gateway::Runtime::new(
+        serde_json::json!({"reactions": false}),
+        path,
+        store.clone(),
+        deliver,
+        runner,
+    )
+    .with_reaction_hook(hook);
+
+    store
+        .enqueue("msg_noreact", "42", "hello", None, 100)
+        .unwrap();
+    assert!(runtime.generate_one().await.unwrap());
+    assert!(runtime.deliver_one().await.unwrap());
+
+    assert!(reactions_log.lock().unwrap().is_empty());
+}

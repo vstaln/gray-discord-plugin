@@ -66,3 +66,26 @@ async fn invalid_content_rejected_before_http() {
     ));
     assert!(stub.sent.lock().unwrap().is_empty());
 }
+
+#[test]
+fn chunk_cap_truncates_at_8_parts_with_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = gray_discord::durable::Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+    store.enqueue("msg_chunk", "42", "q", None, 100).unwrap();
+    let item = store.claim().unwrap().unwrap();
+    let text = ("para\n\n".repeat(350) + "\n\n").repeat(9);
+    store
+        .complete(&item.id, &text, &serde_json::json!({}))
+        .unwrap();
+
+    let mut parts = Vec::new();
+    while let Some(part) = store.next_delivery(0.0).unwrap() {
+        parts.push(part.clone());
+        store
+            .ack(&part.id, part.part, &format!("m{}", part.part))
+            .unwrap();
+    }
+    assert_eq!(parts.len(), 8);
+    assert!(parts[7].content.contains("… (truncated,"));
+    assert!(parts[7].content.contains("more characters not sent)"));
+}
