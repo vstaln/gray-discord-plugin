@@ -13,7 +13,31 @@ See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 session integration pass. Live Discord login, interactive pairing, and
 systemd deployment have not been exercised by the author in this release.
 
-## Install and set up yourself
+## Rust binary (0.2.0)
+
+`gray-discord` 0.2.0 is a standalone Rust binary port of this plugin, replacing the Python runtime with a single compiled binary, zero Python runtime dependencies, an asynchronous twilight-based Discord gateway, SQLite durable queue with WAL mode, and complete parity with the original Hermes-inspired design.
+
+### Installation via gray
+
+```sh
+gray install plugin discord
+```
+
+Prebuilt binaries are published for:
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+### Configuration reuse & migration
+
+Existing `~/.config/gray-discord/config.json` files are fully forward-compatible. The Rust binary reads existing configuration seamlessly. `allowed_users` defaults to `[]` when absent. Existing session files and `jobs.json` (migrated to `queue.sqlite` schedules) are preserved.
+
+### Python deprecation note
+
+The Python implementation (`gray_discord`) is deprecated and will be removed in release 0.2.0 once binary distribution is active. All new features, performance improvements, and security enhancements are developed exclusively in the Rust binary.
+
+## Install and set up yourself (Python legacy)
 
 Requires a working Python 3.11+, gray on PATH, and gray's provider/model already
 configured in `~/.gray/config.json`. Use a separate Discord bot application.
