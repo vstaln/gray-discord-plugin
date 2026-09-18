@@ -2,22 +2,19 @@
 
 A standalone Discord plugin for [gray](https://github.com/vstaln/gray), with
 its own setup wizard and background service. Public source, no Discord code
-added to gray. Uses discord.py like Hermes and ports selected Hermes helpers
-and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
+added to gray. Standalone compiled Rust binary using twilight and SQLite durable
+queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
 
-**Status: isolated runtime-reliability development branch.** Requires the matching
-gray core `--json` implementation; do not upgrade an active service independently.
+**Status: standalone Rust binary (0.2.0).** Requires matching
+gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 
-**Experimental text-only integration.** Offline tests and real-gray
-session integration pass. Live Discord login, interactive pairing, and
-systemd deployment have not been exercised by the author in this release.
+**Experimental text-only integration.** Live Discord login, interactive pairing,
+and systemd deployment have been ported from Python to a single Rust binary.
 
-## Rust binary (0.2.0)
+## Installation
 
-`gray-discord` 0.2.0 is a standalone Rust binary port of this plugin, replacing the Python runtime with a single compiled binary, zero Python runtime dependencies, an asynchronous twilight-based Discord gateway, SQLite durable queue with WAL mode, and complete parity with the original Hermes-inspired design.
-
-### Installation via gray
+### Via gray catalog
 
 ```sh
 gray install plugin discord
@@ -29,21 +26,18 @@ Prebuilt binaries are published for:
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-### Configuration reuse & migration
+### From source
 
-Existing `~/.config/gray-discord/config.json` files are fully forward-compatible. The Rust binary reads existing configuration seamlessly. `allowed_users` defaults to `[]` when absent. Existing session files and `jobs.json` (migrated to `queue.sqlite` schedules) are preserved.
+```sh
+cargo build --release --locked
+```
 
-### Python deprecation note
+## Setup and Service Lifecycle
 
-The Python implementation (`gray_discord`) is deprecated and will be removed in release 0.2.0 once binary distribution is active. All new features, performance improvements, and security enhancements are developed exclusively in the Rust binary.
-
-## Install and set up yourself (Python legacy)
-
-Requires a working Python 3.11+, gray on PATH, and gray's provider/model already
+Requires gray on PATH, and gray's provider/model already
 configured in `~/.gray/config.json`. Use a separate Discord bot application.
 
 ```sh
-gray install plugin discord
 gray discord setup
 gray discord status
 ```
@@ -51,17 +45,18 @@ gray discord status
 Setup reads the bot token with hidden terminal input, validates it, prints an
 invite link, then asks you to DM a one-time code to the bot. The code expires
 in five minutes. Confirm the resulting user ID locally before configuration
-is saved. Only that account can trigger the agent. Enable Message Content
-Intent in the Discord developer portal. Pick a home channel (your DM by default).
+is saved. Only that account and explicitly allowlisted users can trigger the agent.
+Enable Message Content Intent in the Discord developer portal. Pick a home channel
+(your DM by default).
 
 The wizard never sends credentials to a model. Private config is written
 atomically with mode 600. Do not paste bot tokens into chat or command arguments.
 To use a nondefault config, place `--config /absolute/path/config.json` before
 the command on every invocation, including setup/install/register.
 
-The systemd **user** service is `gray-discord-plugin.service`. It uses the
-Python environment where the plugin is installed. Keep that environment.
-For operation after logout/reboot, enable user lingering if permitted:
+The systemd **user** service is `gray-discord-plugin.service`. It runs the
+compiled `gray-discord` binary. For operation after logout/reboot, enable user
+lingering if permitted:
 
 ```sh
 loginctl enable-linger "$USER"
@@ -81,18 +76,24 @@ Different configurations using the same token are not protected by this lock.
 gray discord register
 ```
 
-Setup does this automatically; the command above can repeat it. It registers a protocol-1.1 stdio sidecar in gray's existing plugin lock,
-preserving other entries. Restart existing gray sessions. `discord_send`
-accepts `{ "content": "hello" }` and only sends to the configured destination;
-it does not open a gateway connection. Its calls do not require the background
-service to be running. Long messages are split, with all mentions suppressed.
+Setup does this automatically; the command above can repeat it. It registers a
+protocol-1.1 stdio sidecar in gray's existing plugin lock, preserving other entries.
+Restart existing gray sessions. `discord_send` accepts `{ "content": "hello" }`
+and only sends to the configured destination; it does not open a gateway connection.
+Its calls do not require the background service to be running. Long messages are
+split, with all mentions suppressed.
 
-Requires a gray build with catalog installation and plugin command dispatch.
-Older releases that reject `gray install` must be upgraded first. Gray creates
-a private venv and installs the catalog's pinned source; Python's venv/pip support
-and Git must be available. No global Python packages or separate CLI are required.
-Setup automatically registers the outgoing tool and offers to enable/start the
-background service. Declining service startup leaves foreground use available.
+## Allowlisted users
+
+Allow additional users to trigger the agent (usage is billed to the owner's budget ledger):
+
+```sh
+gray discord allowlist add <USER_SNOWFLAKE_ID>
+gray discord allowlist list
+gray discord allowlist remove <USER_SNOWFLAKE_ID>
+```
+
+Empty allowlist means owner-only access.
 
 ## Scheduled messages
 
@@ -106,8 +107,8 @@ gray discord schedule list
 gray discord schedule remove JOB_ID
 ```
 
-Jobs persist next-run time and `scheduled/running/sent/failed` status. The
-next run advances before execution; interrupted jobs are not replayed. These
+Jobs persist next-run time and `scheduled/running/sent/failed` status in SQLite.
+The next run advances before execution; interrupted jobs are not replayed. These
 are interval jobs, not cron expressions and not gray's native cron scheduler.
 Avoid calling `discord_send` in job prompts: the scheduler already sends the reply.
 
@@ -121,7 +122,7 @@ Tools run on the server, not your desktop. This is **not a sandbox**: allowliste
 users and model tool execution have the OS user's permissions. Prefer a dedicated
 unprivileged service account; do not give it broad SSH/cloud credentials.
 
-Accepted messages and outgoing replies are persisted in a transactional queue.
+Accepted messages and outgoing replies are persisted in a transactional SQLite queue.
 Agent execution and delivery retries are separate; uncertain interrupted work
 is never automatically rerun. Deadlines/concurrency/model-call limits are
 configurable, and the gateway requires explicit model prices and spending
@@ -144,14 +145,12 @@ turn off that tool. Remove private state yourself only if you want to erase it.
 ## Development / verification
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/python -m unittest discover -s tests -v
-GRAY_TEST_BIN=/absolute/path/to/gray .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/pip wheel --no-deps . -w dist
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-Without `GRAY_TEST_BIN`, the real-gray integration test is explicitly skipped.
-With it, a loopback scripted provider captures real gray requests to verify
-second-turn history replay and cross-conversation isolation—no API key, external
-model, or Discord token required. No tests read your actual provider credentials.
+In CI or headless environments:
+```sh
+cargo test --locked --all-targets
+```

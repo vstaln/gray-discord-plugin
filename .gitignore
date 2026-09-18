@@ -1,8 +1,3 @@
-.venv/
-__pycache__/
-*.pyc
-*.egg-info/
-build/
+/target/
 dist/
 .env*
-/target/
