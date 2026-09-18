@@ -173,6 +173,13 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
     crate::config::atomic_json(&lock, &data)
 }
 
+/// Parse the service-install answer. Python parity (`cli.py`):
+/// `input('Enable and start the background service now? [Y/n] ').strip().lower()`
+/// in `('', 'y', 'yes')` — default yes.
+pub fn install_confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes")
+}
+
 /// Dispatch a parsed subcommand. Arms without a landed task fail closed so
 /// no half-wired command can run.
 pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
@@ -182,6 +189,37 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
         Command::Register => {
             let config: Value = crate::config::load_config(config_path)?;
             register(&config, config_path)
+        }
+        Command::Setup => {
+            use crate::setup::Prompter;
+            let mut io = crate::setup::Tty;
+            // setup is async; drive it on a throwaway current-thread runtime
+            // so `run` stays sync like the other CLI arms.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "cannot start setup runtime".to_string())?;
+            // Gateway-event pairing wait lands in Task 9; until then the
+            // wizard reports that pairing needs the running gateway.
+            let done = rt.block_on(crate::setup::run(config_path, &mut io, &|_| {
+                Err("Pairing needs the gateway; run setup after first connect".to_string())
+            }))?;
+            if done {
+                let config: Value = crate::config::load_config(config_path)?;
+                register(&config, config_path)?;
+                println!("Outgoing tool registered with gray.");
+                let answer = io.prompt("Enable and start the background service now? [Y/n] ")?;
+                if install_confirmed(&answer) {
+                    crate::service::install(config_path)?;
+                    println!("Service enabled. Run gray discord status to check it.");
+                    println!("For operation after logout: loginctl enable-linger \"$USER\"");
+                } else {
+                    println!(
+                        "Run gray discord install when ready, or gray discord run in the foreground."
+                    );
+                }
+            }
+            Ok(())
         }
         _ => Err("not yet implemented".to_string()),
     }
