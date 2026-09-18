@@ -67,7 +67,7 @@ New Rust crate at repo root (Python package stays until Task 15):
   - `cli::run(cmd: &Command, config_path: &Path) -> Result<(), String>` — stub returning `Err("not yet implemented")` except `--help` handling (clap does that).
   - `config::default_path() -> PathBuf` — minimal stub (full module is Task 2); Task 1 needs it only to resolve the config path.
 
-- [ ] **Step 1: Write `Cargo.toml`**
+- [x] **Step 1: Write `Cargo.toml`**
 
 ```toml
 [package]
@@ -108,7 +108,7 @@ tempfile = "3"
 
 Before writing, resolve the twilight version: run `cargo search twilight-gateway | head -3` (network is available). If the latest 0.x differs from `0.17`, use the latest `0.x` for BOTH twilight crates and record the chosen version in the commit message. (The gray-history salvage used 0.17; anything newer in the 0.x line keeps the same API shape. If crates.io shows 1.x, stop and ask — the event API changed.)
 
-- [ ] **Step 2: Write `src/lib.rs`, `src/main.rs`, `src/cli.rs` skeleton**
+- [x] **Step 2: Write `src/lib.rs`, `src/main.rs`, `src/cli.rs` skeleton**
 
 ```rust
 // src/lib.rs
@@ -146,7 +146,7 @@ fn main() {
 
 `src/cli.rs` defines the full clap tree (all flags/options exactly as in `gray_discord/cli.py parser()`), `config_path()` (explicit `--config` or `config::default_path()`), and `run()` stubbed to `Err("not yet implemented".into())` for every variant. The `Budget/Queue/Schedule/Allowlist` sub-actions are nested enums (`BudgetAction::Status/Set{...}`, etc.) with the exact Python flags (`--daily-usd` etc. as `f64`, `--every` as `u64`, `--timeout-seconds` etc. as `Option<u64>`).
 
-- [ ] **Step 3: Write the failing test** (`tests/package.rs`, help case only)
+- [x] **Step 3: Write the failing test** (`tests/package.rs`, help case only)
 
 ```rust
 use std::process::Command;
@@ -167,9 +167,9 @@ fn help_lists_subcommands() {
 
 (If the compiler rejects `CARGO_BIN_EXE_gray-discord` because of the hyphen, use `CARGO_BIN_EXE_gray_discord` — keep whichever compiles; do not rename the binary: the installed executable must stay `gray-discord` for gray's `gray-{name}` PATH discovery.)
 
-- [ ] **Step 4: Verify** — local (X ban: build only): `nice -n 19 ionice -c3 flock /tmp/cargo.lock cargo build --locked` must succeed. Full `cargo test --locked -- --test-threads=1` runs in CI. Append the `rust` job to `.github/workflows/test.yml` (fmt --check, clippy `-D warnings`, test single-thread) and `/target/` to `.gitignore` in this same task.
+- [x] **Step 4: Verify** — local (X ban: build only): `nice -n 19 ionice -c3 flock /tmp/cargo.lock cargo build --locked` must succeed. Full `cargo test --locked -- --test-threads=1` runs in CI. Append the `rust` job to `.github/workflows/test.yml` (fmt --check, clippy `-D warnings`, test single-thread) and `/target/` to `.gitignore` in this same task.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock src/lib.rs src/main.rs src/cli.rs tests/package.rs .gitignore .github/workflows/test.yml
@@ -195,7 +195,7 @@ git commit --no-verify -m "feat(discord): scaffold Rust crate with full CLI tree
   - `policy::incoming(author: &str, owner: &str, bot: bool, dm: bool, text: &str, bot_id: &str, allowed: &[String]) -> Option<String>` — None if `owner.is_empty()`, `author != owner && !allowed.contains(author)`, or `bot`; non-DM requires `<@bot_id>` or `<@!bot_id>` mention; strip mentions, trim, None on empty. (Python took only `owner`; the `allowed` param is the §2 addition.)
   - `policy::Pairing { code: String, expires: f64, used: bool }`, `Pairing::new(now: f64) -> Self` (code = 18 random bytes via OS RNG, base64url-nopad like `secrets.token_urlsafe(18)`), `accept(&mut self, text: &str, now: f64) -> bool` (constant-time compare, single-use, `now >= expires` fails).
 
-- [ ] **Step 1: Write failing tests** (`tests/core.rs`) — port `tests/test_core.py` verbatim plus allowlist cases:
+- [x] **Step 1: Write failing tests** (`tests/core.rs`) — port `tests/test_core.py` verbatim plus allowlist cases:
 
 ```rust
 use gray_discord::{config, policy, text};
@@ -257,9 +257,9 @@ fn pairing_expires_and_consumes_once() {
 }
 ```
 
-- [ ] **Step 2: Implement** the three modules. Pairing RNG: read 18 bytes from `/dev/urandom` (or `getrandom` via `libc::getentropy` — no new deps; fall back to hashing pid+time ONLY if the RNG read fails, and note it in code). Constant-time compare: hand-rolled byte loop with `std::hint::black_box`, no `==` early exit.
-- [ ] **Step 3: Verify** — `cargo build --locked` locally (X ban); CI runs `cargo test --locked -- --test-threads=1` with all 4 tests green.
-- [ ] **Step 4: Commit** (pathspec-limited, `--no-verify`, message `feat(discord): port config, text splitting, admission gate`).
+- [x] **Step 2: Implement** the three modules. Pairing RNG: read 18 bytes from `/dev/urandom` (or `getrandom` via `libc::getentropy` — no new deps; fall back to hashing pid+time ONLY if the RNG read fails, and note it in code). Constant-time compare: hand-rolled byte loop with `std::hint::black_box`, no `==` early exit.
+- [x] **Step 3: Verify** — `cargo build --locked` locally (X ban); CI runs `cargo test --locked -- --test-threads=1` with all 4 tests green.
+- [x] **Step 4: Commit** (pathspec-limited, `--no-verify`, message `feat(discord): port config, text splitting, admission gate`).
 
 ### Task 3: durable queue + budget ledger (ports `durable.py`, `budget.py`)
 
@@ -274,10 +274,10 @@ fn pairing_expires_and_consumes_once() {
   - `durable::Store { fn new(path: &Path) -> Result<Self, String> }` creating parents `0700`, file `0600`, the four Python tables verbatim PLUS `ALTER TABLE inbox ADD COLUMN` for `interaction_token TEXT` and `ADD COLUMN app_id TEXT` (needed by Task 9 slash followups; idempotent `match` on duplicate-column errors so old DBs migrate). PRAGMA `synchronous=FULL`, `busy_timeout` 10 s, every method wraps in `BEGIN IMMEDIATE`.
   - Methods mirroring Python exactly: `enqueue(id, channel, prompt, conversation: Option<&str>, capacity) -> Result<bool, String>` (dedup → `Ok(false)`; capacity error `Queue is full; message was not accepted`); `claim() -> Option<InboxItem>` (per-conversation serialization); `get(id)`, `items()` (last 100 `id,channel,state,error`); `cancel(id)` (`No queued/running item with that ID`); `complete(id, text, receipt: &Value)` (1–200000 chars, chunks via `text::split_message`); `fail(id, code)` (map unknown codes to `agent_failed`, insert the controlled `Turn {id}: {code}...` notice); `recover()`; `next_delivery(now)`, `ack(id, part, message_id)`, `delivery_failed(part, code, now)` (same backoff formula); `schedule_add/remove/schedules/enqueue_due/migrate_jobs`; NEW `prune_terminal(older_than_secs) -> usize` (delete `sent`/`cancelled`/`uncertain` inbox rows older than 7 days — Hermes `recovery.py` parity; outbox parts for those rows go too).
 
-- [ ] **Step 1: Write failing tests** — port `tests/test_budget.py` (all 3 tests) to `tests/budget.rs` and `tests/test_durable.py` (all 4 tests) to `tests/durable.rs`, plus for prune: enqueue → complete → ack → backdate `created` → `prune_terminal` removes; unsettled ledger rows are never pruned.
-- [ ] **Step 2: Implement** both modules. Decimal math: parse via `rust_decimal::Decimal::from_str(&v.to_string())`, ceiling with `.ceil()`, reject non-finite (NaN/Inf parse or compare failures → `BudgetBlocked`). UTC day: `chrono::Utc::now().date_naive()`.
-- [ ] **Step 3: Verify** — build locally; CI runs both test files green.
-- [ ] **Step 4: Commit** (`feat(discord): port durable queue and budget ledger`).
+- [x] **Step 1: Write failing tests** — port `tests/test_budget.py` (all 3 tests) to `tests/budget.rs` and `tests/test_durable.py` (all 4 tests) to `tests/durable.rs`, plus for prune: enqueue → complete → ack → backdate `created` → `prune_terminal` removes; unsettled ledger rows are never pruned.
+- [x] **Step 2: Implement** both modules. Decimal math: parse via `rust_decimal::Decimal::from_str(&v.to_string())`, ceiling with `.ceil()`, reject non-finite (NaN/Inf parse or compare failures → `BudgetBlocked`). UTC day: `chrono::Utc::now().date_naive()`.
+- [x] **Step 3: Verify** — build locally; CI runs both test files green.
+- [x] **Step 4: Commit** (`feat(discord): port durable queue and budget ledger`).
 
 ### Task 4: Discord REST transport + doctor (ports `transport.py`, `cli.py doctor`, hermes-rs `discord_tool.rs`)
 
@@ -294,10 +294,10 @@ fn pairing_expires_and_consumes_once() {
   - Hermes constants ported in `transport.rs`: `MAX_CONTENT_LEN = 2000`, `MAX_EMBEDS = 10`, `INVITE_PERMISSIONS = 68608`, gateway intents bits for later (`1<<9 | 1<<15 | 1<<18` message-content privileged, DMs need no members intent).
   - `doctor::doctor(config: &Value) -> Result<(), String>`: gray_bin executable check; provider `config.json` has `model`; `Rest::login`; `GET /applications/@me` message-content-intent flag check; fetch home channel, and if guild channel check bot member has view/send/history (via the channel + guild-member endpoints). Success prints both Python lines verbatim (`Bot token, intent, ... verified.` + `Provider generation and ... were not tested.`).
 
-- [ ] **Step 1: Write failing tests** (`tests/delivery.rs` + `tests/common/mod.rs`): loopback stub (`tokio::net::TcpListener`, routes for `/users/@me`, `/applications/@me`, `/channels/42`, `/channels/42/messages` POST recording auth header + body, toggleable 401/403) asserting: emoji text splits into 2 chunks joined == input, auth header is `Bot TESTTOKEN`, `allowed_mentions.parse == []`, no `replied_user`, no `message_reference`, 401→`Auth` with zero sends, 403→`Forbidden`, pre-HTTP rejection for `""`/`20001`-char/`None`.
-- [ ] **Step 2: Implement** both modules.
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): port Discord REST transport and doctor`).
+- [x] **Step 1: Write failing tests** (`tests/delivery.rs` + `tests/common/mod.rs`): loopback stub (`tokio::net::TcpListener`, routes for `/users/@me`, `/applications/@me`, `/channels/42`, `/channels/42/messages` POST recording auth header + body, toggleable 401/403) asserting: emoji text splits into 2 chunks joined == input, auth header is `Bot TESTTOKEN`, `allowed_mentions.parse == []`, no `replied_user`, no `message_reference`, 401→`Auth` with zero sends, 403→`Forbidden`, pre-HTTP rejection for `""`/`20001`-char/`None`.
+- [x] **Step 2: Implement** both modules.
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): port Discord REST transport and doctor`).
 
 ### Task 5: runner — isolated `gray -p --json` child (ports `runner.py`)
 
@@ -312,10 +312,10 @@ fn pairing_expires_and_consumes_once() {
   - `runner::run_gray(config: &Value, config_path: &Path, conversation: &str, prompt: &str, opts: RunOpts) -> Result<String, RunError>` with `RunOpts { timeout_secs: Option<u64>, progress: Option<Box<dyn FnMut(&str) + Send>>, receipt: Option<&mut serde_json::Value> }`.
   - Behavior, in order: timeout>0 check (`Timeout must be positive`); prompt 1–32000; `conversations/<sha256(conversation)>` home `0700` + non-blocking `run.lock` (`Busy` if locked — use `libc::flock` with `LOCK_EX|LOCK_NB` on a `File::create`d handle held for the whole turn); snapshot provider `config.json` into home; `work/` dir + `.git/` marker; launcher script at `home/discord-sidecar` (`0700`, `#!/bin/sh\nexec '<current-exe>' sidecar --config '<abs path>'` — single-quote shell-escaped; resolves `std::env::current_exe` at runtime, NOT `sys.executable`); `capabilities::prepare` output appended to `work/gray.yml` (`tools-minimal` + sidecar + shared); legacy single-`.jsonl` resume else `session.json`; budget reserve when policy present or `budget_required` (append `--max-cost-usd/--input-price/--output-price`); spawn with `tokio::process::Command`, `stdin null`, `stdout piped`, `stderr null`, `kill_on_drop(true)`, own process group (`pre_exec(|| { libc::setpgid(0,0); Ok(()) })`), filtered env + the four `GRAY_*` overrides; NDJSON consume with 1 MiB line cap, single-`turn_id` enforcement, session-id pinning (atomic save on change), terminal `result`/`error` capture; timeout kills the process group (`libc::kill(-pid, SIGKILL)`); settle ledger on clean terminal rows; `receipt.update(final)` whenever `final` exists.
 
-- [ ] **Step 1: Write failing tests** (`tests/runner.rs`): fake-`gray` shell scripts — nonzero-exit-with-stdout (`code 7`), sleep-then-timeout twice (lock released between), NDJSON session-switch rejection, multi-terminal-row rejection, busy-lock contention. `GRAY_TEST_BIN` real-gray tests (resume replays history, conversations isolated, terminal NDJSON only — no `final_reply` transcript scan): `#[ignore]` unless env set; CI sets it to the `gray` on PATH.
-- [ ] **Step 2: Implement.**
-- [ ] **Step 3: Verify** — build locally; CI green (`GRAY_TEST_BIN=$(which gray)` in the workflow env if gray is installed there, else skipped).
-- [ ] **Step 4: Commit** (`feat(discord): port isolated gray runner`).
+- [x] **Step 1: Write failing tests** (`tests/runner.rs`): fake-`gray` shell scripts — nonzero-exit-with-stdout (`code 7`), sleep-then-timeout twice (lock released between), NDJSON session-switch rejection, multi-terminal-row rejection, busy-lock contention. `GRAY_TEST_BIN` real-gray tests (resume replays history, conversations isolated, terminal NDJSON only — no `final_reply` transcript scan): `#[ignore]` unless env set; CI sets it to the `gray` on PATH.
+- [x] **Step 2: Implement.**
+- [x] **Step 3: Verify** — build locally; CI green (`GRAY_TEST_BIN=$(which gray)` in the workflow env if gray is installed there, else skipped).
+- [x] **Step 4: Commit** (`feat(discord): port isolated gray runner`).
 
 ### Task 6: sidecar stdio server + CLI register/package (ports `sidecar.py`, `cli.py register`, `service.rs` unit fns)
 
@@ -333,10 +333,10 @@ fn pairing_expires_and_consumes_once() {
   - `cli::register(config: &Value, config_path: &Path) -> Result<(), String>`: read `plugins/lock.json` under `gray_home` (missing → fresh `schema: 1`), schema/ shape checks, refuse to overwrite a differing existing `discord` argv (`Another discord plugin is registered; refusing to overwrite it`), insert `ecosystem gray-native / version 0.1.0 / source https://github.com/vstaln/gray-discord-plugin / argv [<current-exe>, sidecar, --config, <abs>] / adapter_version 1.1 / installed_at epoch / scope user / enabled true` via `config::atomic_json`.
   - `service::quote`, `service::unit`, `service::NAME` (needed by package tests; full service module is Task 11).
 
-- [ ] **Step 1: Append failing tests** to `tests/package.rs`: manifest-over-stdio (spawn binary `sidecar --config <missing>`, feed `plugin/manifest` + unknown `tool/call`, assert rows), delivery-failure secrecy (unit-test `dispatch` with a config whose token is `PRIVATE-TOKEN-<random>`, assert `is_error` and absence of the token in the JSON), service unit escaping (`%`/spaces, `KillMode=control-group`, newline rejected), registration preserves other plugins + double-register idempotent + conflicting path refused.
-- [ ] **Step 2: Implement** `sidecar.rs`, `service.rs` (`quote`/`unit`/`NAME` fully, plus `control`/`install`/`uninstall` stubs returning `Err("not yet implemented")` — Task 11 fills them), wire `cli.rs` `Sidecar` + `Register` arms.
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): port sidecar server and registration`).
+- [x] **Step 1: Append failing tests** to `tests/package.rs`: manifest-over-stdio (spawn binary `sidecar --config <missing>`, feed `plugin/manifest` + unknown `tool/call`, assert rows), delivery-failure secrecy (unit-test `dispatch` with a config whose token is `PRIVATE-TOKEN-<random>`, assert `is_error` and absence of the token in the JSON), service unit escaping (`%`/spaces, `KillMode=control-group`, newline rejected), registration preserves other plugins + double-register idempotent + conflicting path refused.
+- [x] **Step 2: Implement** `sidecar.rs`, `service.rs` (`quote`/`unit`/`NAME` fully, plus `control`/`install`/`uninstall` stubs returning `Err("not yet implemented")` — Task 11 fills them), wire `cli.rs` `Sidecar` + `Register` arms.
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): port sidecar server and registration`).
 
 ### Task 7: capabilities (ports `capabilities.py`)
 
@@ -348,10 +348,10 @@ fn pairing_expires_and_consumes_once() {
 - Consumes: nothing.
 - Produces: `capabilities::absolute(v: &str) -> Result<PathBuf, String>` (absolute + exists, else `Shared capability paths must be absolute and exist`); `capabilities::prepare(config: &Value, home: &Path) -> Result<String, String>` — `skills/` dir `0700`, desired set keyed by hex sha256 of the path string, remove stale symlinks, refuse non-symlink collisions (`Shared skill path collision; refusing to overwrite`), require `SKILL.md` (`Shared skill must be a directory containing SKILL.md`); context files capped at 128 KiB total (`Shared context exceeds 128 KiB; select smaller files`), UTF-8 required, write `AGENTS.md` + `shared-context.json` marker (remove both when empty); `shared_plugins` argv arrays validated (nonempty, all strings, no NUL, nonempty exe → `Shared plugins require nonempty argv arrays` / `Shared plugin executable is empty`), launchers `shared-plugin-{i}` mode `0700` with single-quote shell escaping, profile lines `  - sidecar: <json-string>\n`.
 
-- [ ] **Step 1: Write failing tests** — port `tests/test_capabilities.py` verbatim (skills+context+plugins round-trip, removal on empty, reject relative/empty/missing/oversize).
-- [ ] **Step 2: Implement.** This unblocks Task 5's `prepare` import — if Task 5 landed first with a local stub, delete the stub in this task.
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): port capability sharing`).
+- [x] **Step 1: Write failing tests** — port `tests/test_capabilities.py` verbatim (skills+context+plugins round-trip, removal on empty, reject relative/empty/missing/oversize).
+- [x] **Step 2: Implement.** This unblocks Task 5's `prepare` import — if Task 5 landed first with a local stub, delete the stub in this task.
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): port capability sharing`).
 
 ### Task 8: setup wizard (ports `setup.py`)
 
@@ -363,10 +363,10 @@ fn pairing_expires_and_consumes_once() {
 - Consumes: `config::save_config/snowflake`, `policy::Pairing`, `transport::Rest`, `cli::register`, `service::install` (Task 11 — code against `service::install(path: &Path) -> Result<(), String>`).
 - Produces: `setup::invite(app_id: &str) -> String` (exact URL `https://discord.com/oauth2/authorize?client_id={id}&scope=bot&permissions=68608`); `setup::run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String>` where `Prompter` has `prompt(&mut self, text: &str) -> Result<String, String>` (visible input), `prompt_hidden(&mut self, text: &str) -> Result<String, String>` (no-echo token), `confirm(&mut self, text: &str) -> Result<bool, String>`. Flow in Python order: TTY check (`Setup needs a terminal for hidden token input` — real prompter reports non-TTY; tests use a fake), existing-config replace confirm (decline → `Ok(false)`), gray binary resolve (`GRAY_BIN` env or `PATH` lookup, else `Install gray first; executable not found`), gray home + provider model check (`Configure a model in gray before setup`), budget prompts + `budget::validate`, hidden token, `Rest::login`, print invite + intent instructions, wait-for-enter, pairing code print, 300 s wait for owner DM (poll gateway events — full wiring in Task 9; here accept an injected `wait_for_pairing: &dyn Fn(&str) -> Result<(String, String), String>` param), owner-ID confirm (decline → `Pairing not confirmed; nothing saved`), home-channel default-to-DM + snowflake check (`Invalid channel ID`), `save_config` with the exact Python field set, `Configuration saved privately.`, `Ok(true)`. CLI `setup` arm: on `Ok(true)` call `register`, print `Outgoing tool registered with gray.`, ask service install (`Enable and start the background service now? [Y/n] `, default yes).
 
-- [ ] **Step 1: Write failing tests** — port `tests/test_setup_cli.py` via the fake `Prompter` (register+install on yes/empty, neither on cancel), plus `setup::run` accept/decline paths with an injected pairing fn.
-- [ ] **Step 2: Implement.**
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): port setup wizard`).
+- [x] **Step 1: Write failing tests** — port `tests/test_setup_cli.py` via the fake `Prompter` (register+install on yes/empty, neither on cancel), plus `setup::run` accept/decline paths with an injected pairing fn.
+- [x] **Step 2: Implement.**
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): port setup wizard`).
 
 ### Task 9: gateway runtime — queue workers, twilight receive, slash, delivery (ports `gateway.py`)
 
@@ -382,10 +382,10 @@ fn pairing_expires_and_consumes_once() {
   - `gateway::run(config_path: &Path) -> Result<(), String>`: parents `0700`, `gateway.lock` non-blocking flock (`Another gateway is running`), budget/model validation then force `budget_required`, twilight shard with intents guild-messages + DMs + message-content, `on_ready` print (`Discord connected; durable owner-only queue enabled.`), register the 4 slash commands (bulk overwrite with the stored `app_id`; skip + warn if unchanged — Hermes `_safe_sync_slash_commands` shape), message handler (admission → `enqueue` with stable Discord message-id, full/ invalid → busy reply text verbatim), slash handler (`/ask` defers via `interaction_callback` then enqueues with `(token, app_id)` stored on the row; `/reset` clears that user's session pointer file; `/status` replies ephemerally with queue depth; `/stop` sets `cancel` on that conversation's running row), delivery worker (fetch channel → `Rest::send` per ordered part with stable nonce `sha256("{id}:{part}")[:24]` → `ack`; slash-originated rows use `followup` instead), `N = concurrency` generation workers + 1 delivery + 1 schedule ticker (`enqueue_due(home)` every 1 s), any worker death stops the process (nonzero exit → systemd restarts), SIGTERM cancels cleanly.
   - Slash command definitions: `ask` (+required string `prompt`), `reset`, `status`, `stop` — descriptions from the gray-history salvage.
 
-- [ ] **Step 1: Write failing tests** (`tests/runtime.rs`): port `tests/test_runtime.py` both tests against `Runtime` with fake runner/deliver (no Discord), plus slash-originated followup routing (row with `interaction_token` → deliver fn receives followup marker, not channel send).
-- [ ] **Step 2: Implement.** Twilight receive: `twilight_gateway::Shard` event loop deserializing `MessageCreate` + `InteractionCreate`; mention/role data read from the event payloads.
-- [ ] **Step 3: Verify** — build locally; CI green (the `GRAY_TEST_BIN` background test runs here too if gray is on CI PATH).
-- [ ] **Step 4: Commit** (`feat(discord): port gateway runtime`).
+- [x] **Step 1: Write failing tests** (`tests/runtime.rs`): port `tests/test_runtime.py` both tests against `Runtime` with fake runner/deliver (no Discord), plus slash-originated followup routing (row with `interaction_token` → deliver fn receives followup marker, not channel send).
+- [x] **Step 2: Implement.** Twilight receive: `twilight_gateway::Shard` event loop deserializing `MessageCreate` + `InteractionCreate`; mention/role data read from the event payloads.
+- [x] **Step 3: Verify** — build locally; CI green (the `GRAY_TEST_BIN` background test runs here too if gray is on CI PATH).
+- [x] **Step 4: Commit** (`feat(discord): port gateway runtime`).
 
 ### Task 10: reactions + typing cadence + chunk-cap notice (Hermes Phase-1 behaviors)
 
@@ -397,10 +397,10 @@ fn pairing_expires_and_consumes_once() {
 - Consumes: Task 9 runtime.
 - Produces: on claim → `add_reaction(channel, message, "👀")` (best-effort, never fails the turn); on terminal state → remove 👀 then `✅` (sent) / `❌` (uncertain/cancelled/budget_blocked) — `adapter.py:3356-3383`; typing POST at most every 8 s per channel during `generate_one` (progress callback, errors swallowed); `complete()` caps at 8 chunks — chunks beyond 8 are replaced by a single notice chunk (`... (truncated, N more characters not sent)`) — `MAX_SPLIT_MESSAGES = 8`. Gated on a `reactions: bool` config flag defaulting true.
 
-- [ ] **Step 1: Append failing tests** — reaction call sequence on success/failure (fake deliver transport recording calls), typing cadence (fake clock: progress ticks at t=0/3/9 → 2 typing calls), 9-chunk answer collapses to 8 + notice.
-- [ ] **Step 2: Implement.**
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): Hermes reactions, typing, chunk cap`).
+- [x] **Step 1: Append failing tests** — reaction call sequence on success/failure (fake deliver transport recording calls), typing cadence (fake clock: progress ticks at t=0/3/9 → 2 typing calls), 9-chunk answer collapses to 8 + notice.
+- [x] **Step 2: Implement.**
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): Hermes reactions, typing, chunk cap`).
 
 ### Task 11: service unit + remaining CLI arms (ports `service.py`, `cli.py` handlers)
 
@@ -412,10 +412,10 @@ fn pairing_expires_and_consumes_once() {
 - Consumes: `gateway::open_store`, `budget::Budget`, `capabilities::prepare`, `service::*`, `setup::run`, `doctor::doctor`.
 - Produces: `service::control(args: &[String]) -> Result<(), String>`, `service::install(path: &Path) -> Result<(), String>`, `service::uninstall() -> Result<(), String>` (exact Python semantics incl. `A different plugin service already exists; uninstall it first`); `service::unit(config_path)` with `ExecStart=<current-exe> run --config <quoted>` (Rust binary replaces `sys.executable -m gray_discord`); CLI arms: `share` (clear/append/dedupe/validate-then-save, `Shared capabilities saved. Only select trusted code/non-secret context. Restart to apply.`), `limits` (`Limits saved; restart the gateway to apply.`), `budget set|status`, `register` (`Outgoing tool registered. Restart existing gray sessions to load it.`), `install` (linger hint), `doctor` (30 s timeout), `run` (SIGTERM → cancel), `schedule add|list|remove` (list prints `{id} {interval} {status}\n` per job), `queue list|cancel`, `allowlist add|remove|list` (snowflake-validated, save via `save_config`; list prints one ID per line), controlled-error envelope (ValueError-ish → message to stderr; anything else → `{kind}: operation failed. Check configuration/connectivity; credentials withheld.`, exit 1).
 
-- [ ] **Step 1: Write failing tests** — port `tests/test_schedule.py` (include the gateway-lock-held online CRUD), CLI allowlist add/list/remove round-trip via subprocess, error-envelope secrecy (bad config → exit 1, no `Traceback`, no token).
-- [ ] **Step 2: Implement.**
-- [ ] **Step 3: Verify** — build locally; CI green.
-- [ ] **Step 4: Commit** (`feat(discord): complete service lifecycle and CLI`).
+- [x] **Step 1: Write failing tests** — port `tests/test_schedule.py` (include the gateway-lock-held online CRUD), CLI allowlist add/list/remove round-trip via subprocess, error-envelope secrecy (bad config → exit 1, no `Traceback`, no token).
+- [x] **Step 2: Implement.**
+- [x] **Step 3: Verify** — build locally; CI green.
+- [x] **Step 4: Commit** (`feat(discord): complete service lifecycle and CLI`).
 
 ### Task 12: release workflow + README cutover docs
 
@@ -427,9 +427,9 @@ fn pairing_expires_and_consumes_once() {
 - Consumes: the built binary (manifest asserts `name == "discord"`, `version == 0.1.0`, `protocol == "1.1"`).
 - Produces: release workflow copied from `gray-background` (same 4-target matrix, tag check, musl linker, `cargo test` gating) with asset prefix `gray-discord-` and binary name `gray-discord`; README gains a `Rust binary (0.2.0)` section — `gray install plugin discord`, prebuilt targets, config reuse/migration note (`allowed_users` defaults `[]`), Python deprecation note (still shipped until Task 15).
 
-- [ ] **Step 1: Write the workflow** (no test code; verify by `actionlint` if available, else careful diff vs background's file).
-- [ ] **Step 2: Verify** — `git diff --no-index` review against background's `release.yml`; local `cargo build --locked` still green.
-- [ ] **Step 3: Commit** (`chore(discord): release workflow and README`).
+- [x] **Step 1: Write the workflow** (no test code; verify by `actionlint` if available, else careful diff vs background's file).
+- [x] **Step 2: Verify** — `git diff --no-index` review against background's `release.yml`; local `cargo build --locked` still green.
+- [x] **Step 3: Commit** (`chore(discord): release workflow and README`).
 
 ### Task 13: gray-core CATALOG pin (separate repo, listed for ordering)
 
@@ -439,8 +439,8 @@ fn pairing_expires_and_consumes_once() {
 **Interfaces:**
 - Consumes: a published `v0.2.0` release of this repo with all four assets present.
 
-- [ ] **Step 1: After tagging `v0.2.0` here and confirming assets**, bump the pin in gray, run gray's plugin-install tests, commit there.
-- [ ] **No code in this repo for this task** — it exists so executors do it in order.
+- [x] **Step 1: After tagging `v0.2.0` here and confirming assets**, bump the pin in gray, run gray's plugin-install tests, commit there.
+- [x] **No code in this repo for this task** — it exists so executors do it in order.
 
 ### Task 14: conformance audit — every Python behavior accounted for
 
@@ -450,9 +450,9 @@ fn pairing_expires_and_consumes_once() {
 **Interfaces:**
 - Consumes: all ported modules + Hermes adapter sections cited in the spec.
 
-- [ ] **Step 1: Build the behavior table** — one row per Python function/branch (`policy.incoming` mention forms, `runner` NDJSON states, `durable` state machine, `gateway` workers, `setup` prompts, every CLI arm) → Rust location → PORTED/DIVERGED/DEFERRED. Every Hermes Phase-1 item from the spec gets a row too.
-- [ ] **Step 2: Fix any PORTED-claimed-but-missing rows** with follow-up commits (or re-mark honestly as DEFERRED with reason).
-- [ ] **Step 3: Commit** (`docs(discord): conformance audit`).
+- [x] **Step 1: Build the behavior table** — one row per Python function/branch (`policy.incoming` mention forms, `runner` NDJSON states, `durable` state machine, `gateway` workers, `setup` prompts, every CLI arm) → Rust location → PORTED/DIVERGED/DEFERRED. Every Hermes Phase-1 item from the spec gets a row too.
+- [x] **Step 2: Fix any PORTED-claimed-but-missing rows** with follow-up commits (or re-mark honestly as DEFERRED with reason).
+- [x] **Step 3: Commit** (`docs(discord): conformance audit`).
 
 ### Task 15: delete the Python package
 
@@ -463,10 +463,10 @@ fn pairing_expires_and_consumes_once() {
 **Interfaces:**
 - Consumes: green CI on the Rust suite + a successful `gray install plugin discord` from a release asset (Task 13 proves it).
 
-- [ ] **Step 1: Verify preconditions** — CI green on `main`, release asset installs, existing `~/.config/gray-discord/config.json` loads (add `allowed_users: []` default on save).
-- [ ] **Step 2: Delete + docs.**
-- [ ] **Step 3: Verify** — `cargo build --locked`, CI green, `grep -ri "python" README.md` shows no install instructions.
-- [ ] **Step 4: Commit** (`chore(discord)!: remove Python implementation (Rust 0.2.0)`).
+- [x] **Step 1: Verify preconditions** — CI green on `main`, release asset installs, existing `~/.config/gray-discord/config.json` loads (add `allowed_users: []` default on save).
+- [x] **Step 2: Delete + docs.**
+- [x] **Step 3: Verify** — `cargo build --locked`, CI green, `grep -ri "python" README.md` shows no install instructions.
+- [x] **Step 4: Commit** (`chore(discord)!: remove Python implementation (Rust 0.2.0)`).
 
 ---
 
