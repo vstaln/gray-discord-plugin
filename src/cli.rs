@@ -1,5 +1,6 @@
 //! CLI tree: `gray-discord --config <path> <subcommand>`. Mirrors gray_discord/cli.py parser().
 use clap::{Parser, Subcommand};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// Standalone Discord transport and setup for gray.
@@ -111,9 +112,77 @@ pub enum AllowlistAction {
     List,
 }
 
-/// Dispatch a parsed subcommand. Full handlers land in their task; until then
-/// every arm fails closed so no half-wired command can run.
-pub fn run(cmd: &Command, _config_path: &Path) -> Result<(), String> {
-    let _ = cmd;
-    Err("not yet implemented".to_string())
+/// Register the outgoing `discord_send` tool in gray's plugin lock.
+/// Matches `gray_plugin::lock::LockEntry` (explicit argv, no fake install).
+pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
+    use serde_json::{json, Value};
+    let gray_home = config
+        .get("gray_home")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let lock = Path::new(gray_home).join("plugins/lock.json");
+    let mut data: Value = std::fs::read(&lock)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({"schema": 1, "plugins": {}}));
+    if data.get("schema").and_then(Value::as_u64) != Some(1)
+        || !data.get("plugins").is_some_and(Value::is_object)
+    {
+        return Err("Unsupported gray plugin lock; not changing it".to_string());
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|_| "cannot locate plugin binary".to_string())?;
+    let resolved = config_path
+        .to_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| config_path.to_string_lossy().into_owned());
+    let argv = vec![
+        Value::String(exe),
+        Value::String("sidecar".to_string()),
+        Value::String("--config".to_string()),
+        Value::String(resolved),
+    ];
+    let previous = data
+        .get("plugins")
+        .and_then(|p| p.get("discord"))
+        .and_then(|d| d.get("argv"))
+        .cloned();
+    if let Some(prev) = previous {
+        if prev != Value::Array(argv.clone()) {
+            return Err(
+                "Another discord plugin is registered; refusing to overwrite it".to_string(),
+            );
+        }
+    }
+    let installed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    data["plugins"]["discord"] = json!({
+        "ecosystem": "gray-native",
+        "version": "0.1.0",
+        "hash": "",
+        "source": "https://github.com/vstaln/gray-discord-plugin",
+        "argv": argv,
+        "adapter_version": "1.1",
+        "installed_at": installed_at,
+        "scope": "user",
+        "enabled": true
+    });
+    crate::config::atomic_json(&lock, &data)
+}
+
+/// Dispatch a parsed subcommand. Arms without a landed task fail closed so
+/// no half-wired command can run.
+pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
+    use serde_json::Value;
+    match cmd {
+        Command::Sidecar => crate::sidecar::serve(config_path),
+        Command::Register => {
+            let config: Value = crate::config::load_config(config_path)?;
+            register(&config, config_path)
+        }
+        _ => Err("not yet implemented".to_string()),
+    }
 }
