@@ -5,7 +5,7 @@ its own setup wizard and background service. Public source, no Discord code
 added to gray. Standalone compiled Rust binary using twilight and SQLite durable
 queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
 
-**Status: standalone Rust binary (0.2.0).** Requires matching
+**Status: standalone Rust binary (0.1.0).** Requires matching
 gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 

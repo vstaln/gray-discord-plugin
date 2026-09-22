@@ -161,7 +161,7 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         .unwrap_or_default();
     data["plugins"]["discord"] = json!({
         "ecosystem": "gray-native",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "hash": "",
         "source": "https://github.com/vstaln/gray-discord-plugin",
         "argv": argv,
