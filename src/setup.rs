@@ -114,22 +114,52 @@ fn is_executable(path: &Path) -> bool {
 
 /// Run the setup wizard. `wait_for_pairing` polls gateway events for the
 /// owner's DM; it receives the bot token and the printed code and returns
-/// `(owner_id, dm_channel_id)`.
-pub async fn run(
-    path: &Path,
-    io: &mut dyn Prompter,
-    wait_for_pairing: &WaitForPairing,
-) -> Result<bool, String> {
-    run_with_login(path, io, wait_for_pairing, &default_login).await
+/// `(owner_id, dm_channel_id)`. Only used when the caller asks for pairing.
+pub struct Wiring {
+    pub login: &'static LoginStep,
+    /// Open the DM channel with a user (setup's home channel).
+    pub dm: &'static DmStep,
+    /// The app's own doctor, run after the config is written.
+    pub verify: &'static VerifyStep,
+    /// The gateway-code wait, for `--pair`.
+    pub pairing: &'static WaitForPairing,
+    /// Overrides for the silent gray-path resolution (`GRAY_BIN` / `GRAY_HOME`
+    /// in production); tests pin them instead of mutating the environment.
+    pub gray_bin: Option<String>,
+    pub gray_home: Option<String>,
 }
 
-/// Test seam: production login (30 s bound) vs stub returning an app id.
-/// Keeps network out of unit tests; the CLI always passes `default_login`.
-pub async fn run_with_login(
+/// Everything setup needs from the outside world. Production defaults in
+/// [`Wiring::production`]; tests inject stubs and keep the network out.
+pub type DmStep = dyn Fn(&str, u64) -> DmFut;
+pub type VerifyStep = dyn Fn(&Value) -> VerifyFut;
+
+impl Wiring {
+    pub fn production() -> Self {
+        Self {
+            login: &default_login,
+            dm: &default_dm,
+            verify: &default_verify,
+            pairing: &default_pairing,
+            gray_bin: None,
+            gray_home: None,
+        }
+    }
+}
+
+/// The wizard. `pair` selects the DM-code dance for discovering the owner's
+/// ID; the default path just asks for the ID (Hermes parity: token + your
+/// user ID, done).
+pub async fn run(path: &Path, io: &mut dyn Prompter, pair: bool) -> Result<bool, String> {
+    let wiring = Wiring::production();
+    run_wired(path, io, &wiring, pair).await
+}
+
+pub async fn run_wired(
     path: &Path,
     io: &mut dyn Prompter,
-    wait_for_pairing: &WaitForPairing,
-    login: &LoginStep,
+    wiring: &Wiring,
+    pair: bool,
 ) -> Result<bool, String> {
     if !io.is_terminal() {
         return Err("Setup needs a terminal for hidden token input".to_string());
@@ -137,112 +167,138 @@ pub async fn run_with_login(
     if path.exists() && !io.confirm("Replace existing configuration? [y/N] ")? {
         return Ok(false);
     }
-    let default_gray = std::env::var("GRAY_BIN").unwrap_or_else(|_| "gray".to_string());
-    let gray_answer = io.prompt(&format!("gray binary [{default_gray}]: "))?;
-    let gray_input = gray_answer.trim();
-    let gray_name = if gray_input.is_empty() {
-        &default_gray
-    } else {
-        gray_input
+    // Hermes parity: one secret, one identity. Gray's binary and home are
+    // resolved silently (env, then the conventional defaults) — they are
+    // derived facts, not questions.
+    let gray = match &wiring.gray_bin {
+        Some(g) => g.clone(),
+        None => resolve_gray(&std::env::var("GRAY_BIN").unwrap_or_else(|_| "gray".to_string()))
+            .ok_or_else(|| "Install gray first; executable not found".to_string())?,
     };
-    let Some(gray) = resolve_gray(gray_name) else {
-        return Err("Install gray first; executable not found".to_string());
+    let gray_home = match &wiring.gray_home {
+        Some(h) => absolutize(Path::new(h)),
+        None => absolutize(Path::new(&shellexpand_home(
+            &std::env::var("GRAY_HOME").unwrap_or_else(|_| "~/.gray".to_string()),
+        ))),
     };
-    let default_home = std::env::var("GRAY_HOME").unwrap_or_else(|_| "~/.gray".to_string());
-    let home_answer = io.prompt(&format!("Gray provider home [{default_home}]: "))?;
-    let home_text = home_answer.trim();
-    let home_raw = if home_text.is_empty() {
-        &default_home
-    } else {
-        home_text
-    };
-    let expanded = shellexpand_home(home_raw);
-    let gray_home = Path::new(&expanded);
-    let provider: Value = std::fs::read(gray_home.join("config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(Value::Null);
-    let model = provider.get("model").and_then(Value::as_str).unwrap_or("");
-    if model.is_empty() {
-        return Err("Configure a model in gray before setup".to_string());
-    }
-    // Budget is opt-in accounting (gateway-side parity with `budget set`):
-    // declining writes no policy, and the daemon then starts with no ledger.
-    let mut policy: Option<Value> = None;
-    if io.confirm("Set a daily spend budget now? [y/N] ")? {
-        io.print_line(
-            "Set a daily allowance and conservative model prices. Unknown pricing is not free.",
-        );
-        io.print_line(
-            "Client limits stop subsequent requests; configure provider-side caps for a hard invoice limit.",
-        );
-        let daily = io.prompt("Daily budget USD: ")?;
-        let turn = io.prompt("Per-turn budget USD: ")?;
-        let input_pm = io.prompt("Input USD per million tokens (0 only if genuinely free): ")?;
-        let output_pm = io.prompt("Output USD per million tokens (include reasoning): ")?;
-        let offered = json!({
-            "model": model,
-            "daily_usd": daily.trim(),
-            "turn_usd": turn.trim(),
-            "input_per_million": input_pm.trim(),
-            "output_per_million": output_pm.trim()
-        });
-        crate::budget::validate(&offered, model).map_err(|e| e.to_string())?;
-        policy = Some(offered);
-    }
 
-    let token = io.prompt_hidden("Discord BOT token (hidden): ")?;
+    let token = io.prompt_hidden("Discord bot token (hidden): ")?;
     let token = token.trim().to_string();
-    let app_id = login(&token).await?;
+    let app_id = (wiring.login)(&token).await?;
     io.print_line(&format!("Invite your bot: {}", invite(&app_id)));
     io.print_line("Enable Message Content Intent in the Discord developer portal.");
-    let _ = io.prompt("Press Enter after inviting the bot and enabling the intent. ")?;
 
-    let pairing = crate::policy::Pairing::new(now_secs());
-    io.print_line(&format!(
-        "DM this one-time code to the bot within five minutes: {}",
-        pairing.code
-    ));
-    let (owner, dm) = wait_for_pairing(&token, &pairing.code).await?;
-    io.print_line(&format!("Candidate owner ID: {owner}"));
-    if !io.confirm("Confirm this is your Discord account? [y/N] ")? {
-        return Err("Pairing not confirmed; nothing saved".to_string());
-    }
-    let channel_answer = io.prompt(&format!("Home channel ID [your DM: {dm}]: "))?;
-    let channel = channel_answer.trim();
-    let channel = if channel.is_empty() {
-        dm
+    // Who may talk to the bot: the owner (first ID) plus an optional
+    // allowlist. The home channel is then the DM with the owner — created,
+    // never asked for.
+    let (owner, mut allowed) = if pair {
+        let pairing = crate::policy::Pairing::new(now_secs());
+        io.print_line(&format!(
+            "DM this one-time code to the bot within five minutes: {}",
+            pairing.code
+        ));
+        let (owner, dm) = (wiring.pairing)(&token, &pairing.code).await?;
+        io.print_line(&format!("Owner ID: {owner} (home channel: your DM {dm})"));
+        (owner, Vec::new())
     } else {
-        channel.to_string()
+        let answer = io.prompt("Your Discord user ID (comma-separated to also allow others): ")?;
+        let mut ids: Vec<String> = answer
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        anyhow_ids(&ids)?;
+        let owner = ids.remove(0);
+        (owner, ids)
     };
-    if !crate::config::snowflake(&Value::String(channel.clone())) {
-        return Err("Invalid channel ID".to_string());
+    if !crate::config::snowflake(&Value::String(owner.clone())) {
+        return Err("User IDs must be Discord snowflakes".to_string());
     }
+    allowed.retain(|id| crate::config::snowflake(&Value::String(id.clone())));
+
+    let owner_num: u64 = owner
+        .parse()
+        .map_err(|_| "User IDs must be Discord snowflakes".to_string())?;
+    let dm_channel = (wiring.dm)(&token, owner_num).await?;
+
     // Python parity (`setup.py`): `Path(gray).absolute()`,
     // `gray_home.expanduser().resolve()`, `path.parent.resolve()` — the saved
     // config must hold absolute paths or `save_config` validation rejects it.
-    let gray = absolutize(Path::new(&gray)).to_string_lossy().into_owned();
-    let gray_home = absolutize(Path::new(&expanded));
     let workdir = path
         .parent()
         .map(|p| absolutize(p).to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    // A declined budget writes no key at all: an absent policy means "no
-    // ledger" (gateway parity), and `validate_config` rejects a null one.
     let mut saved = json!({
         "token": token,
         "owner_id": owner,
-        "channel_id": channel,
-        "gray_bin": gray,
+        "channel_id": dm_channel.to_string(),
+        "gray_bin": absolutize(Path::new(&gray)).to_string_lossy(),
         "gray_home": gray_home.to_string_lossy(),
         "workdir": workdir
     });
-    if let Some(policy) = policy {
-        saved["budget"] = policy;
+    if !allowed.is_empty() {
+        saved["allowed_users"] = Value::Array(allowed.into_iter().map(Value::String).collect());
     }
     crate::config::save_config(path, &saved)?;
     io.print_line("Configuration saved privately.");
+
+    // Prove it with the app's own doctor before anyone is told it worked.
+    let report = (wiring.verify)(&saved).await;
+    match report {
+        Ok(()) => io.print_line("Doctor verified the configuration."),
+        Err(e) => io.print_line(&format!("Doctor disagreed (fix and re-run): {e}")),
+    }
     Ok(true)
+}
+
+/// Snowflake check for every comma-separated ID, with the same error text.
+fn anyhow_ids(ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err("At least your own user ID is required".to_string());
+    }
+    if ids
+        .iter()
+        .any(|id| !crate::config::snowflake(&Value::String(id.clone())))
+    {
+        return Err("User IDs must be Discord snowflakes".to_string());
+    }
+    Ok(())
+}
+
+/// The production DM open: POST /users/@me/channels with a 30 s bound.
+pub type DmFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send>>;
+
+pub fn default_dm(token: &str, owner: u64) -> DmFut {
+    let token = token.to_string();
+    Box::pin(async move {
+        let rest = crate::transport::Rest::production(&token);
+        tokio::time::timeout(std::time::Duration::from_secs(30), rest.create_dm(owner))
+            .await
+            .map_err(|_| "Discord did not answer opening your DM".to_string())?
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The production doctor, bounded like the CLI's own (30 s).
+pub type VerifyFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+pub fn default_verify(config: &Value) -> VerifyFut {
+    let config = config.clone();
+    Box::pin(async move {
+        let token = config
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let rest = crate::transport::Rest::production(&token);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::doctor::check(&config, &rest),
+        )
+        .await
+        .map_err(|_| "doctor timed out after 30s".to_string())?
+    })
 }
 
 /// The production pairing wait: one bare gateway connection that accepts

@@ -25,7 +25,14 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    Setup,
+    /// Interactive setup. Default: Hermes parity — token plus your user ID,
+    /// home channel is your DM. `--pair` instead discovers your ID from a
+    /// DM you send the bot (the OpenClaw-style code dance).
+    Setup {
+        /// Discover the owner's ID by DMing a one-time code to the bot.
+        #[arg(long)]
+        pair: bool,
+    },
     Run,
     Sidecar,
     Register,
@@ -69,6 +76,10 @@ pub enum Command {
         #[command(subcommand)]
         action: AllowlistAction,
     },
+    Pairing {
+        #[command(subcommand)]
+        action: PairingAction,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -110,6 +121,18 @@ pub enum AllowlistAction {
     Add { id: String },
     Remove { id: String },
     List,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PairingAction {
+    /// Approve a code the bot handed an unconfigured DMer: they join the
+    /// allowlist (or become the owner if none is set yet).
+    Approve {
+        /// Platform the code was issued for. Only `discord` exists.
+        platform: String,
+        /// The code from the bot's DM reply.
+        code: String,
+    },
 }
 
 /// Register the outgoing `discord_send` tool in gray's plugin lock.
@@ -190,7 +213,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             let config: Value = crate::config::load_config(config_path)?;
             register(&config, config_path)
         }
-        Command::Setup => {
+        Command::Setup { pair } => {
             use crate::setup::Prompter;
             let mut io = crate::setup::Tty;
             // setup is async; drive it on a throwaway current-thread runtime
@@ -199,13 +222,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|_| "cannot start setup runtime".to_string())?;
-            // Production pairing: one bare gateway connection waits for the
-            // owner's DM carrying the printed code, then hands back the IDs.
-            let done = rt.block_on(crate::setup::run(
-                config_path,
-                &mut io,
-                &crate::setup::default_pairing,
-            ))?;
+            let done = rt.block_on(crate::setup::run(config_path, &mut io, *pair))?;
             if done {
                 let config: Value = crate::config::load_config(config_path)?;
                 register(&config, config_path)?;
@@ -450,6 +467,13 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 }
             }
         }
+        Command::Pairing { action } => match action {
+            PairingAction::Approve { platform, code } => {
+                let line = crate::pairing::approve(config_path, platform, code)?;
+                println!("{line}");
+                Ok(())
+            }
+        },
         Command::Allowlist { action } => {
             let mut config = crate::config::load_config(config_path)?;
             let mut allowed: Vec<String> = config

@@ -268,6 +268,25 @@ impl Rest {
     }
 
     /// Typing indicator. Best-effort: never fails a turn.
+    /// Open (or re-open) the DM channel with a user: POST
+    /// /users/@me/channels. Used by setup to make the owner's DM the home
+    /// channel without asking them to hunt an ID.
+    pub async fn create_dm(&self, user_id: u64) -> Result<u64, TransportError> {
+        self.post(
+            "/users/@me/channels",
+            &serde_json::json!({ "recipient_id": user_id.to_string() }),
+        )
+        .await
+        .and_then(|v| {
+            v.get("id")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    TransportError::Invalid("Discord did not return a DM channel".into())
+                })
+        })
+    }
+
     pub async fn typing(&self, channel: u64) {
         let _ = self
             .post(&format!("/channels/{channel}/typing"), &json!({}))

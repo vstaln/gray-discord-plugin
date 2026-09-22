@@ -45,14 +45,39 @@ gray discord setup
 gray discord status
 ```
 
-Setup reads the bot token with hidden terminal input, validates it against
-Discord's own API, prints an invite link, then connects one short-lived
-gateway and asks you to DM a one-time code to the bot. The code expires in
-five minutes. Confirm the resulting user ID locally before configuration is
-saved. Only that account and explicitly allowlisted users can trigger the agent.
-Enable Message Content Intent in the Discord developer portal. Pick a home
-channel (your DM by default). The spend budget is optional: decline and the
-daemon runs with no ledger; `gray discord budget set` opts in later.
+Setup is one command (Hermes parity — token plus your user ID, nothing else):
+
+```sh
+gray discord setup
+```
+
+```
+Discord bot token (hidden): ••••••••
+Your Discord user ID (comma-separated to also allow others): 1493623750858375228,1502…
+```
+
+The wizard validates the token against Discord's own API, makes your DM the
+home channel (created, never asked for), writes the config privately, and
+runs the doctor. Your first ID is the owner; the rest join the allowlist.
+Enable Message Content Intent in the Developer Portal (the doctor checks it).
+Don't know your user ID? `gray discord setup --pair` instead prints a
+one-time code, you DM it to the bot, and the wizard discovers your ID and DM
+channel from that DM.
+
+**Pairing happens on Discord too.** Once the bot is running, anyone can DM
+it: an unconfigured human is told their own Discord ID and a pairing code,
+and the owner admits them with one command:
+
+```
+access not configured.
+Your Discord user id: 1493623750858375228
+Pairing code: SNU3ZQ37
+Ask the bot owner to approve with:
+gray discord pairing approve discord SNU3ZQ37
+```
+
+Codes are single-use; approving before an owner exists makes that user the
+owner. A running gateway applies approvals on restart.
 
 The wizard never sends credentials to a model. Private config is written
 atomically with mode 600. Do not paste bot tokens into chat or command arguments.

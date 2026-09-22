@@ -548,6 +548,15 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                         .await;
                                 }
                             }
+                        } else if let Some(reply) =
+                            crate::pairing::reply_for(&store, &author_id, is_dm, m.author.bot)
+                        {
+                            // Unknown human DMing the bot: tell them their own
+                            // ID and mint a code — the owner approves it with
+                            // `gray discord pairing approve discord <code>`.
+                            if let Ok(ch) = channel_id.parse::<u64>() {
+                                let _ = rest.send(ch, &reply, None).await;
+                            }
                         }
                     }
                     Some(Ok(Event::InteractionCreate(ic))) => {

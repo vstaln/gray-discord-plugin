@@ -116,6 +116,10 @@ Tests exercise the real gray binary with loopback model/Discord endpoints,
 redacted-prompt resumption, conversation isolation, background delivery failure
 and restart, a budget overage blocking the next run, cancellation, online schedule
 edits, and selected capabilities. No user token/provider key is read by tests.
+`owner_id` in the config is optional: absent means nobody is admitted yet,
+and every human DM draws a pairing reply (their own ID plus a single-use
+code) until `gray discord pairing approve discord <code>` lands — the
+OpenClaw bootstrap. A running gateway re-reads approvals on restart.
 Live Discord pairing now runs in setup itself: one short-lived gateway
 connection waits for the owner's DM (see `setup::default_pairing`). The
 service lifecycle runs under runit, systemd --user, or gray's own detached

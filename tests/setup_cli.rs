@@ -1,4 +1,6 @@
-use gray_discord::setup::{invite, run, run_with_login, Prompter};
+use gray_discord::setup::{
+    invite, run_wired, DmStep, LoginStep, PairingFut, Prompter, VerifyStep, Wiring,
+};
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -36,7 +38,7 @@ impl Prompter for Fake {
         self.log.push(text.to_string());
         self.hidden
             .pop_front()
-            .ok_or_else(|| "no more hidden".to_string())
+            .ok_or_else(|| "no more hidden answers".to_string())
     }
     fn confirm(&mut self, text: &str) -> Result<bool, String> {
         self.log.push(text.to_string());
@@ -51,8 +53,23 @@ impl Prompter for Fake {
     }
 }
 
-/// Pairing stub: accept the printed code, return a fixed owner + DM channel.
-fn pairing_ok(_token: &str, code: &str) -> gray_discord::setup::PairingFut {
+fn stub_login(_token: &str) -> gray_discord::setup::LoginFut {
+    Box::pin(async { Ok("999".to_string()) })
+}
+
+fn stub_dm(_token: &str, _owner: u64) -> gray_discord::setup::DmFut {
+    Box::pin(async { Ok(222) })
+}
+
+fn verify_ok(_config: &serde_json::Value) -> gray_discord::setup::VerifyFut {
+    Box::pin(async { Ok(()) })
+}
+
+fn verify_bad(_config: &serde_json::Value) -> gray_discord::setup::VerifyFut {
+    Box::pin(async { Err("Enable Message Content Intent".to_string()) })
+}
+
+fn pairing_ok(_token: &str, code: &str) -> PairingFut {
     let code = code.to_string();
     Box::pin(async move {
         assert!(!code.is_empty(), "pairing code must be shown");
@@ -60,84 +77,32 @@ fn pairing_ok(_token: &str, code: &str) -> gray_discord::setup::PairingFut {
     })
 }
 
-fn stub_login(_token: &str) -> gray_discord::setup::LoginFut {
-    Box::pin(async { Ok("999".to_string()) })
-}
-
-/// Drive the wizard without network: stub login returns app id "999".
-async fn run_offline(
-    path: &std::path::Path,
-    io: &mut Fake,
-    wait: &gray_discord::setup::WaitForPairing,
-) -> Result<bool, String> {
-    run_with_login(path, io, wait, &stub_login).await
-}
-
-fn pairing_fail(_token: &str, _code: &str) -> gray_discord::setup::PairingFut {
+fn pairing_fail(_token: &str, _code: &str) -> PairingFut {
     Box::pin(async {
         Err("Pairing failed or expired; check intent and DM permissions".to_string())
     })
 }
 
-fn provider_home(root: &Path, model: Option<&str>) -> std::path::PathBuf {
-    let home = root.join("gray-home");
-    std::fs::create_dir(&home).unwrap();
-    let mut provider = serde_json::json!({});
-    if let Some(model) = model {
-        provider["model"] = model.into();
+fn wiring(pairing: &'static gray_discord::setup::WaitForPairing, home: &Path) -> Wiring {
+    Wiring {
+        login: &stub_login as &LoginStep,
+        dm: &stub_dm as &DmStep,
+        verify: &verify_ok as &VerifyStep,
+        pairing,
+        gray_bin: Some("/bin/true".to_string()),
+        gray_home: Some(home.to_string_lossy().into_owned()),
     }
-    gray_discord::config::atomic_json(&home.join("config.json"), &provider).unwrap();
-    home
 }
 
-fn base_answers(home: &std::path::Path) -> Vec<String> {
-    vec![
-        // gray binary prompt: absolute fixture exe.
-        "/bin/true".to_string(),
-        // gray home prompt.
-        home.to_str().unwrap().to_string(),
-        // budget question first (opt-in; "n" declines for most tests).
-        "n".to_string(),
-        // wait-for-enter after invite.
-        String::new(),
-    ]
+fn wiring_bad_doctor(pairing: &'static gray_discord::setup::WaitForPairing, home: &Path) -> Wiring {
+    Wiring {
+        verify: &verify_bad as &VerifyStep,
+        ..wiring(pairing, home)
+    }
 }
 
-/// The four answers the budget quiz asks for when accepted.
-fn budget_answers() -> Vec<String> {
-    vec![
-        "y".to_string(),
-        "5".to_string(),
-        "1".to_string(),
-        "2".to_string(),
-        "3".to_string(),
-    ]
-}
-
-#[tokio::test]
-async fn declined_budget_writes_no_policy() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = provider_home(tmp.path(), Some("test-model"));
-    // base_answers already declines the budget question ("n").
-    let mut answers = base_answers(&home);
-    answers.push("y".to_string());
-    answers.push(String::new());
-    let mut io = Fake::new(
-        true,
-        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &["FIXTURETOKEN"],
-    );
-    let path = tmp.path().join("config.json");
-    assert!(run_offline(&path, &mut io, &pairing_ok).await.unwrap());
-    // load_config validates: a null budget would be rejected here, proving
-    // the declined path really omits the key.
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(
-        config.get("budget").is_none(),
-        "declined budget must vanish"
-    );
-    gray_discord::config::load_config(&path).expect("declined config must load");
+async fn run_offline(path: &Path, io: &mut Fake, w: &Wiring, pair: bool) -> Result<bool, String> {
+    run_wired(path, io, w, pair).await
 }
 
 #[test]
@@ -152,9 +117,14 @@ fn invite_url_is_exact() {
 async fn non_terminal_refuses_hidden_token_input() {
     let tmp = tempfile::tempdir().unwrap();
     let mut io = Fake::new(false, &[], &[]);
-    let err = run_offline(&tmp.path().join("config.json"), &mut io, &pairing_ok)
-        .await
-        .unwrap_err();
+    let err = run_offline(
+        &tmp.path().join("config.json"),
+        &mut io,
+        &wiring(&pairing_ok, tmp.path()),
+        false,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err, "Setup needs a terminal for hidden token input");
 }
 
@@ -165,94 +135,131 @@ async fn existing_config_decline_keeps_old_file() {
     std::fs::write(&path, "{\"kept\":true}").unwrap();
     // First answer is the replace confirm ("n" → decline).
     let mut io = Fake::new(true, &["n"], &[]);
-    assert!(!run_offline(&path, &mut io, &pairing_ok).await.unwrap());
+    assert!(
+        !run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), false)
+            .await
+            .unwrap()
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"kept\":true}");
 }
 
 #[tokio::test]
-async fn accept_path_saves_exact_field_set() {
+async fn hermes_path_is_token_plus_your_id() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = provider_home(tmp.path(), Some("test-model"));
-    let mut answers = base_answers(&home);
-    // Replace the default budget "n" with the accepted quiz answers.
-    answers.splice(2..3, budget_answers());
-    // owner-ID confirm (yes) + home-channel default (empty → DM id).
-    answers.push("y".to_string());
-    answers.push(String::new());
-    let mut io = Fake::new(
-        true,
-        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &["FIXTURETOKEN"],
-    );
+    let mut io = Fake::new(true, &["111,333,444"], &["FIXTURETOKEN"]);
     let path = tmp.path().join("config.json");
-    assert!(run_offline(&path, &mut io, &pairing_ok).await.unwrap());
+    assert!(
+        run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), false)
+            .await
+            .unwrap()
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // owner is the first ID; the rest are the allowlist; the home channel is
+    // the DM the wizard created (stub 222) — never asked, never hunted.
+    assert_eq!(saved["owner_id"], "111");
+    assert_eq!(saved["channel_id"], "222");
+    assert_eq!(saved["allowed_users"][0], "333");
+    assert_eq!(saved["allowed_users"][1], "444");
+    assert_eq!(saved["gray_bin"], "/bin/true");
+    // Budget is not part of the wizard; validate_config would reject a null.
+    assert!(saved.get("budget").is_none());
+    // The doctor ran and agreed; the token never appeared anywhere.
+    assert!(io.log.iter().any(|l| l.contains("Doctor verified")));
+    assert!(io.log.iter().all(|l| !l.contains("FIXTURETOKEN")));
+    gray_discord::config::load_config(&path).expect("saved config must validate");
+    // Exactly two questions were asked: the token and your IDs.
+    assert_eq!(
+        io.log
+            .iter()
+            .filter(|l| l.contains("(hidden)") || l.contains("comma-separated"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn pair_path_discovers_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut io = Fake::new(true, &[], &["FIXTURETOKEN"]);
+    let path = tmp.path().join("config.json");
+    assert!(
+        run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), true)
+            .await
+            .unwrap()
+    );
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(saved["owner_id"], "111");
     assert_eq!(saved["channel_id"], "222");
-    assert_eq!(saved["budget"]["model"], "test-model");
-    assert_eq!(saved["gray_bin"], "/bin/true");
-    assert!(saved.get("budget").is_some_and(|b| b.is_object()));
-    // Token is stored but never printed: no log line may contain it.
-    assert!(io.log.iter().all(|l| !l.contains("FIXTURETOKEN")));
+    assert!(saved.get("allowed_users").is_none());
     assert!(io
         .log
         .iter()
-        .any(|l| l.contains("Configuration saved privately.")));
+        .any(|l| l.contains("one-time code to the bot")));
+    assert!(io.log.iter().all(|l| !l.contains("FIXTURETOKEN")));
 }
 
 #[tokio::test]
-async fn owner_decline_saves_nothing() {
+async fn pair_failure_saves_nothing() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = provider_home(tmp.path(), Some("test-model"));
-    let mut answers = base_answers(&home);
-    answers.push("n".to_string());
-    let mut io = Fake::new(
-        true,
-        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &["FIXTURETOKEN"],
-    );
+    let mut io = Fake::new(true, &[], &["FIXTURETOKEN"]);
     let path = tmp.path().join("config.json");
-    let err = run_offline(&path, &mut io, &pairing_ok).await.unwrap_err();
-    assert_eq!(err, "Pairing not confirmed; nothing saved");
-    assert!(!path.exists());
-}
-
-#[tokio::test]
-async fn pairing_timeout_surfaces_python_message() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = provider_home(tmp.path(), Some("test-model"));
-    let answers = base_answers(&home);
-    let mut io = Fake::new(
-        true,
-        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &["FIXTURETOKEN"],
-    );
-    let err = run_offline(&tmp.path().join("config.json"), &mut io, &pairing_fail)
+    let err = run_offline(&path, &mut io, &wiring(&pairing_fail, tmp.path()), true)
         .await
         .unwrap_err();
     assert_eq!(
         err,
         "Pairing failed or expired; check intent and DM permissions"
     );
+    assert!(!path.exists());
 }
 
 #[tokio::test]
-async fn bad_channel_id_is_rejected() {
+async fn empty_id_list_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = provider_home(tmp.path(), Some("test-model"));
-    let mut answers = base_answers(&home);
-    answers.push("y".to_string());
-    answers.push("not-an-id".to_string());
-    let mut io = Fake::new(
-        true,
-        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &["FIXTURETOKEN"],
-    );
-    let err = run_offline(&tmp.path().join("config.json"), &mut io, &pairing_ok)
+    let mut io = Fake::new(true, &["   "], &["FIXTURETOKEN"]);
+    let path = tmp.path().join("config.json");
+    let err = run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), false)
         .await
         .unwrap_err();
-    assert_eq!(err, "Invalid channel ID");
+    assert_eq!(err, "At least your own user ID is required");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn non_snowflake_id_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut io = Fake::new(true, &["not-an-id,222"], &["FIXTURETOKEN"]);
+    let path = tmp.path().join("config.json");
+    let err = run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), false)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "User IDs must be Discord snowflakes");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn doctor_disagreement_is_reported_but_the_config_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut io = Fake::new(true, &["111"], &["FIXTURETOKEN"]);
+    let path = tmp.path().join("config.json");
+    assert!(run_offline(
+        &path,
+        &mut io,
+        &wiring_bad_doctor(&pairing_ok, tmp.path()),
+        false
+    )
+    .await
+    .unwrap());
+    // The save is never rolled back — the operator fixes the intent and
+    // re-runs the doctor; but nothing claims success.
+    assert!(path.exists());
+    assert!(io
+        .log
+        .iter()
+        .any(|l| l.contains("Doctor disagreed") && l.contains("Message Content Intent")));
+    assert!(!io.log.iter().any(|l| l.contains("Doctor verified")));
 }
 
 #[test]
@@ -260,8 +267,6 @@ fn cli_setup_registers_and_optionally_installs() {
     // Ports test_setup_cli.py: register on Ok(true) + install prompt default.
     // The CLI arm reads the answer via `prompt` and decides with
     // `cli::install_confirmed` (Python: `strip().lower() in ('', 'y', 'yes')`).
-    // `service::install` is still a Task-11 stub, so the test records the
-    // decision instead of touching systemd.
     for (answer, start) in [
         ("y", true),
         ("", true),
@@ -289,24 +294,4 @@ fn cli_setup_registers_and_optionally_installs() {
         .unwrap();
         assert_eq!(data["plugins"]["discord"]["adapter_version"], "1.1");
     }
-}
-
-#[test]
-fn cli_setup_cancel_registers_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    // No lock file is created when setup returns false.
-    assert!(!tmp.path().join("plugins/lock.json").exists());
-}
-
-#[tokio::test]
-async fn run_requires_terminal_without_network() {
-    // `run` wires the production login, but the TTY guard fires first, so
-    // this exercises the production entry without touching the network
-    // (global constraint: no live network in tests).
-    let tmp = tempfile::tempdir().unwrap();
-    let mut io = Fake::new(false, &[], &[]);
-    let err = run(&tmp.path().join("config.json"), &mut io, &pairing_ok)
-        .await
-        .unwrap_err();
-    assert_eq!(err, "Setup needs a terminal for hidden token input");
 }
