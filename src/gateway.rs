@@ -645,7 +645,16 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     Some(Err(e)) => {
                         eprintln!("[discord] gateway error: {e}");
                     }
-                    None => break,
+                    None => {
+                        // The stream only ends on a fatal close (bad token,
+                        // disabled privileged intent, or dropped network).
+                        // Say so: an exit-0 silence would restart-loop under
+                        // a supervisor with empty logs.
+                        eprintln!(
+                            "[discord] gateway closed the connection (token, Message Content Intent, or network); exiting"
+                        );
+                        break;
+                    }
                     _ => {}
                 }
             }
