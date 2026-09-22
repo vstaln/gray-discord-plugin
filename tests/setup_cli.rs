@@ -52,9 +52,12 @@ impl Prompter for Fake {
 }
 
 /// Pairing stub: accept the printed code, return a fixed owner + DM channel.
-fn pairing_ok(code: &str) -> gray_discord::setup::PairingResult {
-    assert!(!code.is_empty(), "pairing code must be shown");
-    Ok(("111".to_string(), "222".to_string()))
+fn pairing_ok(_token: &str, code: &str) -> gray_discord::setup::PairingFut {
+    let code = code.to_string();
+    Box::pin(async move {
+        assert!(!code.is_empty(), "pairing code must be shown");
+        Ok(("111".to_string(), "222".to_string()))
+    })
 }
 
 fn stub_login(_token: &str) -> gray_discord::setup::LoginFut {
@@ -70,8 +73,10 @@ async fn run_offline(
     run_with_login(path, io, wait, &stub_login).await
 }
 
-fn pairing_fail(_code: &str) -> gray_discord::setup::PairingResult {
-    Err("Pairing failed or expired; check intent and DM permissions".to_string())
+fn pairing_fail(_token: &str, _code: &str) -> gray_discord::setup::PairingFut {
+    Box::pin(async {
+        Err("Pairing failed or expired; check intent and DM permissions".to_string())
+    })
 }
 
 fn provider_home(root: &Path, model: Option<&str>) -> std::path::PathBuf {
@@ -91,14 +96,48 @@ fn base_answers(home: &std::path::Path) -> Vec<String> {
         "/bin/true".to_string(),
         // gray home prompt.
         home.to_str().unwrap().to_string(),
-        // budget prompts: daily, turn, input/M, output/M.
+        // budget question first (opt-in; "n" declines for most tests).
+        "n".to_string(),
+        // wait-for-enter after invite.
+        String::new(),
+    ]
+}
+
+/// The four answers the budget quiz asks for when accepted.
+fn budget_answers() -> Vec<String> {
+    vec![
+        "y".to_string(),
         "5".to_string(),
         "1".to_string(),
         "2".to_string(),
         "3".to_string(),
-        // wait-for-enter after invite.
-        String::new(),
     ]
+}
+
+#[tokio::test]
+async fn declined_budget_writes_no_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = provider_home(tmp.path(), Some("test-model"));
+    // base_answers already declines the budget question ("n").
+    let mut answers = base_answers(&home);
+    answers.push("y".to_string());
+    answers.push(String::new());
+    let mut io = Fake::new(
+        true,
+        &answers.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        &["FIXTURETOKEN"],
+    );
+    let path = tmp.path().join("config.json");
+    assert!(run_offline(&path, &mut io, &pairing_ok).await.unwrap());
+    // load_config validates: a null budget would be rejected here, proving
+    // the declined path really omits the key.
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        config.get("budget").is_none(),
+        "declined budget must vanish"
+    );
+    gray_discord::config::load_config(&path).expect("declined config must load");
 }
 
 #[test]
@@ -135,6 +174,8 @@ async fn accept_path_saves_exact_field_set() {
     let tmp = tempfile::tempdir().unwrap();
     let home = provider_home(tmp.path(), Some("test-model"));
     let mut answers = base_answers(&home);
+    // Replace the default budget "n" with the accepted quiz answers.
+    answers.splice(2..3, budget_answers());
     // owner-ID confirm (yes) + home-channel default (empty → DM id).
     answers.push("y".to_string());
     answers.push(String::new());
@@ -151,6 +192,7 @@ async fn accept_path_saves_exact_field_set() {
     assert_eq!(saved["channel_id"], "222");
     assert_eq!(saved["budget"]["model"], "test-model");
     assert_eq!(saved["gray_bin"], "/bin/true");
+    assert!(saved.get("budget").is_some_and(|b| b.is_object()));
     // Token is stored but never printed: no log line may contain it.
     assert!(io.log.iter().all(|l| !l.contains("FIXTURETOKEN")));
     assert!(io

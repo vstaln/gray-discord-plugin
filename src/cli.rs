@@ -199,20 +199,28 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|_| "cannot start setup runtime".to_string())?;
-            // Gateway-event pairing wait lands in Task 9; until then the
-            // wizard reports that pairing needs the running gateway.
-            let done = rt.block_on(crate::setup::run(config_path, &mut io, &|_| {
-                Err("Pairing needs the gateway; run setup after first connect".to_string())
-            }))?;
+            // Production pairing: one bare gateway connection waits for the
+            // owner's DM carrying the printed code, then hands back the IDs.
+            let done = rt.block_on(crate::setup::run(
+                config_path,
+                &mut io,
+                &crate::setup::default_pairing,
+            ))?;
             if done {
                 let config: Value = crate::config::load_config(config_path)?;
                 register(&config, config_path)?;
                 println!("Outgoing tool registered with gray.");
                 let answer = io.prompt("Enable and start the background service now? [Y/n] ")?;
                 if install_confirmed(&answer) {
-                    crate::service::install(config_path)?;
-                    println!("Service enabled. Run gray discord status to check it.");
-                    println!("For operation after logout: loginctl enable-linger \"$USER\"");
+                    let line = crate::service::install(config_path)?;
+                    println!("{line}");
+                    println!("Run gray discord status to check it.");
+                    if matches!(
+                        crate::service::detect(),
+                        crate::service::Supervisor::SystemdUser { .. }
+                    ) {
+                        println!("For operation after logout: loginctl enable-linger \"$USER\"");
+                    }
                 } else {
                     println!(
                         "Run gray discord install when ready, or gray discord run in the foreground."
@@ -228,17 +236,33 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .map_err(|_| "cannot start gateway runtime".to_string())?;
             rt.block_on(crate::gateway::run(config_path))
         }
-        Command::Status => crate::service::control(&["status", crate::service::NAME]),
-        Command::Stop => crate::service::control(&["stop", crate::service::NAME]),
-        Command::Restart => crate::service::control(&["restart", crate::service::NAME]),
+        Command::Status => {
+            println!("{}", crate::service::status(config_path)?);
+            Ok(())
+        }
+        Command::Stop => {
+            println!("{}", crate::service::stop(config_path)?);
+            Ok(())
+        }
+        Command::Restart => {
+            println!("{}", crate::service::restart(config_path)?);
+            Ok(())
+        }
         Command::Uninstall => {
-            crate::service::uninstall()?;
+            let line = crate::service::uninstall(config_path)?;
+            println!("{line}");
             println!("Service removed. Private configuration and sessions retained; registered outgoing tool retained.");
             Ok(())
         }
         Command::Install => {
-            crate::service::install(config_path)?;
-            println!("Service enabled. To survive logout, enable user linger: loginctl enable-linger \"$USER\"");
+            let line = crate::service::install(config_path)?;
+            println!("{line}");
+            if matches!(
+                crate::service::detect(),
+                crate::service::Supervisor::SystemdUser { .. }
+            ) {
+                println!("To survive logout, enable user linger: loginctl enable-linger \"$USER\"");
+            }
             Ok(())
         }
         Command::Doctor => {

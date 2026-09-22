@@ -20,8 +20,13 @@ pub trait Prompter {
 
 /// Owner pairing result: `(owner_id, dm_channel_id)` from the DM wait.
 pub type PairingResult = Result<(String, String), String>;
-/// Gateway-event wait injected by the caller (full wiring lands in Task 9).
-pub type WaitForPairing = dyn Fn(&str) -> PairingResult;
+/// The pairing wait as a future: it holds a gateway connection open, so it
+/// cannot be plain sync work.
+pub type PairingFut = std::pin::Pin<Box<dyn std::future::Future<Output = PairingResult> + Send>>;
+/// Injected wait for the owner's DM: receives the bot token and the printed
+/// code, returns `(owner_id, dm_channel_id)`. Tests inject a scripted fake
+/// (`&|_, _| Box::pin(async { .. })`); the CLI passes [`default_pairing`].
+pub type WaitForPairing = dyn Fn(&str, &str) -> PairingFut;
 /// Login step injected for tests (`default_login` in production).
 pub type LoginStep = dyn Fn(&str) -> LoginFut;
 
@@ -108,8 +113,8 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Run the setup wizard. `wait_for_pairing` polls gateway events for the
-/// owner's DM (full wiring lands in Task 9); it receives the printed code
-/// and returns `(owner_id, dm_channel_id)`.
+/// owner's DM; it receives the bot token and the printed code and returns
+/// `(owner_id, dm_channel_id)`.
 pub async fn run(
     path: &Path,
     io: &mut dyn Prompter,
@@ -161,24 +166,30 @@ pub async fn run_with_login(
     if model.is_empty() {
         return Err("Configure a model in gray before setup".to_string());
     }
-    io.print_line(
-        "Set a daily allowance and conservative model prices. Unknown pricing is not free.",
-    );
-    io.print_line(
-        "Client limits stop subsequent requests; configure provider-side caps for a hard invoice limit.",
-    );
-    let daily = io.prompt("Daily budget USD: ")?;
-    let turn = io.prompt("Per-turn budget USD: ")?;
-    let input_pm = io.prompt("Input USD per million tokens (0 only if genuinely free): ")?;
-    let output_pm = io.prompt("Output USD per million tokens (include reasoning): ")?;
-    let policy = json!({
-        "model": model,
-        "daily_usd": daily.trim(),
-        "turn_usd": turn.trim(),
-        "input_per_million": input_pm.trim(),
-        "output_per_million": output_pm.trim()
-    });
-    crate::budget::validate(&policy, model).map_err(|e| e.to_string())?;
+    // Budget is opt-in accounting (gateway-side parity with `budget set`):
+    // declining writes no policy, and the daemon then starts with no ledger.
+    let mut policy: Option<Value> = None;
+    if io.confirm("Set a daily spend budget now? [y/N] ")? {
+        io.print_line(
+            "Set a daily allowance and conservative model prices. Unknown pricing is not free.",
+        );
+        io.print_line(
+            "Client limits stop subsequent requests; configure provider-side caps for a hard invoice limit.",
+        );
+        let daily = io.prompt("Daily budget USD: ")?;
+        let turn = io.prompt("Per-turn budget USD: ")?;
+        let input_pm = io.prompt("Input USD per million tokens (0 only if genuinely free): ")?;
+        let output_pm = io.prompt("Output USD per million tokens (include reasoning): ")?;
+        let offered = json!({
+            "model": model,
+            "daily_usd": daily.trim(),
+            "turn_usd": turn.trim(),
+            "input_per_million": input_pm.trim(),
+            "output_per_million": output_pm.trim()
+        });
+        crate::budget::validate(&offered, model).map_err(|e| e.to_string())?;
+        policy = Some(offered);
+    }
 
     let token = io.prompt_hidden("Discord BOT token (hidden): ")?;
     let token = token.trim().to_string();
@@ -192,7 +203,7 @@ pub async fn run_with_login(
         "DM this one-time code to the bot within five minutes: {}",
         pairing.code
     ));
-    let (owner, dm) = wait_for_pairing(&pairing.code)?;
+    let (owner, dm) = wait_for_pairing(&token, &pairing.code).await?;
     io.print_line(&format!("Candidate owner ID: {owner}"));
     if !io.confirm("Confirm this is your Discord account? [y/N] ")? {
         return Err("Pairing not confirmed; nothing saved".to_string());
@@ -216,20 +227,66 @@ pub async fn run_with_login(
         .parent()
         .map(|p| absolutize(p).to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    crate::config::save_config(
-        path,
-        &json!({
-            "token": token,
-            "owner_id": owner,
-            "channel_id": channel,
-            "budget": policy,
-            "gray_bin": gray,
-            "gray_home": gray_home.to_string_lossy(),
-            "workdir": workdir
-        }),
-    )?;
+    // A declined budget writes no key at all: an absent policy means "no
+    // ledger" (gateway parity), and `validate_config` rejects a null one.
+    let mut saved = json!({
+        "token": token,
+        "owner_id": owner,
+        "channel_id": channel,
+        "gray_bin": gray,
+        "gray_home": gray_home.to_string_lossy(),
+        "workdir": workdir
+    });
+    if let Some(policy) = policy {
+        saved["budget"] = policy;
+    }
+    crate::config::save_config(path, &saved)?;
     io.print_line("Configuration saved privately.");
     Ok(true)
+}
+
+/// The production pairing wait: one bare gateway connection that accepts
+/// exactly one DM carrying the printed code, then disconnects. Mirrors
+/// gray_discord/setup.py's wait, which polled the live gateway for the
+/// owner's DM; the code expires after 300 s (`policy::Pairing`).
+pub fn default_pairing(token: &str, code: &str) -> PairingFut {
+    use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
+    use twilight_model::gateway::event::Event;
+
+    let token = token.to_string();
+    let code = code.to_string();
+    Box::pin(async move {
+        let intents = Intents::GUILD_MESSAGES | Intents::DIRECT_MESSAGES | Intents::MESSAGE_CONTENT;
+        let mut shard = Shard::new(ShardId::ONE, token, intents);
+        let deadline = std::time::Duration::from_secs(300);
+        let started = std::time::Instant::now();
+        loop {
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            // Timeout, a fatal shard error, or a dropped stream all end the
+            // wait the same way: the operator retries setup.
+            let event =
+                match tokio::time::timeout(left, shard.next_event(EventTypeFlags::MESSAGE_CREATE))
+                    .await
+                {
+                    Ok(Some(Ok(event))) => event,
+                    _ => break,
+                };
+            if let Event::MessageCreate(msg) = event {
+                let m = &msg.0;
+                // DMs only, never another bot, exact code match.
+                if m.guild_id.is_none()
+                    && !m.author.bot
+                    && crate::policy::code_matches(&m.content, &code)
+                {
+                    return Ok((m.author.id.to_string(), m.channel_id.to_string()));
+                }
+            }
+        }
+        Err("Pairing failed or expired; check intent and DM permissions".to_string())
+    })
 }
 
 /// Boxed login future: `Send` so `run_with_login` stays `Send` for tokio.

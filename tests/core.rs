@@ -72,6 +72,20 @@ fn pairing_expires_and_consumes_once() {
 }
 
 #[test]
+fn code_matches_is_trim_tolerant_and_exact() {
+    let p = policy::Pairing::new(0.0);
+    assert!(policy::code_matches(&p.code, &p.code));
+    assert!(policy::code_matches(&format!("  {}  ", p.code), &p.code));
+    // A superset is NOT a match: only the bare code pairs.
+    assert!(!policy::code_matches(
+        &format!("use code {}", p.code),
+        &p.code
+    ));
+    assert!(!policy::code_matches("", &p.code));
+    assert!(!policy::code_matches(&format!("{}x", p.code), &p.code));
+}
+
+#[test]
 fn slash_admission_checks_owner_and_allowlist() {
     let allowed = vec!["777".to_string()];
     // owner can invoke /ask with prompt

@@ -40,8 +40,10 @@ blindly retried. Shared plugins can also have their own side effects.
 
 ## Spending policy
 
-Setup requires daily/turn allowances and explicit prices for the selected model.
-Existing configurations must set a policy before starting the upgraded gateway:
+A budget policy is optional accounting, never a start requirement: the setup
+wizard offers it (default no), and gray's own `gray gateway setup discord`
+flow writes none. An existing policy must set daily/turn allowances and
+explicit prices for the selected model:
 
 ```sh
 gray discord budget set --daily-usd 5 --turn-usd 0.50 \

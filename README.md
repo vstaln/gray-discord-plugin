@@ -10,7 +10,10 @@ gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 
 **Experimental text-only integration.** Live Discord login, interactive pairing,
-and systemd deployment have been ported from Python to a single Rust binary.
+and background-service deployment have been ported from Python to a single
+Rust binary. The service probes what this box actually supervises with
+(runit, systemd --user, or gray itself with no init) instead of assuming
+systemd.
 
 ## Installation
 
@@ -42,28 +45,38 @@ gray discord setup
 gray discord status
 ```
 
-Setup reads the bot token with hidden terminal input, validates it, prints an
-invite link, then asks you to DM a one-time code to the bot. The code expires
-in five minutes. Confirm the resulting user ID locally before configuration
-is saved. Only that account and explicitly allowlisted users can trigger the agent.
-Enable Message Content Intent in the Discord developer portal. Pick a home channel
-(your DM by default).
+Setup reads the bot token with hidden terminal input, validates it against
+Discord's own API, prints an invite link, then connects one short-lived
+gateway and asks you to DM a one-time code to the bot. The code expires in
+five minutes. Confirm the resulting user ID locally before configuration is
+saved. Only that account and explicitly allowlisted users can trigger the agent.
+Enable Message Content Intent in the Discord developer portal. Pick a home
+channel (your DM by default). The spend budget is optional: decline and the
+daemon runs with no ledger; `gray discord budget set` opts in later.
 
 The wizard never sends credentials to a model. Private config is written
 atomically with mode 600. Do not paste bot tokens into chat or command arguments.
 To use a nondefault config, place `--config /absolute/path/config.json` before
 the command on every invocation, including setup/install/register.
 
-The systemd **user** service is `gray-discord-plugin.service`. It runs the
-compiled `gray-discord` binary. For operation after logout/reboot, enable user
-lingering if permitted:
+`gray discord install` starts the daemon under whatever this box supervises
+with. On a systemd box the **user** unit is `gray-discord-plugin.service`;
+for operation after logout/reboot, enable user lingering if permitted:
 
 ```sh
 loginctl enable-linger "$USER"
+```
+
+On a runit box the service is written to `~/.config/service/gray-discord/run`
+and brought up with `sv`. With no init at all, gray spawns the daemon
+detached with a pidfile and log beside the config. `gray discord status`,
+`restart`, and `stop` all dispatch to whichever is installed:
+
+```sh
 gray discord status
 gray discord restart
 gray discord stop
-# Or run in the foreground without systemd:
+# Or run in the foreground under any supervisor:
 gray discord run
 ```
 

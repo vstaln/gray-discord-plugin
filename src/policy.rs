@@ -97,6 +97,13 @@ impl Pairing {
     }
 }
 
+/// Does this DM text carry the pairing code? Trim-tolerant, constant-time
+/// comparison on the exact code (a contains-match would let any text
+/// smuggle the code past the wizard).
+pub fn code_matches(text: &str, code: &str) -> bool {
+    constant_eq(text.trim(), code)
+}
+
 /// 18 random bytes, base64url without padding — like secrets.token_urlsafe(18).
 fn random_code() -> String {
     let mut buf = [0u8; 18];
