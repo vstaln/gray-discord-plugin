@@ -57,6 +57,19 @@ pub fn amount(value: &Value, scale: i64) -> Result<i64, BudgetBlocked> {
         .map_err(|_| BudgetBlocked("Budget and prices must be finite nonnegative numbers".into()))
 }
 
+/// Budget is opt-in accounting, not a setup requirement: a policy that is
+/// present must validate against the active model; an absent or null one
+/// means no ledger and no spend gate, so the daemon starts anyway.
+pub fn gate(config: &Value, model: &str) -> Result<bool, BudgetBlocked> {
+    match config.get("budget") {
+        Some(policy) if !policy.is_null() => {
+            validate(policy, model)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Validate a budget policy against the active model. Returns (daily, turn).
 pub fn validate(policy: &Value, model: &str) -> Result<(i64, i64), BudgetBlocked> {
     if !policy.is_object() || policy.get("model").and_then(Value::as_str) != Some(model) {

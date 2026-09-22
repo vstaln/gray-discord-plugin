@@ -378,10 +378,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| "provider model is missing".to_string())?;
-    let empty_policy = Value::Null;
-    let budget_policy = config.get("budget").unwrap_or(&empty_policy);
-    crate::budget::validate(budget_policy, model)?;
-    config["budget_required"] = Value::Bool(true);
+    // Budget gates only when a policy exists (gray's setup writes none);
+    // `budget set` stays the opt-in accounting path.
+    config["budget_required"] = Value::Bool(crate::budget::gate(&config, model)?);
 
     let store = open_store(config_path)?;
 

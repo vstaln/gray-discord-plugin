@@ -1,4 +1,4 @@
-use gray_discord::budget::{Budget, BudgetBlocked};
+use gray_discord::budget::{gate, Budget, BudgetBlocked};
 use serde_json::json;
 use std::path::Path;
 
@@ -76,4 +76,19 @@ fn unsettled_old_reservations_still_block_new_day() {
         budget.reserve("today", &p, "fixture"),
         Err(BudgetBlocked(_))
     ));
+}
+
+#[test]
+fn an_absent_or_null_budget_starts_the_daemon_without_a_gate() {
+    assert!(!gate(&json!({}), "fixture").unwrap());
+    assert!(!gate(&json!({"budget": null}), "fixture").unwrap());
+}
+
+#[test]
+fn a_present_budget_still_has_to_match_the_model() {
+    let policy = json!({"daily_usd": 1.0, "turn_usd": 0.5, "input_per_million": 1.0, "output_per_million": 2.0, "model": "fixture"});
+    assert!(gate(&json!({"budget": policy.clone()}), "fixture").unwrap());
+    assert!(gate(&json!({"budget": policy}), "other-model").is_err());
+    let unpriced = json!({"daily_usd": 1.0, "turn_usd": 0.5, "model": "fixture"});
+    assert!(gate(&json!({"budget": unpriced}), "fixture").is_err());
 }
