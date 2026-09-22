@@ -226,18 +226,46 @@ impl Rest {
     /// GET /guilds/{guild}/members/{user} → guild-wide permission bits.
     /// The Python resolves channel overwrites via `permissions_for`; doctor
     /// checks the guild-level grant, which is the actionable diagnostic.
+    /// A member's effective guild permissions, computed the way every
+    /// client does (the member object itself carries no `permissions` field —
+    /// reading one there is what made doctor fail with a bare HTTP 200):
+    /// the guild owner holds everything implicitly, otherwise the
+    /// `@everyone` role (its id is the guild id) ORs with each role the
+    /// member wears.
     pub async fn guild_member_permissions(
         &self,
         guild_id: &str,
         user_id: &str,
     ) -> Result<u64, TransportError> {
-        let v = self
+        let guild = self.get(&format!("/guilds/{guild_id}")).await?;
+        let member = self
             .get(&format!("/guilds/{guild_id}/members/{user_id}"))
             .await?;
-        v.get("permissions")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+        if guild.get("owner_id").and_then(Value::as_str) == Some(user_id) {
+            return Ok(u64::MAX);
+        }
+        let roles = guild
+            .get("roles")
+            .and_then(Value::as_array)
+            .ok_or_else(|| TransportError::Invalid("cannot read guild roles".into()))?;
+        let worn: Vec<&str> = member
+            .get("roles")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut perms: u64 = 0;
+        for role in roles {
+            let id = role.get("id").and_then(Value::as_str).unwrap_or("");
+            let granted = role
+                .get("permissions")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if id == guild_id || worn.contains(&id) {
+                perms |= granted;
+            }
+        }
+        Ok(perms)
     }
 
     /// Send text as sequential chunks. Returns the first message id.
