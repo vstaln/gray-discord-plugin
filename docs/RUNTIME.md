@@ -116,5 +116,9 @@ Tests exercise the real gray binary with loopback model/Discord endpoints,
 redacted-prompt resumption, conversation isolation, background delivery failure
 and restart, a budget overage blocking the next run, cancellation, online schedule
 edits, and selected capabilities. No user token/provider key is read by tests.
-Live Discord pairing, real systemd startup, and merging with the active gray
-checkout remain separate operator/integration steps.
+Live Discord pairing now runs in setup itself: one short-lived gateway
+connection waits for the owner's DM (see `setup::default_pairing`). The
+service lifecycle runs under runit, systemd --user, or gray's own detached
+spawn — install/status/stop/restart dispatch on what this box supervises
+with. A live bot token and merging with the active gray checkout remain
+operator steps.
