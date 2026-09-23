@@ -2,6 +2,8 @@ pub mod attachments;
 pub mod budget;
 pub mod capabilities;
 pub mod cli;
+pub mod command_dispatch;
+pub mod commands;
 pub mod config;
 pub mod doctor;
 pub mod durable;

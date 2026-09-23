@@ -435,6 +435,31 @@ impl Rest {
         Ok(ids)
     }
 
+    /// The embed sibling of `followup`. A deferred slash-command answer is a
+    /// webhook post, not a channel post, so it cannot reuse `send_embed`;
+    /// the bounds are the same, and an oversized embed is refused here rather
+    /// than 400'd by the API.
+    pub async fn followup_embed(
+        &self,
+        app_id: &str,
+        token: &str,
+        embed: &Value,
+    ) -> Result<String, TransportError> {
+        let compact = serde_json::to_string(embed).unwrap_or_default();
+        check_bounds(&compact, 6000, "Reply is too large")?;
+        let body = json!({
+            "allowed_mentions": {"parse": []},
+            "embeds": [embed],
+        });
+        let v = self
+            .post(&format!("/webhooks/{app_id}/{token}"), &body)
+            .await?;
+        Ok(v.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
     /// Port of `rest_send`: login → channel → send. REST only.
     pub async fn rest_send(
         &self,

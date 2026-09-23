@@ -25,33 +25,12 @@ pub fn open_store(config_path: &Path) -> Result<Store, String> {
     Ok(store)
 }
 
+/// Registration JSON for every slash command the bridge serves. Derived
+/// from `commands::COMMANDS` so the picker, the dispatcher and `/help`
+/// cannot disagree; the hash of this body is what Discord sees, so adding a
+/// command re-registers exactly once.
 pub fn slash_commands_json() -> Value {
-    serde_json::json!([
-        {
-            "name": "ask",
-            "description": "Send a prompt to gray",
-            "options": [
-                {
-                    "name": "prompt",
-                    "description": "What to ask gray",
-                    "type": 3,
-                    "required": true
-                }
-            ]
-        },
-        {
-            "name": "reset",
-            "description": "Reset your gray session"
-        },
-        {
-            "name": "status",
-            "description": "Show gray session status"
-        },
-        {
-            "name": "stop",
-            "description": "Stop the running gray agent"
-        }
-    ])
+    crate::commands::registration_json()
 }
 
 pub type ReactionHook = std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
@@ -708,79 +687,66 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             .or_else(|| interaction.channel_id.map(|c| c.to_string()))
                             .unwrap_or_default();
 
+                        // One context object for every handler; twilight
+                        // never travels past this line.
+                        let effective_app = app_id
+                            .clone()
+                            .unwrap_or_else(|| interaction.application_id.to_string());
+                        let int_id = interaction.id.to_string();
+                        let ctx = crate::command_dispatch::Ctx {
+                            user_id: &user_id,
+                            channel_id: &channel_id,
+                            int_id: &int_id,
+                            int_token: &interaction.token,
+                            app_id: &effective_app,
+                            rest: &rest,
+                            store: &store,
+                            config: &config,
+                            config_path,
+                        };
                         if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(ref cmd)) = interaction.data {
-                            let effective_app = app_id
-                                .clone()
-                                .unwrap_or_else(|| interaction.application_id.to_string());
-                            let int_id = interaction.id.to_string();
-                            let int_token = &interaction.token;
-
-                            match cmd.name.as_str() {
-                                "ask" => {
-                                    let prompt = cmd.options.iter().find(|o| o.name == "prompt").and_then(|o| match &o.value {
-                                        twilight_model::application::interaction::application_command::CommandOptionValue::String(s) => Some(s.as_str()),
-                                        _ => None,
-                                    });
-                                    if let Some(prompt) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
-                                        let defer = serde_json::json!({"type": 5});
-                                        let _ = rest.interaction_callback(&int_id, int_token, &defer).await;
-
-                                        let capacity = config
-                                            .get("queue_capacity")
-                                            .and_then(Value::as_u64)
-                                            .unwrap_or(1000);
-                                        let conv = format!("chat:{channel_id}");
-                                        if store.enqueue(&int_id, &channel_id, prompt, Some(&conv), capacity).is_ok() {
-                                            let _ = store.set_interaction(&int_id, int_token, &effective_app);
-                                        }
-                                    }
-                                }
-                                "reset" => {
-                                    for conv in [format!("chat:{channel_id}"), format!("user:{user_id}")] {
-                                        let key = crate::runner::hex_sha256(conv.as_bytes());
-                                        let base = config_path.parent().unwrap_or_else(|| Path::new("."));
-                                        let session_file = base.join("conversations").join(key).join("session.json");
-                                        let _ = std::fs::remove_file(session_file);
-                                    }
-                                    let resp = serde_json::json!({
-                                        "type": 4,
-                                        "data": {
-                                            "content": "Session reset.",
-                                            "flags": 64
-                                        }
-                                    });
-                                    let _ = rest.interaction_callback(&int_id, int_token, &resp).await;
-                                }
-                                "status" => {
-                                    let depth = store.pending_count().unwrap_or(0);
-                                    let resp = serde_json::json!({
-                                        "type": 4,
-                                        "data": {
-                                            "content": format!("Queue depth: {depth} turn(s) pending/running."),
-                                            "flags": 64
-                                        }
-                                    });
-                                    let _ = rest.interaction_callback(&int_id, int_token, &resp).await;
-                                }
-                                "stop" => {
-                                    let conv = format!("chat:{channel_id}");
-                                    let stopped = store.cancel_conversation(&conv).unwrap_or(false);
-                                    let text = if stopped {
-                                        "Stopping running agent turn."
-                                    } else {
-                                        "No running turn to stop."
-                                    };
-                                    let resp = serde_json::json!({
-                                        "type": 4,
-                                        "data": {
-                                            "content": text,
-                                            "flags": 64
-                                        }
-                                    });
-                                    let _ = rest.interaction_callback(&int_id, int_token, &resp).await;
-                                }
-                                _ => {}
+                        // Flatten what Discord nests: a sub-command arrives as
+                        // one option that carries its own options. Handlers
+                        // read flat name/value pairs, so the parsing of
+                        // twilight's shape lives here and nowhere else.
+                        let (sub, args): (Option<String>, Vec<(&str, &str)>) = cmd
+                            .options
+                            .first()
+                            .map(|opt| match &opt.value {
+                                twilight_model::application::interaction::application_command::CommandOptionValue::SubCommand(inner) => (
+                                    Some(opt.name.clone()),
+                                    inner
+                                        .iter()
+                                        .filter_map(|o| match &o.value {
+                                            twilight_model::application::interaction::application_command::CommandOptionValue::String(v) => Some((o.name.as_str(), v.as_str())),
+                                            _ => None,
+                                        })
+                                        .collect(),
+                                ),
+                                _ => (None, Vec::new()),
+                            })
+                            .unwrap_or((None, Vec::new()));
+                        // Top-level string options (the plain `/ask`).
+                        let mut args = args;
+                        for o in &cmd.options {
+                            if let twilight_model::application::interaction::application_command::CommandOptionValue::String(v) = &o.value {
+                                args.push((o.name.as_str(), v.as_str()));
                             }
+                        }
+                        match crate::commands::parse(cmd.name.as_str(), sub.as_deref(), &args) {
+                            Some(request) => crate::command_dispatch::handle(&ctx, request).await,
+                            None => {
+                                // An interaction we did not register (or a
+                                // sub-command that vanished under us).
+                                eprintln!(
+                                    "[discord] unparseable slash command: {} {sub:?}",
+                                    cmd.name.as_str()
+                                );
+                            }
+                        }
+                        }
+                        if let Some(twilight_model::application::interaction::InteractionData::MessageComponent(ref mc)) = interaction.data {
+                            crate::command_dispatch::button(&ctx, mc.custom_id.as_str()).await;
                         }
                     }
                     Some(Err(e)) => {

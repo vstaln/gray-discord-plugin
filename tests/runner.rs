@@ -196,3 +196,69 @@ async fn real_gray_two_turn_resume_and_conversation_isolation() {
         .collect();
     assert_eq!(conv.len(), 3);
 }
+
+/// A fake `gray` that records the argv it was handed, then answers with one
+/// terminal row so the turn completes.
+fn argv_capture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let out = root.join("argv.txt");
+    let exe = root.join("capture");
+    write_exe(
+        &exe,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n             echo '{{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"ok\"}}'\n",
+            out.display()
+        ),
+    );
+    (exe, out)
+}
+
+/// `/model set` must reach the child as one `--model` flag; a channel that
+/// never picked a model must not have the flag appended at all.
+#[tokio::test]
+async fn a_model_override_reaches_the_gray_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let (exe, out) = argv_capture(root);
+    let config = base_config(&exe, &home);
+    let opts = RunOpts {
+        model: Some("openai/gpt-5".to_string()),
+        ..Default::default()
+    };
+    run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:one",
+        "hello",
+        opts,
+    )
+    .await
+    .unwrap();
+    let argv = std::fs::read_to_string(&out).unwrap();
+    assert!(argv.lines().any(|l| l == "--model"), "argv was:\n{argv}");
+    assert!(
+        argv.lines().any(|l| l == "openai/gpt-5"),
+        "argv was:\n{argv}"
+    );
+    assert_eq!(argv.lines().filter(|l| *l == "--model").count(), 1);
+}
+
+#[tokio::test]
+async fn no_override_means_no_model_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let (exe, out) = argv_capture(root);
+    let config = base_config(&exe, &home);
+    run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:one",
+        "hello",
+        default_opts(),
+    )
+    .await
+    .unwrap();
+    let argv = std::fs::read_to_string(&out).unwrap();
+    assert!(!argv.lines().any(|l| l == "--model"), "argv was:\n{argv}");
+}

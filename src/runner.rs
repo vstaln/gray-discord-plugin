@@ -62,6 +62,9 @@ pub struct RunOpts<'a> {
     pub timeout_secs: Option<u64>,
     pub progress: Option<ProgressFn<'a>>,
     pub receipt: Option<&'a mut Value>,
+    /// Per-turn model override (`/model set`). Appended as `--model` only
+    /// when present, so a channel that never picks one is unaffected.
+    pub model: Option<String>,
 }
 
 /// Progress callback without a captured borrow: plain function pointer plus
@@ -254,6 +257,10 @@ pub async fn run_gray(
     if let Some(sid) = &session_id {
         args.push("--session".to_string());
         args.push(sid.clone());
+    }
+    if let Some(model) = opts.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.clone());
     }
 
     let mut cmd = tokio::process::Command::new(&args[0]);

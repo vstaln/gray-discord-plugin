@@ -167,6 +167,38 @@ The next run advances before execution; interrupted jobs are not replayed. These
 are interval jobs, not cron expressions and not gray's native cron scheduler.
 Avoid calling `discord_send` in job prompts: the scheduler already sends the reply.
 
+## Slash commands
+
+The bridge answers native Discord slash commands. Registration, dispatch and
+`/help` are all derived from one table (`src/commands.rs`), so a command that
+exists is registered, handled and documented or none of the three.
+
+| Command | What it does | Visibility |
+|---|---|---|
+| `/help [command]` | Lists every command, or one in detail | public |
+| `/ask prompt:…` | Enqueues a turn for gray | public |
+| `/cron list` | This channel's scheduled jobs, with a Remove button each | public |
+| `/cron add every:30m prompt:…` | Schedules a prompt **for the channel it is typed in** | public |
+| `/cron remove id:…` | Deletes a job | private |
+| `/model` | Which model answers here, and where it comes from | public |
+| `/model set model:…` | Pins a model for this channel only | public |
+| `/memory list\|show\|set\|remove` | gray's curated cross-session memory | list/show/set public, remove private |
+| `/status` | Queue depth, model, bridge version | public |
+| `/reset` | Forgets your session | private |
+| `/stop` | Cancels the running turn | private |
+
+Anything that shells out to gray (`/memory`) acknowledges first and answers
+afterwards: Discord drops a callback that took longer than three seconds.
+Buttons arrive as `MessageComponent` interactions; only an allow-listed user
+can press one, because Discord does not filter presses for you.
+
+`/cron` fronts the plugin's own schedule store rather than gray's cron CLI.
+gray's cron is file-only and needs a ticker per home; this daemon ticks only
+its own table, so a `gray cron add` issued from Discord would never fire.
+Schedules therefore carry the channel and conversation they belong to, and a
+job created in one channel delivers to that channel — a job added by
+`gray discord schedule add` targets the configured home channel.
+
 ## Sessions and safety boundaries
 
 Each conversation and each job gets its own private gray home, provider config
