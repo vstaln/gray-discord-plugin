@@ -3,9 +3,9 @@
 //! admits them once.
 
 use gray_discord::gateway::open_store;
-use gray_discord::pairing::{approve, gen_code, reply_for, unconfigured_reply};
+use gray_discord::pairing::{approve, gen_code, reply_for, unconfigured_embed, unconfigured_reply};
 use gray_discord::setup::Prompter;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn config_with_home(tmp: &tempfile::TempDir, body: serde_json::Value) -> std::path::PathBuf {
     let path = tmp.path().join("config.json");
@@ -49,6 +49,29 @@ fn reply_names_the_command_with_the_code() {
 }
 
 #[test]
+fn the_embed_carries_the_id_and_the_code() {
+    let embed = unconfigured_embed("1509856035576483874", "528MBFA7");
+    let fields = embed.get("fields").and_then(Value::as_array).unwrap();
+    let id_field = fields
+        .iter()
+        .find(|f| f["name"] == "Your Discord user id")
+        .expect("id field");
+    assert!(id_field["value"]
+        .as_str()
+        .unwrap()
+        .contains("1509856035576483874"));
+    let code_field = fields
+        .iter()
+        .find(|f| f["name"] == "Pairing code")
+        .expect("code field");
+    assert!(code_field["value"].as_str().unwrap().contains("528MBFA7"));
+    // The approve command stays out of the embed entirely.
+    let blob = serde_json::to_string(&embed).unwrap();
+    assert!(!blob.contains("pairing approve"));
+    assert!(embed.get("title").is_some());
+}
+
+#[test]
 fn only_human_dms_get_a_pairing_reply() {
     let tmp = tempfile::tempdir().unwrap();
     let store = open_store(&tmp.path().join("config.json")).unwrap();
@@ -58,8 +81,9 @@ fn only_human_dms_get_a_pairing_reply() {
     assert!(reply_for(&store, "", true, false).is_none());
     // A human DM gets a code.
     let reply = reply_for(&store, "333", true, false).expect("human DM pairs");
-    assert!(reply.contains("Your Discord user id: 333"));
-    assert!(reply.contains("pairing approve discord"));
+    assert!(reply.text.contains("Your Discord user id: 333"));
+    assert!(reply.text.contains("pairing approve discord"));
+    assert_eq!(reply.code.len(), 8);
 }
 
 #[test]
@@ -68,7 +92,11 @@ fn a_repeat_dm_reuses_the_pending_code() {
     let store = open_store(&tmp.path().join("config.json")).unwrap();
     let first = reply_for(&store, "333", true, false).unwrap();
     let second = reply_for(&store, "333", true, false).unwrap();
-    assert_eq!(first, second, "no code pile-up for a persistent asker");
+    assert_eq!(
+        first.text, second.text,
+        "no code pile-up for a persistent asker"
+    );
+    assert_eq!(first.code, second.code);
 }
 
 #[test]
@@ -119,13 +147,7 @@ fn the_config_written_by_the_wizard_survives_pairing_approval() {
     let path = config_with_home(&tmp, valid_config(&tmp, Some("111")));
     let store = open_store(&path).unwrap();
     let reply = reply_for(&store, "555", true, false).unwrap();
-    let code = reply
-        .lines()
-        .find(|l| l.starts_with("Pairing code: "))
-        .and_then(|l| l.rsplit(' ').next())
-        .unwrap()
-        .to_string();
-    approve(&path, "discord", &code).unwrap();
+    approve(&path, "discord", &reply.code).unwrap();
     let saved: serde_json::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     assert_eq!(saved["allowed_users"][0], "555");
     gray_discord::config::load_config(&path).expect("config still validates");

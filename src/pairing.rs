@@ -4,7 +4,7 @@
 //! joins the allowlist. No terminal wizard, no 5-minute timer, nothing to
 //! hunt — the discovery happens where the user already is.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::Path;
 
 /// A fresh code: 8 uppercase alphanumerics (OpenClaw's shape — short enough
@@ -37,15 +37,45 @@ pub fn unconfigured_reply(user_id: &str, code: &str) -> String {
     )
 }
 
+/// The OpenClaw notice, as an embed: their own ID and the code as fields,
+/// the approve command in a code block. Everything the plain text carried,
+/// none of the ragged line breaks.
+pub fn unconfigured_embed(user_id: &str, code: &str) -> Value {
+    const GREY: u32 = 0x57_4F_6E; // warm grey — matches no error state
+    json!({
+        "title": "Access not configured",
+        "color": GREY,
+        "description": "You can DM this bot, but it is not configured to answer you yet.",
+        "fields": [
+            {
+                "name": "Your Discord user id",
+                "value": format!("`{user_id}`"),
+                "inline": true
+            },
+            {
+                "name": "Pairing code",
+                "value": format!("`{code}`"),
+                "inline": true
+            }
+        ],
+        "footer": {"text": "gray-discord"},
+    })
+}
+
 /// What the gateway does when a message is not admitted and the sender is a
 /// human DMing the bot: mint (or reuse) a code and reply. Bots, guild
 /// messages, and admitted senders never see this — `None` for them.
+pub struct PairingReply {
+    pub text: String,
+    pub code: String,
+}
+
 pub fn reply_for(
     store: &crate::durable::Store,
     author: &str,
     dm: bool,
     bot: bool,
-) -> Option<String> {
+) -> Option<PairingReply> {
     if bot || !dm || author.is_empty() {
         return None;
     }
@@ -55,7 +85,10 @@ pub fn reply_for(
         .flatten()
         .unwrap_or_else(gen_code);
     store.pairing_insert(&code, author).ok()?;
-    Some(unconfigured_reply(author, &code))
+    Some(PairingReply {
+        text: unconfigured_reply(author, &code),
+        code,
+    })
 }
 
 /// Consume a code and admit its user: they become `owner_id` if the config

@@ -565,6 +565,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         let author_id = m.author.id.to_string();
                         let channel_id = m.channel_id.to_string();
                         let is_dm = m.guild_id.is_none();
+                        // Receipt log: every message the gateway sees, by ID
+                        // and surface. Never the content — this is the only
+                        // way to tell "never DM'd" from "event never arrived".
+                        eprintln!("[discord] message from {} (dm: {is_dm})", m.author.id.get());
                         let prompt = crate::policy::incoming(
                             &author_id,
                             &owner_id,
@@ -595,14 +599,19 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                         .await;
                                 }
                             }
-                        } else if let Some(reply) =
+                        } else if let Some(paired) =
                             crate::pairing::reply_for(&store, &author_id, is_dm, m.author.bot)
                         {
                             // Unknown human DMing the bot: tell them their own
                             // ID and mint a code — the owner approves it with
                             // `gray discord pairing approve discord <code>`.
                             if let Ok(ch) = channel_id.parse::<u64>() {
-                                let _ = rest.send(ch, &reply, None).await;
+                                let embed =
+                                    crate::pairing::unconfigured_embed(&author_id, &paired.code);
+                                match rest.send_embed(ch, &paired.text, &embed).await {
+                                    Ok(_) => eprintln!("[discord] pairing reply sent"),
+                                    Err(e) => eprintln!("[discord] pairing reply failed: {e}"),
+                                }
                             }
                         }
                     }

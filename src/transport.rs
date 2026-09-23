@@ -315,6 +315,33 @@ impl Rest {
         })
     }
 
+    /// One message carrying an embed (the pairing reply). Discord caps an
+    /// embed at this size; titles and fields that outgrow it are refused
+    /// here rather than 400'd by the API.
+    pub async fn send_embed(
+        &self,
+        channel: u64,
+        content: &str,
+        embed: &Value,
+    ) -> Result<MessageId, TransportError> {
+        check_bounds(content, 20000, "Reply must contain 1-20000 characters")?;
+        let compact = serde_json::to_string(embed).unwrap_or_default();
+        check_bounds(&compact, 6000, "Embed is too large")?;
+        let mut body = json!({
+            "content": content,
+            "allowed_mentions": {"parse": []},
+            "embeds": [embed],
+        });
+        let _ = body["content"].take();
+        let v = self
+            .post(&format!("/channels/{channel}/messages"), &body)
+            .await?;
+        Ok(v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default())
+    }
+
     pub async fn typing(&self, channel: u64) {
         let _ = self
             .post(&format!("/channels/{channel}/typing"), &json!({}))
