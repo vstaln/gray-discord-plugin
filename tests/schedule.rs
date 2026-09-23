@@ -152,10 +152,11 @@ fn error_envelope_secrecy_and_no_traceback() {
     // Write invalid JSON config
     std::fs::write(&path, "{\"token\": \"SECRET123\", bad}").unwrap();
 
+    // A command that loads the config fails closed with a sanitized error.
     let out = Command::new(exe)
         .arg("--config")
         .arg(&path)
-        .arg("status")
+        .arg("doctor")
         .output()
         .expect("spawn");
 
@@ -163,4 +164,26 @@ fn error_envelope_secrecy_and_no_traceback() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("Traceback"));
     assert!(!err.contains("SECRET123"));
+
+    // `status` needs no config: with no service installed under this box's
+    // supervisor it reports "not installed" and exits 0 (it is a report,
+    // not a failure).
+    let path2 = tmp.path().join("other-config.json");
+    let out = Command::new(exe)
+        .arg("--config")
+        .arg(&path2)
+        .arg("status")
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(0));
+    let out_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_text.contains("not installed")
+            || out_text.contains("runs")
+            || out_text.contains("not running")
+    );
 }

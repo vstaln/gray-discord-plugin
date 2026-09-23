@@ -1,4 +1,7 @@
 //! Shared loopback Discord REST stub. No live network, no tokens.
+//! Each test target reads a different subset of the fixture's fields; the
+//! union is only ever complete across all of them.
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +19,9 @@ pub struct Stub {
     pub sent: Arc<Mutex<Vec<Sent>>>,
     pub fail_auth: Arc<Mutex<bool>>,
     pub fail_send: Arc<Mutex<bool>>,
+    /// When set, `/channels/42` reports a guild channel (id 77) so doctor's
+    /// permission path runs; the guild has a permissions-bearing role 78.
+    pub channel_guild: Arc<Mutex<bool>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -99,10 +105,12 @@ impl Stub {
         let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
         let fail_auth: Arc<Mutex<bool>> = Arc::default();
         let fail_send: Arc<Mutex<bool>> = Arc::default();
+        let channel_guild: Arc<Mutex<bool>> = Arc::default();
         let task = {
             let sent = sent.clone();
             let fail_auth = fail_auth.clone();
             let fail_send = fail_send.clone();
+            let channel_guild = channel_guild.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -111,6 +119,7 @@ impl Stub {
                     let sent = sent.clone();
                     let fail_auth = fail_auth.clone();
                     let fail_send = fail_send.clone();
+                    let channel_guild = channel_guild.clone();
                     tokio::spawn(async move {
                         let Some((method, path, headers, body)) = read_request(&mut stream).await
                         else {
@@ -126,7 +135,23 @@ impl Stub {
                         } else if path == "/api/v10/applications/@me" {
                             respond(&mut stream, 200, r#"{"id":"999","flags":262144}"#).await;
                         } else if path == "/api/v10/channels/42" {
-                            respond(&mut stream, 200, r#"{"id":"42","type":1}"#).await;
+                            let body = if *channel_guild.lock().unwrap() {
+                                r#"{"id":"42","type":0,"guild_id":"77"}"#
+                            } else {
+                                r#"{"id":"42","type":1}"#
+                            };
+                            respond(&mut stream, 200, body).await;
+                        } else if path == "/api/v10/guilds/77" {
+                            // @everyone (id == guild) carries nothing; role 78
+                            // carries exactly doctor's HOME_PERMS (68608).
+                            respond(
+                                &mut stream,
+                                200,
+                                r#"{"id":"77","owner_id":"999","roles":[{"id":"77","permissions":"0"},{"id":"78","permissions":"68608"}]}"#,
+                            )
+                            .await;
+                        } else if path == "/api/v10/guilds/77/members/123" {
+                            respond(&mut stream, 200, r#"{"roles":["78"]}"#).await;
                         } else if path == "/api/v10/channels/42/messages" && method == "POST" {
                             // Record before the fail toggle, like the Python
                             // fixture: the refused attempt still reached the server.
@@ -171,6 +196,7 @@ impl Stub {
             sent,
             fail_auth,
             fail_send,
+            channel_guild,
             _task: task,
         }
     }

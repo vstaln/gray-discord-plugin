@@ -25,7 +25,14 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    Setup,
+    /// Interactive setup. Default: Hermes parity — token plus your user ID,
+    /// home channel is your DM. `--pair` instead discovers your ID from a
+    /// DM you send the bot (the OpenClaw-style code dance).
+    Setup {
+        /// Discover the owner's ID by DMing a one-time code to the bot.
+        #[arg(long)]
+        pair: bool,
+    },
     Run,
     Sidecar,
     Register,
@@ -69,6 +76,10 @@ pub enum Command {
         #[command(subcommand)]
         action: AllowlistAction,
     },
+    Pairing {
+        #[command(subcommand)]
+        action: PairingAction,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -110,6 +121,18 @@ pub enum AllowlistAction {
     Add { id: String },
     Remove { id: String },
     List,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PairingAction {
+    /// Approve a code the bot handed an unconfigured DMer: they join the
+    /// allowlist (or become the owner if none is set yet).
+    Approve {
+        /// Platform the code was issued for. Only `discord` exists.
+        platform: String,
+        /// The code from the bot's DM reply.
+        code: String,
+    },
 }
 
 /// Register the outgoing `discord_send` tool in gray's plugin lock.
@@ -161,7 +184,7 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         .unwrap_or_default();
     data["plugins"]["discord"] = json!({
         "ecosystem": "gray-native",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "hash": "",
         "source": "https://github.com/vstaln/gray-discord-plugin",
         "argv": argv,
@@ -190,7 +213,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             let config: Value = crate::config::load_config(config_path)?;
             register(&config, config_path)
         }
-        Command::Setup => {
+        Command::Setup { pair } => {
             use crate::setup::Prompter;
             let mut io = crate::setup::Tty;
             // setup is async; drive it on a throwaway current-thread runtime
@@ -199,20 +222,22 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|_| "cannot start setup runtime".to_string())?;
-            // Gateway-event pairing wait lands in Task 9; until then the
-            // wizard reports that pairing needs the running gateway.
-            let done = rt.block_on(crate::setup::run(config_path, &mut io, &|_| {
-                Err("Pairing needs the gateway; run setup after first connect".to_string())
-            }))?;
+            let done = rt.block_on(crate::setup::run(config_path, &mut io, *pair))?;
             if done {
                 let config: Value = crate::config::load_config(config_path)?;
                 register(&config, config_path)?;
                 println!("Outgoing tool registered with gray.");
                 let answer = io.prompt("Enable and start the background service now? [Y/n] ")?;
                 if install_confirmed(&answer) {
-                    crate::service::install(config_path)?;
-                    println!("Service enabled. Run gray discord status to check it.");
-                    println!("For operation after logout: loginctl enable-linger \"$USER\"");
+                    let line = crate::service::install(config_path)?;
+                    println!("{line}");
+                    println!("Run gray discord status to check it.");
+                    if matches!(
+                        crate::service::detect(),
+                        crate::service::Supervisor::SystemdUser { .. }
+                    ) {
+                        println!("For operation after logout: loginctl enable-linger \"$USER\"");
+                    }
                 } else {
                     println!(
                         "Run gray discord install when ready, or gray discord run in the foreground."
@@ -228,17 +253,33 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .map_err(|_| "cannot start gateway runtime".to_string())?;
             rt.block_on(crate::gateway::run(config_path))
         }
-        Command::Status => crate::service::control(&["status", crate::service::NAME]),
-        Command::Stop => crate::service::control(&["stop", crate::service::NAME]),
-        Command::Restart => crate::service::control(&["restart", crate::service::NAME]),
+        Command::Status => {
+            println!("{}", crate::service::status(config_path)?);
+            Ok(())
+        }
+        Command::Stop => {
+            println!("{}", crate::service::stop(config_path)?);
+            Ok(())
+        }
+        Command::Restart => {
+            println!("{}", crate::service::restart(config_path)?);
+            Ok(())
+        }
         Command::Uninstall => {
-            crate::service::uninstall()?;
+            let line = crate::service::uninstall(config_path)?;
+            println!("{line}");
             println!("Service removed. Private configuration and sessions retained; registered outgoing tool retained.");
             Ok(())
         }
         Command::Install => {
-            crate::service::install(config_path)?;
-            println!("Service enabled. To survive logout, enable user linger: loginctl enable-linger \"$USER\"");
+            let line = crate::service::install(config_path)?;
+            println!("{line}");
+            if matches!(
+                crate::service::detect(),
+                crate::service::Supervisor::SystemdUser { .. }
+            ) {
+                println!("To survive logout, enable user linger: loginctl enable-linger \"$USER\"");
+            }
             Ok(())
         }
         Command::Doctor => {
@@ -426,6 +467,13 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 }
             }
         }
+        Command::Pairing { action } => match action {
+            PairingAction::Approve { platform, code } => {
+                let line = crate::pairing::approve(config_path, platform, code)?;
+                println!("{line}");
+                Ok(())
+            }
+        },
         Command::Allowlist { action } => {
             let mut config = crate::config::load_config(config_path)?;
             let mut allowed: Vec<String> = config

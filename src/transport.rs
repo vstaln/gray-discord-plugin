@@ -226,18 +226,46 @@ impl Rest {
     /// GET /guilds/{guild}/members/{user} → guild-wide permission bits.
     /// The Python resolves channel overwrites via `permissions_for`; doctor
     /// checks the guild-level grant, which is the actionable diagnostic.
+    /// A member's effective guild permissions, computed the way every
+    /// client does (the member object itself carries no `permissions` field —
+    /// reading one there is what made doctor fail with a bare HTTP 200):
+    /// the guild owner holds everything implicitly, otherwise the
+    /// `@everyone` role (its id is the guild id) ORs with each role the
+    /// member wears.
     pub async fn guild_member_permissions(
         &self,
         guild_id: &str,
         user_id: &str,
     ) -> Result<u64, TransportError> {
-        let v = self
+        let guild = self.get(&format!("/guilds/{guild_id}")).await?;
+        let member = self
             .get(&format!("/guilds/{guild_id}/members/{user_id}"))
             .await?;
-        v.get("permissions")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+        if guild.get("owner_id").and_then(Value::as_str) == Some(user_id) {
+            return Ok(u64::MAX);
+        }
+        let roles = guild
+            .get("roles")
+            .and_then(Value::as_array)
+            .ok_or_else(|| TransportError::Invalid("cannot read guild roles".into()))?;
+        let worn: Vec<&str> = member
+            .get("roles")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut perms: u64 = 0;
+        for role in roles {
+            let id = role.get("id").and_then(Value::as_str).unwrap_or("");
+            let granted = role
+                .get("permissions")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if id == guild_id || worn.contains(&id) {
+                perms |= granted;
+            }
+        }
+        Ok(perms)
     }
 
     /// Send text as sequential chunks. Returns the first message id.
@@ -268,6 +296,52 @@ impl Rest {
     }
 
     /// Typing indicator. Best-effort: never fails a turn.
+    /// Open (or re-open) the DM channel with a user: POST
+    /// /users/@me/channels. Used by setup to make the owner's DM the home
+    /// channel without asking them to hunt an ID.
+    pub async fn create_dm(&self, user_id: u64) -> Result<u64, TransportError> {
+        self.post(
+            "/users/@me/channels",
+            &serde_json::json!({ "recipient_id": user_id.to_string() }),
+        )
+        .await
+        .and_then(|v| {
+            v.get("id")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    TransportError::Invalid("Discord did not return a DM channel".into())
+                })
+        })
+    }
+
+    /// One message carrying an embed (the pairing reply). Discord caps an
+    /// embed at this size; titles and fields that outgrow it are refused
+    /// here rather than 400'd by the API.
+    pub async fn send_embed(
+        &self,
+        channel: u64,
+        content: &str,
+        embed: &Value,
+    ) -> Result<MessageId, TransportError> {
+        check_bounds(content, 20000, "Reply must contain 1-20000 characters")?;
+        let compact = serde_json::to_string(embed).unwrap_or_default();
+        check_bounds(&compact, 6000, "Embed is too large")?;
+        let mut body = json!({
+            "content": content,
+            "allowed_mentions": {"parse": []},
+            "embeds": [embed],
+        });
+        let _ = body["content"].take();
+        let v = self
+            .post(&format!("/channels/{channel}/messages"), &body)
+            .await?;
+        Ok(v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default())
+    }
+
     pub async fn typing(&self, channel: u64) {
         let _ = self
             .post(&format!("/channels/{channel}/typing"), &json!({}))

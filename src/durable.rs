@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY, interval INTEGER NOT NULL, prompt TEXT NOT NULL,
     next_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled');
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS pairings (
+    code TEXT PRIMARY KEY, user_id TEXT NOT NULL, created REAL NOT NULL);
 ";
 
 fn connect(path: &Path) -> Result<Connection, String> {
@@ -437,7 +439,50 @@ impl Store {
         })
     }
 
-    /// Read a `meta` key (slash-command sync hash lives here).
+    /// A pending pairing code for this user, if one is already waiting —
+    /// repeat "hi" from an unknown DMer reuses it instead of piling codes up.
+    pub fn pairing_code_for(&self, user_id: &str) -> Result<Option<String>, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                "SELECT code FROM pairings WHERE user_id=?1 ORDER BY created DESC LIMIT 1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional_str()
+            .map_err(|_| "cannot read pairings".to_string())
+        })
+    }
+
+    pub fn pairing_insert(&self, code: &str, user_id: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "INSERT OR REPLACE INTO pairings(code,user_id,created) VALUES(?1,?2,?3)",
+                params![code, user_id, crate::durable::now_secs()],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store pairing".to_string())
+        })
+    }
+
+    /// Consume a code exactly once. A replay finds nothing.
+    pub fn pairing_take(&self, code: &str) -> Result<Option<String>, String> {
+        with_conn(&self.path, |db| {
+            let found = db
+                .query_row(
+                    "SELECT user_id FROM pairings WHERE code=?1",
+                    params![code],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional_str()
+                .map_err(|_| "cannot read pairings".to_string())?;
+            if found.is_some() {
+                db.execute("DELETE FROM pairings WHERE code=?1", params![code])
+                    .map_err(|_| "cannot consume pairing".to_string())?;
+            }
+            Ok(found)
+        })
+    }
+
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, String> {
         with_conn(&self.path, |db| {
             db.query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {

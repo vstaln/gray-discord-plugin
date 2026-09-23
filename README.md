@@ -5,12 +5,15 @@ its own setup wizard and background service. Public source, no Discord code
 added to gray. Standalone compiled Rust binary using twilight and SQLite durable
 queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
 
-**Status: standalone Rust binary (0.2.0).** Requires matching
+**Status: standalone Rust binary (0.1.0).** Requires matching
 gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 
 **Experimental text-only integration.** Live Discord login, interactive pairing,
-and systemd deployment have been ported from Python to a single Rust binary.
+and background-service deployment have been ported from Python to a single
+Rust binary. The service probes what this box actually supervises with
+(runit, systemd --user, or gray itself with no init) instead of assuming
+systemd.
 
 ## Installation
 
@@ -42,28 +45,63 @@ gray discord setup
 gray discord status
 ```
 
-Setup reads the bot token with hidden terminal input, validates it, prints an
-invite link, then asks you to DM a one-time code to the bot. The code expires
-in five minutes. Confirm the resulting user ID locally before configuration
-is saved. Only that account and explicitly allowlisted users can trigger the agent.
-Enable Message Content Intent in the Discord developer portal. Pick a home channel
-(your DM by default).
+Setup is one command (Hermes parity — token plus your user ID, nothing else):
+
+```sh
+gray discord setup
+```
+
+```
+Discord bot token (hidden): ••••••••
+Your Discord user ID (comma-separated to also allow others): 1493623750858375228,1502…
+```
+
+The wizard validates the token against Discord's own API, makes your DM the
+home channel (created, never asked for), writes the config privately, and
+runs the doctor. Your first ID is the owner; the rest join the allowlist.
+Enable Message Content Intent in the Developer Portal (the doctor checks it).
+Don't know your user ID? `gray discord setup --pair` instead prints a
+one-time code, you DM it to the bot, and the wizard discovers your ID and DM
+channel from that DM.
+
+**Pairing happens on Discord too.** Once the bot is running, anyone can DM
+it: an unconfigured human is told their own Discord ID and a pairing code,
+and the owner admits them with one command:
+
+```
+access not configured.
+Your Discord user id: 1493623750858375228
+Pairing code: SNU3ZQ37
+Ask the bot owner to approve with:
+gray discord pairing approve discord SNU3ZQ37
+```
+
+Codes are single-use; approving before an owner exists makes that user the
+owner. A running gateway applies approvals on restart.
 
 The wizard never sends credentials to a model. Private config is written
 atomically with mode 600. Do not paste bot tokens into chat or command arguments.
 To use a nondefault config, place `--config /absolute/path/config.json` before
 the command on every invocation, including setup/install/register.
 
-The systemd **user** service is `gray-discord-plugin.service`. It runs the
-compiled `gray-discord` binary. For operation after logout/reboot, enable user
-lingering if permitted:
+`gray discord install` starts the daemon under whatever this box supervises
+with. On a systemd box the **user** unit is `gray-discord-plugin.service`;
+for operation after logout/reboot, enable user lingering if permitted:
 
 ```sh
 loginctl enable-linger "$USER"
+```
+
+On a runit box the service is written to `~/.config/service/gray-discord/run`
+and brought up with `sv`. With no init at all, gray spawns the daemon
+detached with a pidfile and log beside the config. `gray discord status`,
+`restart`, and `stop` all dispatch to whichever is installed:
+
+```sh
 gray discord status
 gray discord restart
 gray discord stop
-# Or run in the foreground without systemd:
+# Or run in the foreground under any supervisor:
 gray discord run
 ```
 

@@ -5,6 +5,7 @@ pub mod config;
 pub mod doctor;
 pub mod durable;
 pub mod gateway;
+pub mod pairing;
 pub mod policy;
 pub mod runner;
 pub mod service;

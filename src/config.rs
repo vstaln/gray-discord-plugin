@@ -67,9 +67,15 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
         Some(t) if !t.trim().is_empty() => {}
         _ => return Err("Bot token is missing; run setup".to_string()),
     }
-    for key in ["owner_id", "channel_id"] {
-        if !data.get(key).is_some_and(snowflake) {
-            return Err(format!("{key} must be a Discord ID"));
+    // channel_id is the home channel and always required; owner_id is
+    // optional — a token-only config means "nobody admitted yet", and every
+    // human DM then gets a pairing reply (the first approval becomes owner).
+    if !data.get("channel_id").is_some_and(snowflake) {
+        return Err("channel_id must be a Discord ID".to_string());
+    }
+    if let Some(owner) = data.get("owner_id") {
+        if !snowflake(owner) {
+            return Err("owner_id must be a Discord ID".to_string());
         }
     }
     if let Some(users) = data.get("allowed_users") {

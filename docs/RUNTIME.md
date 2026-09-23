@@ -40,8 +40,10 @@ blindly retried. Shared plugins can also have their own side effects.
 
 ## Spending policy
 
-Setup requires daily/turn allowances and explicit prices for the selected model.
-Existing configurations must set a policy before starting the upgraded gateway:
+A budget policy is optional accounting, never a start requirement: the setup
+wizard offers it (default no), and gray's own `gray gateway setup discord`
+flow writes none. An existing policy must set daily/turn allowances and
+explicit prices for the selected model:
 
 ```sh
 gray discord budget set --daily-usd 5 --turn-usd 0.50 \
@@ -114,5 +116,13 @@ Tests exercise the real gray binary with loopback model/Discord endpoints,
 redacted-prompt resumption, conversation isolation, background delivery failure
 and restart, a budget overage blocking the next run, cancellation, online schedule
 edits, and selected capabilities. No user token/provider key is read by tests.
-Live Discord pairing, real systemd startup, and merging with the active gray
-checkout remain separate operator/integration steps.
+`owner_id` in the config is optional: absent means nobody is admitted yet,
+and every human DM draws a pairing reply (their own ID plus a single-use
+code) until `gray discord pairing approve discord <code>` lands — the
+OpenClaw bootstrap. A running gateway re-reads approvals on restart.
+Live Discord pairing now runs in setup itself: one short-lived gateway
+connection waits for the owner's DM (see `setup::default_pairing`). The
+service lifecycle runs under runit, systemd --user, or gray's own detached
+spawn — install/status/stop/restart dispatch on what this box supervises
+with. A live bot token and merging with the active gray checkout remain
+operator steps.
