@@ -121,6 +121,23 @@ and only sends to the configured destination; it does not open a gateway connect
 Its calls do not require the background service to be running. Long messages are
 split, with all mentions suppressed.
 
+## Burst guard and attachments
+
+Two ports from the grayai_legacy bot (Python, `vstaln/grayai_legacy`), kept
+minimal:
+
+- `rate_limit_capacity` + `rate_limit_window_secs` (8 / 60s defaults) — a
+  sliding-window guard per user. Without it one eager DMer is twenty
+  concurrent `gray` processes; the ninth message inside the window gets
+  "Too fast — try again in Ns" instead of a fork.
+- `max_attachment_bytes` (8MB default) — DM attachments are saved under
+  `workdir/attachments/<msg-id>-<name>` and named in the prompt
+  (`[attached file: …]`), so gray's own tools read them: `cat` for text,
+  `cat <image>` for vision. Nothing is decoded here.
+- Outbound text is sanitized before Discord renders it (bare links wrapped
+  so they do not become embed cards, `:fire:` names replaced, doubled
+  heading hashes collapsed) — a port of `services/text_sanitizer.py`.
+
 ## Allowlisted users
 
 Allow additional users to trigger the agent (usage is billed to the owner's budget ledger):

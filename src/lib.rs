@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod budget;
 pub mod capabilities;
 pub mod cli;
@@ -7,6 +8,7 @@ pub mod durable;
 pub mod gateway;
 pub mod pairing;
 pub mod policy;
+pub mod ratelimit;
 pub mod runner;
 pub mod service;
 pub mod setup;

@@ -428,6 +428,24 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         })
         .unwrap_or_default();
 
+    // Sliding-window burst guard per user, from grayai_legacy's rate_limiter:
+    // without it one eager DMer is twenty concurrent gray processes.
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(crate::ratelimit::RateLimiter::new(
+        config
+            .get("rate_limit_capacity")
+            .and_then(Value::as_u64)
+            .unwrap_or(8) as usize,
+        config
+            .get("rate_limit_window_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(60),
+    )));
+    let workdir = config
+        .get("workdir")
+        .and_then(Value::as_str)
+        .unwrap_or(".")
+        .to_string();
+
     let rest = Rest::new(crate::transport::API_BASE, &token);
     let mut bot_id = rest.login().await.unwrap_or_default();
     let initial_app = rest.application().await.ok().map(|(id, _)| id);
@@ -442,7 +460,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             if let Some(ref token) = part.interaction_token {
                 let app_id = part.app_id.as_deref().unwrap_or("");
                 let ids = rest
-                    .followup(app_id, token, &part.content)
+                    .followup(app_id, token, &crate::text::sanitize(&part.content))
                     .await
                     .map_err(|e| e.to_string())?;
                 ids.into_iter()
@@ -458,7 +476,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         [..24]
                         .to_string();
                 let id = rest
-                    .send(ch, &part.content, Some(&nonce))
+                    .send(ch, &crate::text::sanitize(&part.content), Some(&nonce))
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(id)
@@ -585,6 +603,64 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 .unwrap_or(1000);
                             let msg_id = m.id.to_string();
                             let conv = format!("chat:{channel_id}");
+                            // Burst guard: an over-eager user is told to slow
+                            // down instead of forking gray per message.
+                            let allowed_now = limiter
+                                .lock()
+                                .map(|mut l| l.allow(&author_id))
+                                .unwrap_or(true);
+                            if !allowed_now {
+                                let wait = limiter
+                                    .lock()
+                                    .map(|mut l| l.retry_after_secs(&author_id))
+                                    .unwrap_or(1);
+                                if let Ok(ch) = channel_id.parse::<u64>() {
+                                    let _ = rest
+                                        .send(
+                                            ch,
+                                            &format!("Too fast — try again in {wait}s."),
+                                            None,
+                                        )
+                                        .await;
+                                }
+                                continue;
+                            }
+                            // Attachments the user sent: saved, then named in
+                            // the prompt so gray's own tools can read them.
+                            let mut prompt = prompt;
+                            if !m.attachments.is_empty() {
+                                let max_bytes = config
+                                    .get("max_attachment_bytes")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(8 * 1024 * 1024);
+                                let http = reqwest::Client::new();
+                                let mut saved: Vec<std::path::PathBuf> = Vec::new();
+                                for a in &m.attachments {
+                                    let path = crate::attachments::save(
+                                        &http,
+                                        &token,
+                                        &crate::attachments::AttachmentRef {
+                                            url: &a.url,
+                                            filename: &a.filename,
+                                            size: a.size,
+                                        },
+                                        &msg_id,
+                                        std::path::Path::new(&workdir),
+                                        max_bytes,
+                                    )
+                                    .await;
+                                    if let Some(p) = path {
+                                        saved.push(p);
+                                    }
+                                }
+                                if !saved.is_empty() {
+                                    prompt = format!(
+                                        "{}\n\n{}",
+                                        prompt,
+                                        crate::attachments::prompt_lines(&saved)
+                                    );
+                                }
+                            }
                             if store
                                 .enqueue(&msg_id, &channel_id, &prompt, Some(&conv), capacity)
                                 .is_err()
