@@ -532,6 +532,56 @@ pub fn effective_model(override_model: Option<&str>, provider_model: Option<&str
         .to_string()
 }
 
+/// Render one progress phase as a line a human can read, plus how long it
+/// has been going. The phase name never leaks into the text: a phase this
+/// build has never heard of renders as plain "working" rather than a raw
+/// enum value, so a newer gray talking to an older bridge still reads.
+pub fn progress_text(phase: &str, elapsed: std::time::Duration) -> String {
+    let label = match phase {
+        "generating" => "thinking",
+        "tool_started" | "tool_finished" => "working",
+        "provider_retry" => "retrying",
+        "compacted" => "compacting",
+        "persisting" => "saving",
+        _ => "working",
+    };
+    format!("{label} {}", format_elapsed(elapsed))
+}
+
+/// Go-style compact duration: "12s", "1m15s", "2m", "1h5m". Seconds
+/// always show while a minute or an hour is on the clock, because "2m"
+/// reads as done while work is still running.
+fn format_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m{s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Whether a progress line is worth rewriting. Three things earn it: the
+/// phase changed, this is the first line of a step, or the step has run
+/// past the heartbeat. In between, the line is left alone — a status line
+/// that churns on every tool result is noise nobody reads.
+pub fn should_rewrite(
+    phase: &str,
+    elapsed: std::time::Duration,
+    last: &(String, u64),
+    heartbeat_secs: u64,
+) -> bool {
+    if last.0 != phase {
+        return true;
+    }
+    if elapsed.as_secs() == 0 {
+        return true;
+    }
+    elapsed.as_secs() >= heartbeat_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
