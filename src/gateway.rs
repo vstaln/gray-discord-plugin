@@ -353,6 +353,25 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
 
+    // A pidfile next to the config: the /gateway row reads it to tell a
+    // connected daemon from a stale state file. Removed on every exit path
+    // (drop guard), so a crashed run never leaves a green light behind.
+    let pid_path = parent.join("daemon.json");
+    {
+        let stamp = serde_json::json!({
+            "pid": std::process::id(),
+            "started_at": crate::durable::now_secs()
+        });
+        let _ = crate::config::atomic_json(&pid_path, &stamp);
+    }
+    struct RemovePid(std::path::PathBuf);
+    impl Drop for RemovePid {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove_pid = RemovePid(pid_path);
+
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -389,10 +408,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "token missing".to_string())?
         .to_string();
+    // Ownerless is a legal bootstrap state (OpenClaw parity): nobody is
+    // admitted, and every human DM draws a pairing reply until the operator
+    // approves a code. An empty owner admits nobody — never someone else.
     let owner_id = config
         .get("owner_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| "owner_id missing".to_string())?
+        .filter(|o| !o.is_empty())
+        .unwrap_or_default()
         .to_string();
     let allowed: Vec<String> = config
         .get("allowed_users")
@@ -496,7 +519,31 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             event = shard.next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE | EventTypeFlags::READY) => {
                 match event {
                     Some(Ok(Event::Ready(ready))) => {
-                        println!("Discord connected; durable owner-only queue enabled.");
+                        if owner_id.is_empty() {
+                            println!("Discord connected; nobody admitted yet (pairing replies only).");
+                        } else {
+                            println!("Discord connected; durable owner-only queue enabled.");
+                        }
+                        {
+                            // Pin the identity for gray's /gateway row: files
+                            // only, no socket, no token. Written after the
+                            // gateway is up so a half-connected daemon leaves
+                            // the previous value in place.
+                            let state_path = config_path
+                                .parent()
+                                .unwrap_or_else(|| Path::new("."))
+                                .join("state.json");
+                            let bot = format!(
+                                "{}#{}",
+                                ready.user.name, ready.user.discriminator
+                            );
+                            let state = serde_json::json!({
+                                "bot": bot,
+                                "bot_id": bot_id,
+                                "connected_at": crate::durable::now_secs()
+                            });
+                            let _ = crate::config::atomic_json(&state_path, &state);
+                        }
                         let r_app_id = ready.application.id.to_string();
                         bot_id = ready.user.id.to_string();
                         app_id = Some(r_app_id.clone());
