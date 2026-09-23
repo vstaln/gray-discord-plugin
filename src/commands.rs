@@ -574,6 +574,59 @@ mod tests {
     }
 
     #[test]
+    fn every_phase_gray_emits_renders_a_line_a_human_can_read() {
+        for phase in [
+            "generating",
+            "tool_started",
+            "tool_finished",
+            "provider_retry",
+            "compacted",
+            "persisting",
+            "",
+            "something_new_from_a_future_gray",
+        ] {
+            let text = progress_text(phase, std::time::Duration::from_secs(12));
+            assert!(text.contains("12s"), "{phase} rendered {text:?}");
+            assert!(
+                !text.contains(phase) || phase.is_empty(),
+                "{phase} leaked the raw phase name into {text:?}"
+            );
+        }
+        assert!(
+            progress_text("tool_started", std::time::Duration::from_secs(75)).contains("1m15s")
+        );
+    }
+
+    #[test]
+    fn a_rewrite_is_earned_by_a_phase_change_or_a_long_step() {
+        let start = std::time::Duration::from_secs(0);
+        let last = ("generating".to_string(), 0u64);
+        assert!(
+            should_rewrite("tool_started", start, &last, 30),
+            "phase change rewrites"
+        );
+        assert!(
+            should_rewrite("generating", start, &last, 30),
+            "first line of a step"
+        );
+        // Same phase, still inside the heartbeat: leaving it alone is the
+        // point — a status line that churns per tool result is noise.
+        assert!(!should_rewrite(
+            "generating",
+            std::time::Duration::from_secs(20),
+            &last,
+            30
+        ));
+        // ...until the step runs long enough to look frozen.
+        assert!(should_rewrite(
+            "generating",
+            std::time::Duration::from_secs(30),
+            &last,
+            30
+        ));
+    }
+
+    #[test]
     fn help_lists_every_command_in_the_table() {
         let body = help_embed()["description"].as_str().unwrap().to_string();
         for c in COMMANDS {

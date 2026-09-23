@@ -189,6 +189,34 @@ impl Rest {
         self.classify(status, resp).await
     }
 
+    async fn patch(&self, path: &str, body: &Value) -> Result<Value, TransportError> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self
+            .client
+            .patch(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| TransportError::Net(trim_net_error(e)))?;
+        let status = resp.status();
+        self.classify(status, resp).await
+    }
+
+    /// Overwrite one of our own messages (the activity bubble). Mentions
+    /// stay off. `Ok(false)` means the message is gone (404) and the caller
+    /// should stop editing it; every other failure is transient.
+    pub async fn edit_message(&self, channel: u64, message: &str, text: &str) -> bool {
+        let body = json!({"content": text, "allowed_mentions": {"parse": []}});
+        match self
+            .patch(&format!("/channels/{channel}/messages/{message}"), &body)
+            .await
+        {
+            Ok(_) => true,
+            Err(TransportError::Http(404, _)) => false,
+            Err(_) => true,
+        }
+    }
+
     /// GET /users/@me → bot user id. Proves the token works.
     pub async fn login(&self) -> Result<UserId, TransportError> {
         let v = self.get("/users/@me").await?;

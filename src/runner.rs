@@ -50,8 +50,10 @@ impl std::fmt::Display for RunError {
 }
 impl std::error::Error for RunError {}
 
-/// Boxed progress callback: phase name in, nothing out, never fails.
-pub type ProgressFn<'a> = Box<dyn FnMut(&str) + Send + 'a>;
+/// Boxed progress callback: one `--json` progress row in, nothing out,
+/// never fails. The whole row (phase + tool + redacted detail) so a
+/// renderer can use everything gray emits without a second protocol.
+pub type ProgressFn<'a> = Box<dyn FnMut(&Value) + Send + 'a>;
 
 /// Per-turn options. `timeout_secs` defaults to `timeout_seconds` from config
 /// (600 when absent); `progress` phases never fail the turn; `receipt` gets
@@ -71,7 +73,7 @@ pub struct RunOpts<'a> {
 /// an opaque `Send` payload. Lets the consume future own everything it
 /// touches (the Python just awaits a closure; Rust needs the split).
 pub struct ProgressCb<'a> {
-    pub call: fn(&mut ProgressCtx<'a>, &str),
+    pub call: fn(&mut ProgressCtx<'a>, &Value),
     pub ctx: ProgressCtx<'a>,
 }
 
@@ -289,8 +291,23 @@ pub async fn run_gray(
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    // A job the model adds with a plain `gray cron add` inherits this
+    // conversation's binding, so it comes back to the channel it was added
+    // from. Absent outside a chat: the job is just local.
+    if let Some(origin) = crate::cron::origin_env(&home) {
+        cmd.env("GRAY_CRON_ORIGIN", origin);
+    }
     cmd.env("GRAY_SKILLS_ONLY", "1");
-    cmd.env("GRAY_SHOW_REASONING", "0");
+    // Reasoning traces reach the renderer only when narration is on; the
+    // child is isolated either way, so the cost is the disclosed detail.
+    cmd.env(
+        "GRAY_SHOW_REASONING",
+        if crate::activity::enabled(config) {
+            "1"
+        } else {
+            "0"
+        },
+    );
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
     let mut child = cmd
         .spawn()
@@ -305,9 +322,9 @@ pub async fn run_gray(
     // captures locals — never `opts` itself (receipt is only touched after
     // the await, like the Python's post-turn `receipt.update(final)`).
     let mut progress_cb = ProgressCb {
-        call: |ctx, phase| {
+        call: |ctx, row| {
             if let Some(inner) = ctx.inner.as_deref_mut() {
-                inner(phase);
+                inner(row);
             }
         },
         ctx: ProgressCtx {
@@ -450,12 +467,7 @@ async fn consume_ndjson(
             }
             Some("progress") => {
                 if let Some(cb) = progress.as_deref_mut() {
-                    let phase = row
-                        .get("phase")
-                        .and_then(Value::as_str)
-                        .unwrap_or("working")
-                        .to_string();
-                    (cb.call)(&mut cb.ctx, &phase);
+                    (cb.call)(&mut cb.ctx, &row);
                 }
             }
             _ => {

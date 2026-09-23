@@ -138,6 +138,79 @@ minimal:
   so they do not become embed cards, `:fire:` names replaced, doubled
   heading hashes collapsed) — a port of `services/text_sanitizer.py`.
 
+## Typing indicator
+
+On by default, and re-poked every 8 seconds while the agent is working — so
+from Discord it reads as a permanent "typing…" bubble on a long turn. Turn
+it off in `config.json`:
+
+```json
+{"typing_indicator": false}
+```
+
+Same key, default, and gate placement as Hermes' `discord.typing_indicator`:
+the check happens in the adapter before any typing call, so `false` stops
+the whole path (the REST poke and the host hook) rather than one loop of it.
+Reload by restarting the service (`gray discord restart`).
+
+## Activity narration
+
+While the agent works, one status message per channel shows what it is
+doing, overwritten in place as the turn proceeds — Hermes' single-bubble
+model, not one message per tool call:
+
+```
+💻 terminal: cargo test -p gray
+📖 Reading config.yaml L110-139
+🧠 the user wants magic words
+```
+
+The rows come from gray core's `--json` progress stream (phase + tool +
+a redacted one-line detail), so every chat surface can render the same
+narration; only the rendering is Discord-specific. Reasoning traces
+appear when gray is configured to show them (`GRAY_SHOW_REASONING`, which
+the runner sets from this switch). Every disclosed detail is redacted and
+capped before it leaves gray.
+
+Off in `config.json`:
+
+```json
+{"activity_indicator": false}
+```
+
+Absent means on. Turning it off also stops reasoning from being streamed
+to the runner. Reload by restarting the service (`gray discord restart`).
+
+## Cron that comes back to the chat
+
+Ask for a reminder in Discord ("remind me to check the deploy every hour")
+and the job posts its result back to the channel it was added from:
+
+```
+Cronjob Response: check the deploy
+(job_id: 125c6c57422c)
+-------------
+
+the deploy is green
+
+To stop or manage this job, send me a new message (e.g. "stop reminder check the deploy").
+```
+
+The frame is gray core's, byte-for-byte Hermes' `_deliver_result`; this
+plugin only carries it. How it fits together:
+
+- Each turn runs in its own gray home, so a job added from a conversation
+  lives in that conversation's store and fires with its credentials,
+  workdir, and skills.
+- The channel binding is a `route.json` next to that store, written where
+  the channel is known and read where the home is known, so a plain
+  `gray cron add` from the model is already bound — no ids in the prompt.
+- A background task ticks each conversation every 60s via
+  `gray cron tick --json` and posts what comes back. Runs as its own task,
+  so a firing never stalls shard events.
+- Output that is `[SILENT]` is not posted (core suppresses it), and the
+  full transcript of every run stays on disk.
+
 ## Allowlisted users
 
 Allow additional users to trigger the agent (usage is billed to the owner's budget ledger):

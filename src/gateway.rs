@@ -36,6 +36,17 @@ pub fn slash_commands_json() -> Value {
 pub type ReactionHook = std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 pub type TypingHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 pub type ClockFn = std::sync::Arc<dyn Fn() -> f64 + Send + Sync>;
+/// Narration hook: (bubble text, was it an edit of the existing bubble?).
+pub type ActivityHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
+
+/// The one status bubble per channel: its message id, the text last
+/// published (so a quiet turn edits nothing), and when.
+#[derive(Clone)]
+struct ActivityBubble {
+    id: String,
+    text: String,
+    at: f64,
+}
 
 #[derive(Clone)]
 pub struct Runtime<R, D> {
@@ -47,8 +58,13 @@ pub struct Runtime<R, D> {
     pub rest: Option<Rest>,
     pub reaction_hook: Option<ReactionHook>,
     pub typing_hook: Option<TypingHook>,
+    pub activity_hook: Option<ActivityHook>,
     pub clock: Option<ClockFn>,
+    /// Rows the runner has read but nobody has narrated yet.
+    pub activity: Option<crate::activity::Sink>,
     last_typing: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    activity_bubbles:
+        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, ActivityBubble>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -62,11 +78,28 @@ impl<R, D> Runtime<R, D> {
             rest: None,
             reaction_hook: None,
             typing_hook: None,
+            activity_hook: None,
             clock: None,
+            activity: None,
             last_typing: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            activity_bubbles: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
+    }
+
+    /// Wire the runner's progress sink: gray's rows in, the status bubble
+    /// out. Without it the plugin still runs (typing only).
+    pub fn with_activity(mut self, sink: crate::activity::Sink) -> Self {
+        self.activity = Some(sink);
+        self
+    }
+
+    pub fn with_activity_hook(mut self, hook: ActivityHook) -> Self {
+        self.activity_hook = Some(hook);
+        self
     }
 
     pub fn with_rest(mut self, rest: Rest) -> Self {
@@ -96,7 +129,27 @@ impl<R, D> Runtime<R, D> {
             .unwrap_or_else(crate::durable::now_secs)
     }
 
+    /// The Discord typing indicator, on by default.
+    ///
+    /// Ported 1:1 from Hermes' platform `typing_indicator` flag: same key
+    /// name, same default (on), same gate placement (the adapter refuses
+    /// before any typing RPC, so turning it off kills the whole path rather
+    /// than one loop of it). Set `"typing_indicator": false` in config.json
+    /// and the bot never pokes `/channels/<id>/typing`, so Discord drops the
+    /// bubble instead of showing it through most turns — the 8s throttle
+    /// below re-pokes it for as long as work is in progress, which is what
+    /// reads as "always typing" from the other side.
+    pub fn typing_enabled(&self) -> bool {
+        self.config
+            .get("typing_indicator")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
     pub async fn report_progress(&self, channel: &str) {
+        if !self.typing_enabled() {
+            return;
+        }
         let now = self.now_secs();
         let mut map = self.last_typing.lock().await;
         let last = map.get(channel).copied().unwrap_or(-10.0);
@@ -111,6 +164,107 @@ impl<R, D> Runtime<R, D> {
                     hook(ch);
                 }
             }
+        }
+    }
+
+    /// The gray home for one conversation (the same layout `run_gray`
+    /// builds), or `None` when the layout cannot be derived.
+    pub fn conversation_home(&self, conversation: &str) -> Option<std::path::PathBuf> {
+        let base = self.config_path.parent()?;
+        Some(
+            base.join("conversations")
+                .join(crate::runner::hex_sha256(conversation.as_bytes())),
+        )
+    }
+
+    /// The live session id for a conversation, when a turn has created one.
+    fn session_id(&self, conversation: &str) -> Option<String> {
+        let home = self.conversation_home(conversation)?;
+        let state = std::fs::read(home.join("state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&state).ok()?;
+        v.get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Narrate whatever the agent just did, Hermes-style: one status
+    /// bubble per channel, overwritten in place as the turn proceeds —
+    /// never one message per tool call. Best-effort throughout; narration
+    /// can never fail a turn.
+    pub async fn report_activity(&self, channel: &str) {
+        self.report_activity_at(channel, false).await
+    }
+
+    /// `force` skips the edit gap for the final flush at turn end, so the
+    /// last action of a turn is never swallowed by the rate limit.
+    pub async fn report_activity_at(&self, channel: &str, force: bool) {
+        let Some(sink) = self.activity.clone() else {
+            return;
+        };
+        if !crate::activity::enabled(&self.config) {
+            crate::activity::drain(&sink);
+            return;
+        }
+        let rows = crate::activity::drain(&sink);
+        let Some(text) = crate::activity::render(&rows) else {
+            return;
+        };
+        let now = self.now_secs();
+        let prev = {
+            let map = self.activity_bubbles.lock().await;
+            map.get(channel).cloned()
+        };
+        let (last_text, last_at) = match &prev {
+            Some(b) => (Some(b.text.as_str()), b.at),
+            None => (None, -1.0),
+        };
+        if !force && !crate::activity::should_publish(&text, last_text, now, last_at) {
+            return;
+        }
+        let Ok(ch) = channel.parse::<u64>() else {
+            return;
+        };
+        match &prev {
+            // Existing bubble: overwrite it.
+            Some(b) => {
+                if let Some(ref rest) = self.rest {
+                    if !rest.edit_message(ch, &b.id, &text).await {
+                        // The bubble was deleted (or is in another channel):
+                        // forget it so the next line posts a fresh one.
+                        self.activity_bubbles.lock().await.remove(channel);
+                        return;
+                    }
+                }
+                if let Some(ref hook) = self.activity_hook {
+                    hook(&text, true);
+                }
+            }
+            // First line of the turn (or the first of the channel).
+            None => {
+                let id = match self.rest {
+                    Some(ref rest) => match rest.send(ch, &text, None).await {
+                        Ok(id) => id,
+                        Err(_) => return,
+                    },
+                    // No REST (tests, dry runs): still narrate via the hook.
+                    None => "hook".to_string(),
+                };
+                self.activity_bubbles.lock().await.insert(
+                    channel.to_string(),
+                    ActivityBubble {
+                        id,
+                        text: text.clone(),
+                        at: now,
+                    },
+                );
+                if let Some(ref hook) = self.activity_hook {
+                    hook(&text, false);
+                }
+            }
+        }
+        if let Some(b) = self.activity_bubbles.lock().await.get_mut(channel) {
+            b.text = text;
+            b.at = now;
         }
     }
 
@@ -168,6 +322,15 @@ where
 
         self.add_reaction(&item.channel, &item.id, "👀").await;
         self.report_progress(&item.channel).await;
+        // Bind this conversation's cron jobs to this channel. The chat id
+        // is the live session when we have one (so a cron reply continues
+        // in context), else the conversation key.
+        if let Some(home) = self.conversation_home(&item.conversation) {
+            let chat = self
+                .session_id(&item.conversation)
+                .unwrap_or_else(|| item.conversation.clone());
+            crate::cron::write_route(&home, &item.channel, &chat);
+        }
 
         let run_fut = (self.runner)(
             &self.config,
@@ -187,6 +350,7 @@ where
                 }
                 _ = ticker.tick() => {
                     self.report_progress(&item.channel).await;
+                    self.report_activity(&item.channel).await;
                     if let Ok(Some(cur)) = self.store.get(&item.id) {
                         if cur.cancel {
                             self.store.fail(&item.id, "cancelled")?;
@@ -199,6 +363,9 @@ where
             }
         };
 
+        // Final flush before the answer lands: the bubble shows the last
+        // thing the agent did, then the answer arrives as its own message.
+        self.report_activity_at(&item.channel, true).await;
         match result {
             Some(Ok(answer)) => {
                 let receipt = serde_json::json!({});
@@ -463,13 +630,22 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         })
     };
 
-    let runner = |cfg: &Value, pth: &Path, conv: &str, prompt: &str| {
+    // One narration sink per daemon: the runner pushes gray's progress
+    // rows, the Runtime drains them into the channel's status bubble.
+    let activity = crate::activity::sink();
+    let runner_sink = activity.clone();
+    let runner = move |cfg: &Value, pth: &Path, conv: &str, prompt: &str| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
         let conv = conv.to_string();
         let prompt = prompt.to_string();
+        let sink = runner_sink.clone();
         Box::pin(async move {
-            crate::runner::run_gray(&cfg, &pth, &conv, &prompt, crate::runner::default_opts()).await
+            let opts = crate::runner::RunOpts {
+                progress: Some(crate::activity::callback(sink)),
+                ..crate::runner::default_opts()
+            };
+            crate::runner::run_gray(&cfg, &pth, &conv, &prompt, opts).await
         })
     };
 
@@ -480,10 +656,44 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         deliver,
         runner,
     )
-    .with_rest(rest.clone());
+    .with_rest(rest.clone())
+    .with_activity(activity);
 
     let runtime_task = runtime.run();
     tokio::pin!(runtime_task);
+
+    // Chat-bound cron. Its own task: firing a job spawns a gray turn, and
+    // that must never stall shard events (a typing indicator that stops
+    // updating mid-turn is a broken gateway).
+    let cron_rest = rest.clone();
+    let cron_bin = std::path::PathBuf::from(
+        config
+            .get("gray_bin")
+            .and_then(Value::as_str)
+            .unwrap_or("gray"),
+    );
+    let cron_conversations = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("conversations");
+    let cron_task = async move {
+        let mut every = tokio::time::interval(crate::cron::TICK_EVERY);
+        // A slow tick must not burst-fire the backlog.
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            every.tick().await;
+            for home in crate::cron::routable_homes(&cron_conversations) {
+                for delivery in crate::cron::tick_home(&cron_bin, &home).await {
+                    let Ok(ch) = delivery.channel.parse::<u64>() else {
+                        continue;
+                    };
+                    let body = crate::text::sanitize(&delivery.text);
+                    let _ = cron_rest.send(ch, &body, None).await;
+                }
+            }
+        }
+    };
+    tokio::pin!(cron_task);
 
     #[cfg(unix)]
     let mut sigterm =
@@ -506,6 +716,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         tokio::select! {
             res = &mut runtime_task => {
                 return res;
+            }
+            _ = &mut cron_task => {
+                // The cron task never returns; if it does, the daemon is
+                // broken rather than idle.
+                return Err("cron task stopped".to_string());
             }
             _ = &mut sigterm_recv => {
                 break;
