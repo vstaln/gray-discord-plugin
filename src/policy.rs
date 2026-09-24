@@ -47,7 +47,7 @@ pub fn is_allowed_user(author: &str, owner: &str, allowed: &[String]) -> bool {
 ///
 /// Sender must be owner or in `allowed_users`.
 /// For `/ask`, requires a non-empty string prompt and returns `Some(prompt)`.
-/// For `/reset`, `/status`, and `/stop`, returns `Some(cmd_name)`.
+/// For `/new`, `/reset`, `/status`, and `/stop`, returns `Some(cmd_name)`.
 pub fn slash_admission(
     user_id: &str,
     owner_id: &str,
@@ -67,7 +67,7 @@ pub fn slash_admission(
                 Some(p.to_string())
             }
         }
-        "reset" | "status" | "stop" => Some(command_name.to_string()),
+        "new" | "reset" | "status" | "stop" => Some(command_name.to_string()),
         _ => None,
     }
 }

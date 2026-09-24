@@ -90,8 +90,8 @@ Status legend:
 | Multi-worker generation | `src/gateway.rs` | PORTED | `N = concurrency` worker tasks bounded by semaphore. |
 | Delivery background loop | `src/gateway.rs` | PORTED | Dedicated delivery task consuming outbox parts with stable nonces. |
 | Schedule ticker | `src/gateway.rs` | PORTED | 1-second ticker checking due schedules and enqueuing items. |
-| Slash command registration | `src/gateway.rs` | PORTED | Bulk overwrite with app ID; hash caching via `meta` table. |
-| Slash command handlers | `src/gateway.rs` | PORTED | `/ask` (allowlisted prompt), `/reset` (session clear), `/status` (queue depth), `/stop` (cancel). |
+| Slash command registration | `src/gateway.rs` | PORTED | Bulk overwrite with app ID; hash caching via `meta` table; the command table includes `/new`. |
+| Slash command handlers | `src/command_dispatch.rs` | PORTED | `/ask` (allowlisted prompt), `/new` and `/reset` (session clear), `/status` (queue depth), `/stop` (cancel), plus cron/model/memory/help handlers. |
 
 ### `gray_discord.policy`
 | Python Symbol / Behavior | Rust Implementation | Status | Notes |
@@ -158,11 +158,11 @@ Status legend:
 | Typing indicator cadence | Hermes typing loop | `src/gateway.rs` | PORTED | Sends typing POST every 8 seconds during turn generation. |
 | Slash command registration | Hermes `_safe_sync_slash_commands` | `src/gateway.rs` | PORTED | Bulk overwrite with SHA-256 hash caching in SQLite `meta` table. |
 | `/ask` slash command | Hermes `/ask` | `src/gateway.rs` | PORTED | Submits prompt; defers interaction, routes followup reply. |
-| `/reset` slash command | Hermes `/reset` | `src/gateway.rs` | PORTED | Resets caller's session pointer in conversation directory. |
+| `/new` and `/reset` slash commands | Hermes `/new`, `/reset` | `src/command_dispatch.rs` | PORTED | Cancels pending work, removes the caller's JSONL transcript, and advances the generation marker. |
 | `/status` slash command | Hermes `/status` | `src/gateway.rs` | PORTED | Replies ephemerally with pending queue depth. |
 | `/stop` slash command | Hermes `/stop` | `src/gateway.rs` | PORTED | Sets cancel flag on the caller's active turn. |
 | Allowlist authorization | Hermes `_is_allowed_user` | `src/policy.rs`, `src/cli.rs` | PORTED | Snowflake allowlist; defaults to owner-only when empty. |
-| Thread isolation | Hermes conversation thread keys | `src/gateway.rs` | PORTED | Uses channel ID as conversation key; replies routed to thread. |
+| Thread and group isolation | Hermes conversation thread keys | `src/session.rs`, `src/gateway.rs` | PORTED | Native thread channel IDs remain distinct; guild messages are keyed per user. |
 | 7-day queue retention prune | Hermes `recovery.py` | `src/durable.rs` | PORTED | Prunes terminal inbox/outbox items older than 7 days. |
 
 ---
@@ -171,7 +171,7 @@ Status legend:
 
 The following capabilities from Hermes full suite are deliberately deferred to Phase 2 per design spec (§3):
 1. **Voice / Opus / TTS**: Voice channels, real-time voice synthesis, audio mixing.
-2. **Media & Attachments**: Image downloads, OCR, file uploads, Discord rich embeds.
+2. **Media & Attachments**: Text/image downloads are implemented; OCR, file uploads, and Discord rich embeds remain deferred.
 3. **Channel Skill Bindings**: Restricting specific gray skills to specific Discord channels.
 4. **Free-Response Channels**: Responding to every message in a channel without an `@mention`.
 5. **Role-Based Authorization**: Authorizing users based on Discord guild roles rather than snowflake user IDs.

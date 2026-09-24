@@ -234,7 +234,12 @@ pub async fn run_wired(
         "channel_id": dm_channel.to_string(),
         "gray_bin": absolutize(Path::new(&gray)).to_string_lossy(),
         "gray_home": gray_home.to_string_lossy(),
-        "workdir": workdir
+        "workdir": workdir,
+        "session_reset": {
+            "mode": "both",
+            "idle_minutes": 1_440,
+            "at_hour": 4
+        }
     });
     if !allowed.is_empty() {
         saved["allowed_users"] = Value::Array(allowed.into_iter().map(Value::String).collect());

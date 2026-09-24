@@ -50,8 +50,10 @@ impl std::fmt::Display for RunError {
 }
 impl std::error::Error for RunError {}
 
-/// Boxed progress callback: phase name in, nothing out, never fails.
-pub type ProgressFn<'a> = Box<dyn FnMut(&str) + Send + 'a>;
+/// Boxed progress callback: one `--json` progress row in, nothing out,
+/// never fails. The whole row (phase + tool + redacted detail) so a
+/// renderer can use everything gray emits without a second protocol.
+pub type ProgressFn<'a> = Box<dyn FnMut(&Value) + Send + 'a>;
 
 /// Per-turn options. `timeout_secs` defaults to `timeout_seconds` from config
 /// (600 when absent); `progress` phases never fail the turn; `receipt` gets
@@ -62,13 +64,16 @@ pub struct RunOpts<'a> {
     pub timeout_secs: Option<u64>,
     pub progress: Option<ProgressFn<'a>>,
     pub receipt: Option<&'a mut Value>,
+    /// Per-turn model override (`/model set`). Appended as `--model` only
+    /// when present, so a channel that never picks one is unaffected.
+    pub model: Option<String>,
 }
 
 /// Progress callback without a captured borrow: plain function pointer plus
 /// an opaque `Send` payload. Lets the consume future own everything it
 /// touches (the Python just awaits a closure; Rust needs the split).
 pub struct ProgressCb<'a> {
-    pub call: fn(&mut ProgressCtx<'a>, &str),
+    pub call: fn(&mut ProgressCtx<'a>, &Value),
     pub ctx: ProgressCtx<'a>,
 }
 
@@ -123,11 +128,24 @@ pub async fn run_gray(
         .map_err(|_| RunError::Io("cannot lock conversation".to_string()))?;
     // SAFETY: flock on a file we keep open; fd valid until `_lock` drops.
     use std::os::unix::io::AsRawFd;
-    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    let lock_fd = lock_file.as_raw_fd();
+    // Do not let another concurrently spawned gray child inherit this lock
+    // descriptor. Otherwise a child for conversation B can keep conversation
+    // A's flock alive after A's runner future has returned.
+    let fd_flags = unsafe { libc::fcntl(lock_fd, libc::F_GETFD) };
+    if fd_flags < 0
+        || unsafe { libc::fcntl(lock_fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(RunError::Io("cannot protect conversation lock".to_string()));
+    }
+    let locked = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
         return Err(RunError::Busy);
     }
-    let _lock = lock_file;
+    let _lock = ConversationLock {
+        _file: lock_file,
+        fd: lock_fd,
+    };
 
     // Snapshot the provider config into the isolated home.
     let gray_home = config
@@ -177,8 +195,16 @@ pub async fn run_gray(
     // Bound project discovery at the dedicated work directory.
     let _ = std::fs::create_dir(work.join(".git"));
 
+    let state_path = home.join("session.json");
+    let mut state: Value = std::fs::read(&state_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    if !state.is_object() {
+        state = Value::Object(Default::default());
+    }
     let sessions = home.join("sessions");
-    let files: Vec<PathBuf> = if sessions.is_dir() {
+    let mut files: Vec<PathBuf> = if sessions.is_dir() {
         std::fs::read_dir(&sessions)
             .map_err(|_| RunError::Io("cannot list sessions".to_string()))?
             .flatten()
@@ -188,18 +214,41 @@ pub async fn run_gray(
     } else {
         Vec::new()
     };
+    let now = crate::durable::now_secs();
+    let has_session = state
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|sid| !sid.is_empty())
+        || files.len() == 1;
+    if crate::session::ResetPolicy::from_config(config)
+        .reset_reason(&state, has_session, now)
+        .is_some()
+    {
+        crate::session::reset_home(&home, now).map_err(RunError::Io)?;
+        state = serde_json::json!({
+            "generation": crate::durable::uuid_hex(),
+            "last_activity": now
+        });
+        files.clear();
+    }
+    if state
+        .get("generation")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        state["generation"] = Value::String(crate::durable::uuid_hex());
+    }
+    state["last_activity"] = serde_json::json!(now);
+    crate::config::atomic_json(&state_path, &state).map_err(RunError::Io)?;
+    let generation = state
+        .get("generation")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if files.len() > 1 {
         return Err(RunError::Protocol(
             "Ambiguous conversation store; refusing to select a session".to_string(),
         ));
-    }
-    let state_path = home.join("session.json");
-    let mut state: Value = std::fs::read(&state_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(Value::Null);
-    if !state.is_object() {
-        state = Value::Object(Default::default());
     }
 
     let gray_bin = config.get("gray_bin").and_then(Value::as_str).unwrap_or("");
@@ -255,6 +304,10 @@ pub async fn run_gray(
         args.push("--session".to_string());
         args.push(sid.clone());
     }
+    if let Some(model) = opts.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
 
     let mut cmd = tokio::process::Command::new(&args[0]);
     cmd.args(&args[1..]);
@@ -282,7 +335,15 @@ pub async fn run_gray(
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    // A job the model adds with a plain `gray cron add` inherits this
+    // conversation's binding, so it comes back to the channel it was added
+    // from. Absent outside a chat: the job is just local.
+    if let Some(origin) = crate::cron::origin_env(&home) {
+        cmd.env("GRAY_CRON_ORIGIN", origin);
+    }
     cmd.env("GRAY_SKILLS_ONLY", "1");
+    // Tool narration is safe to show; raw model reasoning is not. Keep the
+    // wire quiet even when the activity bubble is enabled, matching Hermes.
     cmd.env("GRAY_SHOW_REASONING", "0");
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
     let mut child = cmd
@@ -298,17 +359,25 @@ pub async fn run_gray(
     // captures locals — never `opts` itself (receipt is only touched after
     // the await, like the Python's post-turn `receipt.update(final)`).
     let mut progress_cb = ProgressCb {
-        call: |ctx, phase| {
+        call: |ctx, row| {
             if let Some(inner) = ctx.inner.as_deref_mut() {
-                inner(phase);
+                inner(row);
             }
         },
         ctx: ProgressCtx {
             inner: opts.progress.take(),
         },
     };
-    let consume =
-        async { consume_ndjson(stdout, &state_path, &mut state, Some(&mut progress_cb)).await };
+    let consume = async {
+        consume_ndjson(
+            stdout,
+            &state_path,
+            &generation,
+            &mut state,
+            Some(&mut progress_cb),
+        )
+        .await
+    };
     let outcome: Result<Consume, RunError> =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await {
             Ok(r) => r,
@@ -361,9 +430,28 @@ pub async fn run_gray(
     {
         return Err(RunError::Incomplete);
     }
-    match final_row.get("text").and_then(Value::as_str) {
+    let answer = match final_row.get("text").and_then(Value::as_str) {
         Some(t) if !t.trim().is_empty() => Ok(t.to_string()),
         _ => Err(RunError::Empty),
+    };
+    // Drop the lock before the async state machine is suspended again. This
+    // matters when several workers are created in one Tokio process.
+    drop(_lock);
+    answer
+}
+
+struct ConversationLock {
+    _file: std::fs::File,
+    fd: std::os::unix::io::RawFd,
+}
+
+impl Drop for ConversationLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is owned by this guard and remains valid
+        // until this method returns.
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
     }
 }
 
@@ -379,6 +467,7 @@ struct Consume {
 async fn consume_ndjson(
     stdout: tokio::process::ChildStdout,
     state_path: &Path,
+    generation: &str,
     state: &mut Value,
     mut progress: Option<&mut ProgressCb<'_>>,
 ) -> Result<Consume, RunError> {
@@ -422,6 +511,13 @@ async fn consume_ndjson(
         }
         if let Some(sid) = row.get("session_id").and_then(Value::as_str) {
             if uuid_valid(sid) {
+                // `/new` advances the on-disk generation while an old child
+                // may still be finishing. Never let that child resurrect its
+                // predecessor's pointer.
+                if !crate::session::generation_is_current(state_path, generation) {
+                    protocol_ok = false;
+                    continue;
+                }
                 let pinned = state
                     .get("session_id")
                     .and_then(Value::as_str)
@@ -443,12 +539,7 @@ async fn consume_ndjson(
             }
             Some("progress") => {
                 if let Some(cb) = progress.as_deref_mut() {
-                    let phase = row
-                        .get("phase")
-                        .and_then(Value::as_str)
-                        .unwrap_or("working")
-                        .to_string();
-                    (cb.call)(&mut cb.ctx, &phase);
+                    (cb.call)(&mut cb.ctx, &row);
                 }
             }
             _ => {

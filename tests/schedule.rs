@@ -34,8 +34,10 @@ fn online_crud_via_store_and_cli() {
     let _lock = lock_file;
 
     let store = open_store(&path).unwrap();
+    // Seeded directly on the store, exactly as `gray discord schedule add`
+    // in the configured home channel would write it.
     store
-        .schedule_add("legacy-job", 120, "legacy", 1000.0)
+        .schedule_add("legacy-job", 120, "legacy", "42", "chat:42", 1000.0)
         .unwrap();
     let migrated = open_store(&path).unwrap();
     let jobs = migrated.schedules().unwrap();
@@ -70,15 +72,18 @@ fn online_crud_via_store_and_cli() {
     let all_jobs = store.schedules().unwrap();
     let created = all_jobs.iter().find(|j| j.id == job_id).expect("found job");
     assert_eq!(created.prompt, "hello");
+    // The CLI has no channel context, so it targets the configured home.
+    assert_eq!(created.channel, "42");
+    assert_eq!(created.conversation, "chat:42");
 
     // remove job_id
     let out = invoke(&["remove", &job_id]);
     assert_eq!(out.status.code(), Some(0));
 
-    // list now only has legacy-job
+    // list now only has legacy-job, and says where it delivers
     let out = invoke(&["list"]);
     let list = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(list, "legacy-job 120 scheduled\n");
+    assert_eq!(list, "legacy-job 120 scheduled 42\n");
 
     // remove again fails
     let out = invoke(&["remove", &job_id]);

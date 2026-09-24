@@ -189,6 +189,34 @@ impl Rest {
         self.classify(status, resp).await
     }
 
+    async fn patch(&self, path: &str, body: &Value) -> Result<Value, TransportError> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self
+            .client
+            .patch(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| TransportError::Net(trim_net_error(e)))?;
+        let status = resp.status();
+        self.classify(status, resp).await
+    }
+
+    /// Overwrite one of our own messages (the activity bubble). Mentions
+    /// stay off. `Ok(false)` means the message is gone (404) and the caller
+    /// should stop editing it; every other failure is transient.
+    pub async fn edit_message(&self, channel: u64, message: &str, text: &str) -> bool {
+        let body = json!({"content": text, "allowed_mentions": {"parse": []}});
+        match self
+            .patch(&format!("/channels/{channel}/messages/{message}"), &body)
+            .await
+        {
+            Ok(_) => true,
+            Err(TransportError::Http(404, _)) => false,
+            Err(_) => true,
+        }
+    }
+
     /// GET /users/@me → bot user id. Proves the token works.
     pub async fn login(&self) -> Result<UserId, TransportError> {
         let v = self.get("/users/@me").await?;
@@ -433,6 +461,31 @@ impl Rest {
             );
         }
         Ok(ids)
+    }
+
+    /// The embed sibling of `followup`. A deferred slash-command answer is a
+    /// webhook post, not a channel post, so it cannot reuse `send_embed`;
+    /// the bounds are the same, and an oversized embed is refused here rather
+    /// than 400'd by the API.
+    pub async fn followup_embed(
+        &self,
+        app_id: &str,
+        token: &str,
+        embed: &Value,
+    ) -> Result<String, TransportError> {
+        let compact = serde_json::to_string(embed).unwrap_or_default();
+        check_bounds(&compact, 6000, "Reply is too large")?;
+        let body = json!({
+            "allowed_mentions": {"parse": []},
+            "embeds": [embed],
+        });
+        let v = self
+            .post(&format!("/webhooks/{app_id}/{token}"), &body)
+            .await?;
+        Ok(v.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
     }
 
     /// Port of `rest_send`: login → channel → send. REST only.

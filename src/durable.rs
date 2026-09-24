@@ -45,6 +45,11 @@ pub struct Schedule {
     pub prompt: String,
     pub next_at: f64,
     pub status: String,
+    /// Where a due fire lands, and which gray home it runs in. Empty on
+    /// rows written before `/cron` existed; the ticker then falls back to
+    /// the configured home channel.
+    pub channel: String,
+    pub conversation: String,
 }
 
 const SCHEMA: &str = "
@@ -60,7 +65,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     PRIMARY KEY(id,part));
 CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY, interval INTEGER NOT NULL, prompt TEXT NOT NULL,
-    next_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled');
+    next_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+    channel TEXT NOT NULL DEFAULT '', conversation TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS pairings (
     code TEXT PRIMARY KEY, user_id TEXT NOT NULL, created REAL NOT NULL);
@@ -89,6 +95,22 @@ fn connect(path: &Path) -> Result<Connection, String> {
     for col in ["interaction_token TEXT", "app_id TEXT"] {
         let name = col.split_whitespace().next().unwrap_or(col);
         let sql = format!("ALTER TABLE inbox ADD COLUMN {col}");
+        match conn.execute_batch(&sql) {
+            Ok(()) => {}
+            Err(e) => {
+                if !e.to_string().contains(name) {
+                    return Err("cannot migrate queue".to_string());
+                }
+            }
+        }
+    }
+    // Migrate pre-slash databases whose schedules carried no target.
+    for col in [
+        "channel TEXT NOT NULL DEFAULT ''",
+        "conversation TEXT NOT NULL DEFAULT ''",
+    ] {
+        let name = col.split_whitespace().next().unwrap_or(col);
+        let sql = format!("ALTER TABLE schedules ADD COLUMN {col}");
         match conn.execute_batch(&sql) {
             Ok(()) => {}
             Err(e) => {
@@ -391,15 +413,28 @@ impl Store {
         id: &str,
         interval: u64,
         prompt: &str,
+        channel: &str,
+        conversation: &str,
         now: f64,
     ) -> Result<(), String> {
         if interval < 60 || prompt.trim().is_empty() || prompt.len() > 32000 {
             return Err("Interval must be >=60s and prompt 1–32000 characters".to_string());
         }
+        if channel.trim().is_empty() || conversation.trim().is_empty() {
+            return Err("A schedule needs a channel and a conversation".to_string());
+        }
         with_conn(&self.path, |db| {
             db.execute(
-                "INSERT INTO schedules(id,interval,prompt,next_at) VALUES(?1,?2,?3,?4)",
-                params![id, interval as i64, prompt, now + interval as f64],
+                "INSERT INTO schedules(id,interval,prompt,next_at,channel,conversation)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    interval as i64,
+                    prompt,
+                    now + interval as f64,
+                    channel,
+                    conversation
+                ],
             )
             .map_err(|_| "cannot add schedule".to_string())?;
             Ok(())
@@ -409,7 +444,10 @@ impl Store {
     pub fn schedules(&self) -> Result<Vec<Schedule>, String> {
         with_conn(&self.path, |db| {
             let mut stmt = db
-                .prepare("SELECT id,interval,prompt,next_at,status FROM schedules ORDER BY id")
+                .prepare(
+                    "SELECT id,interval,prompt,next_at,status,channel,conversation
+                     FROM schedules ORDER BY id",
+                )
                 .map_err(|_| "cannot list schedules".to_string())?;
             let rows = stmt
                 .query_map([], |r| {
@@ -419,6 +457,8 @@ impl Store {
                         prompt: r.get(2)?,
                         next_at: r.get(3)?,
                         status: r.get(4)?,
+                        channel: r.get(5)?,
+                        conversation: r.get(6)?,
                     })
                 })
                 .map_err(|_| "cannot list schedules".to_string())?;
@@ -530,6 +570,27 @@ impl Store {
         })
     }
 
+    /// Cancel work that predates a session reset. Queued rows become terminal
+    /// immediately; a running child is flagged so its worker can settle it
+    /// without restoring the old session pointer.
+    pub fn cancel_pending_conversation(&self, conversation: &str) -> Result<bool, String> {
+        with_conn(&self.path, |db| {
+            let queued = db
+                .execute(
+                    "UPDATE inbox SET state='cancelled', error='cancelled' WHERE conversation=?1 AND state='queued'",
+                    params![conversation],
+                )
+                .map_err(|_| "cannot cancel".to_string())?;
+            let running = db
+                .execute(
+                    "UPDATE inbox SET cancel=1 WHERE conversation=?1 AND state='running'",
+                    params![conversation],
+                )
+                .map_err(|_| "cannot cancel".to_string())?;
+            Ok(queued + running > 0)
+        })
+    }
+
     /// Queued + running + delivery rows (`/status` queue depth).
     pub fn pending_count(&self) -> Result<i64, String> {
         with_conn(&self.path, |db| {
@@ -545,21 +606,38 @@ impl Store {
     pub fn enqueue_due(&self, channel: &str, now: f64) -> Result<(), String> {
         with_conn(&self.path, |db| {
             let mut stmt = db
-                .prepare("SELECT id,interval,prompt,next_at FROM schedules WHERE next_at<=?1")
+                .prepare(
+                    "SELECT id,interval,prompt,next_at,channel,conversation
+                     FROM schedules WHERE next_at<=?1",
+                )
                 .map_err(|_| "cannot enqueue due".to_string())?;
-            let due: Vec<(String, i64, String, f64)> = stmt
+            let due: Vec<(String, i64, String, f64, String, String)> = stmt
                 .query_map(params![now], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
                 })
                 .map_err(|_| "cannot enqueue due".to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| "cannot enqueue due".to_string())?;
-            for (job_id, interval, prompt, next_at) in due {
+            for (job_id, interval, prompt, next_at, target, target_conv) in due {
                 let inbox_id = format!("job:{job_id}:{next_at}");
-                let conv = format!("job:{job_id}");
+                // A job made in another channel keeps its own target; a row
+                // from before `/cron` existed (empty target) falls back to
+                // the configured home channel and its own gray home.
+                let (post_to, conv) = if target.trim().is_empty() {
+                    (channel.to_string(), format!("job:{job_id}"))
+                } else {
+                    (target, target_conv)
+                };
                 db.execute(
                     "INSERT OR IGNORE INTO inbox(id,channel,conversation,prompt,created) VALUES(?1,?2,?3,?4,?5)",
-                    params![inbox_id, channel, conv, prompt, now],
+                    params![inbox_id, post_to, conv, prompt, now],
                 ).map_err(|_| "cannot enqueue due".to_string())?;
                 db.execute(
                     "UPDATE schedules SET next_at=?1,status='queued' WHERE id=?2",
@@ -649,6 +727,21 @@ pub(crate) fn cap_chunks(chunks: Vec<String>, dropped_chars: usize) -> Vec<Strin
         "… (truncated, {dropped_chars} more characters not sent)"
     ));
     kept
+}
+
+/// A short random id for a scheduled job. Filled from `/dev/urandom` where
+/// that exists; a zero buffer still yields a stable, unique-enough id
+/// because the store refuses a duplicate.
+pub fn uuid_hex() -> String {
+    let mut buf = [0u8; 16];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut buf);
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn now_secs() -> f64 {

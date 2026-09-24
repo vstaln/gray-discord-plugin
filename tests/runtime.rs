@@ -368,3 +368,83 @@ async fn reactions_disabled_when_config_flag_false() {
 
     assert!(reactions_log.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn typing_indicator_disabled_when_config_flag_false() {
+    // Port of Hermes' `discord.typing_indicator: false`. The gate sits in
+    // the adapter before the typing RPC, so disabling it stops both the
+    // REST poke and the host hook — the whole path, not one loop of it.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+
+    let typing_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let typing_calls_clone = typing_calls.clone();
+    let hook = std::sync::Arc::new(move |ch: u64| {
+        typing_calls_clone.lock().unwrap().push(ch);
+    });
+
+    let fake_time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fake_time_clone = fake_time.clone();
+    let clock = std::sync::Arc::new(move || {
+        fake_time_clone.load(std::sync::atomic::Ordering::SeqCst) as f64
+    });
+
+    let dummy_runner =
+        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
+            Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
+        };
+    let dummy_deliver = move |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async move { Ok::<String, String>("".to_string()) })
+    };
+
+    let runtime = gray_discord::gateway::Runtime::new(
+        serde_json::json!({"typing_indicator": false}),
+        path,
+        store,
+        dummy_deliver,
+        dummy_runner,
+    )
+    .with_typing_hook(hook)
+    .with_clock(clock);
+
+    assert!(!runtime.typing_enabled());
+    // Two progress reports well past the 8s throttle window: still silent.
+    fake_time.store(0, std::sync::atomic::Ordering::SeqCst);
+    runtime.report_progress("42").await;
+    fake_time.store(30, std::sync::atomic::Ordering::SeqCst);
+    runtime.report_progress("42").await;
+    assert!(
+        typing_calls.lock().unwrap().is_empty(),
+        "typing_indicator=false must silence the indicator entirely"
+    );
+}
+
+#[tokio::test]
+async fn typing_indicator_defaults_on_and_omitting_the_key_is_not_off() {
+    // Default-on is the whole point of the port: a config written before
+    // the flag existed keeps its indicator, and only an explicit false
+    // silences it.
+    let tmp = tempfile::tempdir().unwrap();
+    for config in [serde_json::json!({}), serde_json::json!({"token": "x"})] {
+        let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+        let dummy_runner =
+            move |_c: &serde_json::Value, _p: &std::path::Path, _v: &str, _q: &str| {
+                Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".into()) })
+            };
+        let dummy_deliver = move |_p: gray_discord::durable::OutboxPart| {
+            Box::pin(async move { Ok::<String, String>("".into()) })
+        };
+        let runtime = gray_discord::gateway::Runtime::new(
+            config,
+            tmp.path().join("config.json"),
+            store,
+            dummy_deliver,
+            dummy_runner,
+        );
+        assert!(
+            runtime.typing_enabled(),
+            "typing is on unless explicitly disabled"
+        );
+    }
+}

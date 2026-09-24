@@ -7,11 +7,17 @@ updated or started as part of this work.
 ## Structured execution
 
 The runner consumes NDJSON, not terminal output or session-file text searches.
-Progress contains phase names only. The terminal result includes `session_id`,
+Progress contains safe phase/tool labels and redacted one-line details; raw
+reasoning is suppressed before it reaches the bridge. The terminal result includes
+`session_id`,
 `turn_id`, final redacted assistant text, and provider accounting. Errors are
 sanitized and retain a nonzero exit status. Malformed output is rejected.
 Each conversation keeps an explicit session pointer. Existing single-file
-conversation homes migrate on first use; ambiguous stores fail closed.
+conversation homes migrate on first use; ambiguous stores fail closed. DMs use
+the channel key, native Discord threads use their thread channel key, and guild
+messages use a per-user key. The default reset policy is `both`: 1,440 idle
+minutes or the next 04:00 local boundary. `/new` and `/reset` remove the
+conversation's JSONL transcripts and advance a generation marker.
 
 `gray discord limits --timeout-seconds 1800 --concurrency 4 --max-requests 32`
 sets runtime policy; restart to apply. Defaults: 600 seconds, 2 workers, 32
