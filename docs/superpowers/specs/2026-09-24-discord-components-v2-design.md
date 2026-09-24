@@ -262,16 +262,18 @@ and session continuity are preserved by the durable queue.
 
 ## 8. Interaction state and event lifecycle
 
-SQLite owns the following records:
+SQLite owns the following logical records. Because the plugin already has a
+legacy `component_states` table for cron buttons, the new physical tables use
+`ui_component_` prefixes:
 
-- `component_documents`: logical ID, revision, surface, owner, channel, guild,
+- `ui_component_documents`: logical ID, revision, surface, owner, channel, guild,
   message/modal ID, protocol version, expiry, and status;
-- `component_states`: opaque token, logical component/action, document,
+- `ui_component_states`: opaque token, logical component/action, document,
   user/channel binding, input schema, one-shot/repeatable policy, expiry, and
   consumed state;
-- `component_events`: Discord interaction ID, event kind, normalized values,
+- `ui_component_events`: Discord interaction ID, event kind, normalized values,
   file IDs, conversation, delivery status, and timestamps;
-- `component_files`: managed path, media type, size, hash, owner, expiry, and
+- `ui_component_files`: managed path, media type, size, hash, owner, expiry, and
   Discord attachment reference.
 
 ### 8.1 Button
@@ -325,7 +327,9 @@ The plugin supports:
 
 Files are copied into a private managed store before being exposed to Gray. Each
 file has a stable ID, media type, size, hash, owner, expiry, and redacted
-display name. The plugin enforces byte limits, count limits, allowed media
+display name. Generated files may be imported only from a canonical path under
+the current conversation work directory; symlink escapes and arbitrary host
+paths are rejected. The plugin enforces byte limits, count limits, allowed media
 types, path safety, and permission checks.
 
 Discord uploads use multipart requests with the correct `payload_json` component
