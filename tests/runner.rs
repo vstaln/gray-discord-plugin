@@ -143,6 +143,65 @@ async fn busy_conversation_is_rejected() {
     first.abort();
 }
 
+#[tokio::test]
+async fn an_idle_session_is_replaced_before_the_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let marker = root.join("ran-once");
+    let argv_file = root.join("argv.txt");
+    let exe = root.join("rotating-gray");
+    let script = format!(
+        r#"#!/bin/sh
+if [ -f "{marker}" ]; then
+  sid="22222222-2222-2222-2222-222222222222"
+else
+  sid="11111111-1111-1111-1111-111111111111"
+  : > "{marker}"
+fi
+printf '%s\n' "$@" > "{argv_file}"
+printf '{{"protocol":1,"turn_id":"t","type":"result","session_id":"%s","text":"ok"}}\n' "$sid"
+"#,
+        marker = marker.display(),
+        argv_file = argv_file.display(),
+    );
+    write_exe(&exe, &script);
+    let mut config = base_config(&exe, &home);
+    config["session_reset"] = serde_json::json!({
+        "mode": "idle",
+        "idle_minutes": 1
+    });
+    let path = root.join("plugin.json");
+    run_gray(&config, &path, "chat:one", "first", default_opts())
+        .await
+        .unwrap();
+
+    let state_path = root
+        .join("conversations")
+        .join(gray_discord::runner::hex_sha256(b"chat:one"))
+        .join("session.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["last_activity"] = serde_json::json!(0.0);
+    gray_discord::config::atomic_json(&state_path, &state).unwrap();
+    let sessions = state_path.parent().unwrap().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("old.jsonl"), "old transcript").unwrap();
+
+    run_gray(&config, &path, "chat:one", "second", default_opts())
+        .await
+        .unwrap();
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(
+        !argv.lines().any(|line| line == "--session"),
+        "argv:\n{argv}"
+    );
+    assert!(!sessions.join("old.jsonl").exists());
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["session_id"], "22222222-2222-2222-2222-222222222222");
+}
+
 // Real-gray integration (no transcript scan — terminal NDJSON only):
 // resume replays history, conversations stay isolated. Requires gray on PATH.
 #[tokio::test]

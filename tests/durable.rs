@@ -81,6 +81,25 @@ fn cancel_and_queue_capacity() {
 }
 
 #[test]
+fn reset_cancels_queued_and_running_conversation_work() {
+    let (_tmp, store) = store();
+    store
+        .enqueue("running", "42", "one", Some("chat:42:user:7"), 1000)
+        .unwrap();
+    let first = store.claim().unwrap().expect("running row");
+    store
+        .enqueue("queued", "42", "two", Some("chat:42:user:7"), 1000)
+        .unwrap();
+    assert!(store.cancel_pending_conversation("chat:42:user:7").unwrap());
+    assert!(store.get(&first.id).unwrap().expect("running").cancel);
+    assert_eq!(
+        store.get("queued").unwrap().expect("queued").state,
+        "cancelled"
+    );
+    assert!(store.claim().unwrap().is_none());
+}
+
+#[test]
 fn prune_removes_old_terminal_rows_only() {
     let (_tmp, store) = store();
     store.enqueue("old", "42", "gone", None, 1000).unwrap();

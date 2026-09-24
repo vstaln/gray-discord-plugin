@@ -89,7 +89,6 @@ fn line(row: &Value) -> Option<String> {
             other if detail.is_empty() => format!("🔧 {other}"),
             other => format!("🔧 {other}: {}", one_line(detail)),
         }),
-        "thinking" if !detail.is_empty() => Some(format!("🧠 {}", one_line(detail))),
         "tool_finished" if row.get("error").and_then(Value::as_bool) == Some(true) => Some(
             format!("❌ {} failed", if tool.is_empty() { "tool" } else { tool }),
         ),

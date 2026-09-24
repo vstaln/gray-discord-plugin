@@ -180,7 +180,7 @@ impl<R, D> Runtime<R, D> {
     /// The live session id for a conversation, when a turn has created one.
     fn session_id(&self, conversation: &str) -> Option<String> {
         let home = self.conversation_home(conversation)?;
-        let state = std::fs::read(home.join("state.json")).ok()?;
+        let state = std::fs::read(home.join("session.json")).ok()?;
         let v: serde_json::Value = serde_json::from_slice(&state).ok()?;
         v.get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -796,7 +796,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 .and_then(Value::as_u64)
                                 .unwrap_or(1000);
                             let msg_id = m.id.to_string();
-                            let conv = format!("chat:{channel_id}");
+                            let conv = crate::session::conversation_key(
+                                &channel_id,
+                                &author_id,
+                                is_dm,
+                            );
                             // Burst guard: an over-eager user is told to slow
                             // down instead of forking gray per message.
                             let allowed_now = limiter
@@ -911,6 +915,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         let ctx = crate::command_dispatch::Ctx {
                             user_id: &user_id,
                             channel_id: &channel_id,
+                            is_dm: interaction.guild_id.is_none(),
                             int_id: &int_id,
                             int_token: &interaction.token,
                             app_id: &effective_app,

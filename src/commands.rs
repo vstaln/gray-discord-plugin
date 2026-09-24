@@ -187,6 +187,12 @@ pub const COMMANDS: &[Command] = &[
         options: &[],
     },
     Command {
+        name: "new",
+        description: "Start a fresh gray session",
+        subcommands: &[],
+        options: &[],
+    },
+    Command {
         name: "stop",
         description: "Stop the running gray agent",
         subcommands: &[],
@@ -288,7 +294,7 @@ pub fn parse(command: &str, subcommand: Option<&str>, values: &[(&str, &str)]) -
         }),
         ("memory", Some("remove")) => needed("key").map(|key| Request::MemoryRemove { key }),
         ("status", _) => Some(Request::Status),
-        ("reset", _) => Some(Request::Reset),
+        ("new", _) | ("reset", _) => Some(Request::Reset),
         ("stop", _) => Some(Request::Stop),
         _ => None,
     }
@@ -714,6 +720,15 @@ mod tests {
         let ask = arr.iter().find(|c| c["name"] == "ask").unwrap();
         assert_eq!(ask["options"][0]["name"], json!("prompt"));
         assert_eq!(ask["options"][0]["type"], json!(3));
+    }
+
+    #[test]
+    fn new_and_reset_share_the_session_reset_action() {
+        assert!(matches!(parse("new", None, &[]), Some(Request::Reset)));
+        assert!(matches!(parse("reset", None, &[]), Some(Request::Reset)));
+        let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"new"));
+        assert!(names.contains(&"reset"));
     }
 
     #[test]

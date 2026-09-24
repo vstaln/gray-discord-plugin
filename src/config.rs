@@ -97,6 +97,31 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;
     int_in(data, "queue_capacity", 1, 100000)?;
+    if let Some(policy) = data.get("session_reset") {
+        if !policy.is_object() {
+            return Err("session_reset must be an object".to_string());
+        }
+        if let Some(mode) = policy.get("mode") {
+            let ok = mode
+                .as_str()
+                .is_some_and(|m| matches!(m, "none" | "idle" | "daily" | "both"));
+            if !ok {
+                return Err("session_reset.mode must be none, idle, daily, or both".to_string());
+            }
+        }
+        if let Some(minutes) = policy.get("idle_minutes") {
+            let ok = minutes.as_u64().is_some_and(|n| (1..=10_080).contains(&n));
+            if !ok {
+                return Err("session_reset.idle_minutes must be between 1 and 10080".to_string());
+            }
+        }
+        if let Some(hour) = policy.get("at_hour") {
+            let ok = hour.as_u64().is_some_and(|n| n <= 23);
+            if !ok {
+                return Err("session_reset.at_hour must be between 0 and 23".to_string());
+            }
+        }
+    }
     if let Some(policy) = data.get("budget") {
         let model = policy.get("model").and_then(Value::as_str).unwrap_or("");
         crate::budget::validate(policy, model)?;

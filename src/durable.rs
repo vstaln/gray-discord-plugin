@@ -570,6 +570,27 @@ impl Store {
         })
     }
 
+    /// Cancel work that predates a session reset. Queued rows become terminal
+    /// immediately; a running child is flagged so its worker can settle it
+    /// without restoring the old session pointer.
+    pub fn cancel_pending_conversation(&self, conversation: &str) -> Result<bool, String> {
+        with_conn(&self.path, |db| {
+            let queued = db
+                .execute(
+                    "UPDATE inbox SET state='cancelled', error='cancelled' WHERE conversation=?1 AND state='queued'",
+                    params![conversation],
+                )
+                .map_err(|_| "cannot cancel".to_string())?;
+            let running = db
+                .execute(
+                    "UPDATE inbox SET cancel=1 WHERE conversation=?1 AND state='running'",
+                    params![conversation],
+                )
+                .map_err(|_| "cannot cancel".to_string())?;
+            Ok(queued + running > 0)
+        })
+    }
+
     /// Queued + running + delivery rows (`/status` queue depth).
     pub fn pending_count(&self) -> Result<i64, String> {
         with_conn(&self.path, |db| {

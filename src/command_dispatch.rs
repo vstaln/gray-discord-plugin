@@ -28,6 +28,7 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Ctx<'a> {
     pub user_id: &'a str,
     pub channel_id: &'a str,
+    pub is_dm: bool,
     pub int_id: &'a str,
     pub int_token: &'a str,
     pub app_id: &'a str,
@@ -54,9 +55,11 @@ impl<'a> Ctx<'a> {
         home
     }
 
-    /// A channel is one gray conversation, in DMs too.
+    /// DMs use their channel; guild messages are isolated per user. Discord
+    /// supplies a thread's own channel id for messages inside that thread,
+    /// so native threads already get separate sessions.
     pub fn conversation(&self) -> String {
-        format!("chat:{}", self.channel_id)
+        crate::session::conversation_key(self.channel_id, self.user_id, self.is_dm)
     }
 
     /// The configured home channel, which owns every schedule written before
@@ -452,16 +455,15 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
             }
         }
         Request::Reset => {
-            let base = ctx
-                .config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            // Both surfaces: the channel's session and the caller's own.
-            for conv in [ctx.conversation(), format!("user:{}", ctx.user_id)] {
-                let key = crate::runner::hex_sha256(conv.as_bytes());
-                let session = base.join("conversations").join(key).join("session.json");
-                let _ = std::fs::remove_file(&session);
+            let _canceled = ctx
+                .store
+                .cancel_pending_conversation(&ctx.conversation())
+                .unwrap_or(false);
+            if let Err(e) =
+                crate::session::reset_home(&ctx.conversation_home(), crate::durable::now_secs())
+            {
+                answer(ctx, &commands::embed("Session", e, &[]), &[], false).await;
+                return;
             }
             answer(
                 ctx,

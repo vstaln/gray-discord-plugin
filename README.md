@@ -162,15 +162,15 @@ model, not one message per tool call:
 ```
 💻 terminal: cargo test -p gray
 📖 Reading config.yaml L110-139
-🧠 the user wants magic words
+✍️ Editing src/config.rs
 ```
 
 The rows come from gray core's `--json` progress stream (phase + tool +
 a redacted one-line detail), so every chat surface can render the same
-narration; only the rendering is Discord-specific. Reasoning traces
-appear when gray is configured to show them (`GRAY_SHOW_REASONING`, which
-the runner sets from this switch). Every disclosed detail is redacted and
-capped before it leaves gray.
+narration; only the rendering is Discord-specific. Safe tool activity is
+shown by default. Raw model reasoning is never sent to Discord: the bridge
+always runs gray with `GRAY_SHOW_REASONING=0`, even when this bubble is
+enabled. Every disclosed detail is redacted and capped before it leaves gray.
 
 Off in `config.json`:
 
@@ -178,8 +178,34 @@ Off in `config.json`:
 {"activity_indicator": false}
 ```
 
-Absent means on. Turning it off also stops reasoning from being streamed
-to the runner. Reload by restarting the service (`gray discord restart`).
+Absent means on. Turning it off stops the status bubble and its tool
+narration; it never enables raw reasoning. Reload by restarting the service
+(`gray discord restart`).
+
+## Sessions and new conversations
+
+A DM is one conversation. A native Discord thread is already a separate
+conversation because Discord sends that thread's channel ID. Guild messages
+are isolated per user, so two people in one channel do not share a transcript.
+
+By default Gray follows the local Hermes policy: a session is replaced after
+24 hours idle or at the next 04:00 local boundary, whichever comes first.
+The policy is configurable:
+
+```json
+{
+  "session_reset": {
+    "mode": "both",
+    "idle_minutes": 1440,
+    "at_hour": 4
+  }
+}
+```
+
+`mode` may be `none`, `idle`, `daily`, or `both`. `/new` and `/reset` both
+forget the caller's transcript, cancel work already queued for that
+conversation, and leave a fresh generation marker so an old in-flight turn
+cannot restore its previous session.
 
 ## Cron that comes back to the chat
 
@@ -257,7 +283,8 @@ exists is registered, handled and documented or none of the three.
 | `/model set model:…` | Pins a model for this channel only | public |
 | `/memory list\|show\|set\|remove` | gray's curated cross-session memory | list/show/set public, remove private |
 | `/status` | Queue depth, model, bridge version | public |
-| `/reset` | Forgets your session | private |
+| `/new` | Starts a fresh session for you | private |
+| `/reset` | Alias of `/new` | private |
 | `/stop` | Cancels the running turn | private |
 
 Anything that shells out to gray (`/memory`) acknowledges first and answers
@@ -276,7 +303,10 @@ job created in one channel delivers to that channel — a job added by
 
 Each conversation and each job gets its own private gray home, provider config
 snapshot, sessions and working directory below the plugin config directory.
-Turns resume the existing ID; ambiguous session stores fail rather than guessing.
+Turns resume the existing ID until the reset policy or `/new` starts a new one;
+ambiguous session stores fail rather than guessing. Native Discord threads use
+their own channel key, and guild chats use a per-user key. Resets remove the
+private conversation transcript rather than merely deleting its pointer.
 A gray profile explicitly enables `tools-minimal` and the outgoing sidecar.
 Tools run on the server, not your desktop. This is **not a sandbox**: allowlisted
 users and model tool execution have the OS user's permissions. Prefer a dedicated
@@ -300,7 +330,8 @@ are not included.
 it does not test provider generation or prove gateway connectivity.
 `uninstall` removes the service only; config, sessions, jobs and the registered
 outgoing tool are deliberately retained. Use `gray plugin disable discord` to
-turn off that tool. Remove private state yourself only if you want to erase it.
+turn off that tool. Use `/new` or `/reset` to erase the current conversation;
+remove other private state yourself only if you want to erase it.
 
 ## Development / verification
 

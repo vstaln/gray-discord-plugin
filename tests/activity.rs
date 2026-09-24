@@ -52,9 +52,9 @@ fn unknown_tool_still_names_itself() {
 }
 
 #[test]
-fn thinking_and_failures_are_visible() {
+fn thinking_is_hidden_but_failures_are_visible() {
     let r = rows(json!({"phase": "thinking", "detail": "the user wants X"}));
-    assert_eq!(activity::render(&r).as_deref(), Some("🧠 the user wants X"));
+    assert_eq!(activity::render(&r), None);
     let f = rows(json!({"phase": "tool_finished", "tool": "bash", "error": true}));
     assert_eq!(activity::render(&f).as_deref(), Some("❌ bash failed"));
     let c = rows(json!({"phase": "compacted"}));
@@ -285,8 +285,5 @@ async fn a_real_gray_turn_narrates_end_to_end() {
     let rows = activity::drain(&sink);
     assert_eq!(rows.len(), 2, "one row per narrated action: {rows:?}");
     let bubble = activity::render(&rows).unwrap();
-    assert_eq!(
-        bubble,
-        "💻 terminal: cargo test -p gray\n🧠 run the tests first"
-    );
+    assert_eq!(bubble, "💻 terminal: cargo test -p gray");
 }

@@ -15,6 +15,7 @@ pub mod policy;
 pub mod ratelimit;
 pub mod runner;
 pub mod service;
+pub mod session;
 pub mod setup;
 pub mod sidecar;
 pub mod text;
