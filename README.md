@@ -155,22 +155,30 @@ Reload by restarting the service (`gray discord restart`).
 
 ## Activity narration
 
-While the agent works, one status message per channel shows what it is
-doing, overwritten in place as the turn proceeds — Hermes' single-bubble
-model, not one message per tool call:
+While the agent works, one live status message per turn shows what it is
+doing, overwritten in place as the turn proceeds. At the end of the turn,
+Discord also keeps a separate bounded tool-activity card with the command
+and redacted terminal output, so activity does not disappear when the next
+turn starts:
 
-```
+````markdown
 💻 terminal: cargo test -p gray
-📖 Reading config.yaml L110-139
-✍️ Editing src/config.rs
+
+🛠 Tool activity
+$ cargo test -p gray
+```text
+test result: ok. ...
 ```
+````
 
 The rows come from gray core's `--json` progress stream (phase + tool +
-a redacted one-line detail), so every chat surface can render the same
-narration; only the rendering is Discord-specific. Safe tool activity is
-shown by default. Raw model reasoning is never sent to Discord: the bridge
-always runs gray with `GRAY_SHOW_REASONING=0`, even when this bubble is
-enabled. Every disclosed detail is redacted and capped before it leaves gray.
+redacted detail/output), so every chat surface can render the same data;
+only the presentation is Discord-specific. Safe tool activity is shown by
+default. Raw model reasoning is never sent to Discord: the bridge always
+runs gray with `GRAY_SHOW_REASONING=0`, even when activity is enabled.
+Every disclosed detail and output is redacted and capped before it leaves
+gray. The card is bounded in rows and characters and never includes
+reasoning.
 
 Off in `config.json`:
 
@@ -178,8 +186,8 @@ Off in `config.json`:
 {"activity_indicator": false}
 ```
 
-Absent means on. Turning it off stops the status bubble and its tool
-narration; it never enables raw reasoning. Reload by restarting the service
+Absent means on. Turning it off stops both the live status bubble and the
+persistent tool card; it never enables raw reasoning. Reload by restarting the service
 (`gray discord restart`).
 
 ## Sessions and new conversations

@@ -1,8 +1,11 @@
 //! Narration: gray's `--json` progress rows -> one status bubble.
 
+mod common;
+
 use gray_discord::activity;
 use gray_discord::durable::Store;
 use gray_discord::gateway::Runtime;
+use gray_discord::transport::Rest;
 use serde_json::json;
 
 // ── rendering (Hermes parity) ──
@@ -15,6 +18,17 @@ fn rows(v: serde_json::Value) -> Vec<serde_json::Value> {
 fn bash_line_matches_hermes_format() {
     let r = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": "ls -la"}));
     assert_eq!(activity::render(&r).as_deref(), Some("💻 terminal: ls -la"));
+}
+
+#[test]
+fn tool_start_is_visible_before_a_long_call_returns() {
+    let started = rows(json!({"phase": "tool_started", "tool": "bash"}));
+    assert_eq!(activity::render(&started).as_deref(), Some("💻 terminal"));
+    let ran = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": "sleep 30"}));
+    assert_eq!(
+        activity::render(&ran).as_deref(),
+        Some("💻 terminal: sleep 30")
+    );
 }
 
 #[test]
@@ -73,7 +87,7 @@ fn quiet_rows_render_to_nothing() {
     let ok = rows(json!({"phase": "tool_finished", "tool": "bash"}));
     assert!(activity::render(&ok).is_none());
     let started = rows(json!({"phase": "tool_started", "tool": "bash"}));
-    assert!(activity::render(&started).is_none());
+    assert_eq!(activity::render(&started).as_deref(), Some("💻 terminal"));
     let thinking_empty = rows(json!({"phase": "thinking", "detail": ""}));
     assert!(activity::render(&thinking_empty).is_none());
 }
@@ -88,6 +102,30 @@ fn repeated_lines_collapse_and_the_tail_is_kept() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "keeps the last three: {text}");
     assert_eq!(lines[2], "💻 terminal: cargo test");
+}
+
+#[test]
+fn the_card_contains_command_and_bounded_output() {
+    let batch = vec![
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "line one\nline two"}),
+    ];
+    let card = activity::render_card(&batch).unwrap();
+    assert!(card.starts_with("🛠 Tool activity\n$ cargo test"), "{card}");
+    assert!(card.contains("line one\nline two"), "{card}");
+}
+
+#[test]
+fn the_card_pairs_parallel_results_by_call_id() {
+    let batch = vec![
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "first"}),
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "second"}),
+        json!({"phase": "tool_finished", "call_id": "b", "tool": "bash", "output": "B"}),
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "A"}),
+    ];
+    let card = activity::render_card(&batch).unwrap();
+    assert!(card.contains("$ first\n```text\nA\n```"), "{card}");
+    assert!(card.contains("$ second\n```text\nB\n```"), "{card}");
 }
 
 // ── the gate ──
@@ -116,6 +154,39 @@ fn the_sink_is_bounded_and_drains() {
     // The newest survive: that is the action in flight.
     assert_eq!(got.last().unwrap()["detail"], "199");
     assert!(activity::drain(&s).is_empty(), "drain empties the queue");
+    assert!(activity::finish(&s, "").len() <= 128);
+    assert!(activity::finish(&s, "").is_empty(), "finish is one-shot");
+}
+
+#[test]
+fn scoped_sinks_do_not_mix_conversations() {
+    let s = activity::sink();
+    activity::begin(&s, "one");
+    activity::begin(&s, "two");
+    activity::push_for(
+        &s,
+        "one",
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "one"}),
+    );
+    activity::push_for(
+        &s,
+        "two",
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "two"}),
+    );
+    let one = activity::drain_for(&s, "one");
+    let two = activity::drain_for(&s, "two");
+    assert_eq!(one[0]["detail"], "one");
+    assert_eq!(two[0]["detail"], "two");
+    assert_eq!(activity::finish(&s, "one").len(), 1);
+    assert_eq!(activity::finish(&s, "two").len(), 1);
+
+    activity::begin(&s, "one");
+    activity::push_for(&s, "one", json!({"phase": "tool_ran", "detail": "stale"}));
+    activity::begin(&s, "one");
+    activity::push_for(&s, "one", json!({"phase": "tool_ran", "detail": "fresh"}));
+    let fresh = activity::finish(&s, "one");
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0]["detail"], "fresh");
 }
 
 #[test]
@@ -132,7 +203,7 @@ fn publishing_needs_new_content_and_a_gap() {
     assert!(activity::should_publish("b", Some("a"), 1.5, 0.0));
 }
 
-// ── wiring: one bubble per channel, edited in place ──
+// ── wiring: one live bubble per channel/conversation, plus a final card ──
 
 /// A runtime wired for narration. A macro, not a fn: the runner/deliver
 /// closure types would otherwise have to be spelled out by hand.
@@ -192,6 +263,76 @@ async fn the_second_line_edits_the_first_bubble() {
 }
 
 #[tokio::test]
+async fn final_flush_posts_a_separate_card_and_next_turn_gets_a_new_bubble() {
+    let sink = activity::sink();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+    let rt = narrated!(json!({}), sink, seen, clock);
+
+    rt.begin_activity("42", "chat:one").await;
+    activity::push_for(
+        &sink,
+        "chat:one",
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "ls"}),
+    );
+    activity::push_for(
+        &sink,
+        "chat:one",
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "one\ntwo"}),
+    );
+    rt.report_activity_for("42", "chat:one", false).await;
+    rt.report_activity_for("42", "chat:one", true).await;
+
+    rt.begin_activity("42", "chat:one").await;
+    activity::push_for(
+        &sink,
+        "chat:one",
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "pwd"}),
+    );
+    rt.report_activity_for("42", "chat:one", false).await;
+
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert_eq!(log[0], ("💻 terminal: ls".to_string(), false));
+    assert!(log[1].0.starts_with("🛠 Tool activity"), "card: {log:?}");
+    assert!(log[1].0.contains("one\ntwo"), "output missing: {log:?}");
+    assert_eq!(
+        log[2],
+        ("💻 terminal: pwd".to_string(), false),
+        "new turn bubble"
+    );
+}
+
+#[tokio::test]
+async fn final_card_reaches_the_discord_rest_endpoint() {
+    let sink = activity::sink();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+    let stub = common::Stub::start().await;
+    let rt = narrated!(json!({}), sink, seen, clock).with_rest(Rest::new(&stub.base, "TESTTOKEN"));
+
+    rt.begin_activity("42", "chat:rest").await;
+    activity::push_for(
+        &sink,
+        "chat:rest",
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "printf hi"}),
+    );
+    activity::push_for(
+        &sink,
+        "chat:rest",
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "hi"}),
+    );
+    rt.report_activity_for("42", "chat:rest", false).await;
+    rt.report_activity_for("42", "chat:rest", true).await;
+
+    let sent = stub.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "expected live bubble plus card");
+    let card = sent[1].body["content"].as_str().unwrap();
+    assert!(card.contains("Tool activity"), "{card}");
+    assert!(card.contains("hi"), "{card}");
+}
+
+#[tokio::test]
 async fn off_activity_narrates_nothing() {
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -238,11 +379,14 @@ fn write_exe(path: &std::path::Path, script: &str) {
 }
 
 /// The exact rows gray's `--json` emitter produces for one turn: a tool
-/// call narrated, a thinking batch, then the answer. If gray changes the
-/// shape, this fails here rather than silently going quiet on Discord.
+/// call narrated, its completed output, a thinking batch, then the answer.
+/// If gray changes the shape, this fails here rather than silently going
+/// quiet on Discord.
 const GRAY_TURN: &str = r#"#!/bin/sh
 cat <<'JSON'
-{"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"tool_ran","tool":"bash","detail":"cargo test -p gray"}
+{"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"tool_started","call_id":"c1","tool":"bash"}
+{"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"tool_ran","call_id":"c1","tool":"bash","detail":"cargo test -p gray"}
+{"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"tool_finished","call_id":"c1","tool":"bash","output":"test result: ok\n0 passed"}
 {"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"thinking","detail":"run the tests first"}
 {"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"result","text":"done","usage":{}}
 JSON
@@ -283,7 +427,13 @@ async fn a_real_gray_turn_narrates_end_to_end() {
     assert_eq!(answer, "done");
 
     let rows = activity::drain(&sink);
-    assert_eq!(rows.len(), 2, "one row per narrated action: {rows:?}");
+    assert_eq!(rows.len(), 4, "one row per progress event: {rows:?}");
     let bubble = activity::render(&rows).unwrap();
-    assert_eq!(bubble, "💻 terminal: cargo test -p gray");
+    assert_eq!(bubble, "💻 terminal\n💻 terminal: cargo test -p gray");
+    let card = activity::render_card(&activity::finish(&sink, "")).unwrap();
+    assert!(card.contains("test result: ok\n0 passed"), "{card}");
+    assert!(
+        !card.contains("run the tests first"),
+        "reasoning leaked: {card}"
+    );
 }

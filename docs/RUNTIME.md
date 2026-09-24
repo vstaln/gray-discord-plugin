@@ -1,14 +1,18 @@
 # Runtime reliability changes (isolated development version)
 
 Requires the matching gray core changes implementing `gray -p --json` protocol 1.
-Do not install this branch with an older gray executable. No active service was
-updated or started as part of this work.
+Do not install this branch with an older gray executable. Upgrade the gray binary
+and this plugin together, then restart the service so the two protocol versions
+match.
 
 ## Structured execution
 
 The runner consumes NDJSON, not terminal output or session-file text searches.
-Progress contains safe phase/tool labels and redacted one-line details; raw
-reasoning is suppressed before it reaches the bridge. The terminal result includes
+Progress contains safe phase/tool labels, redacted one-line details, and a
+bounded redacted output for completed tools (plus an internal call ID for
+pairing parallel results). Discord drains rows per conversation, keeps a live
+status bubble, and posts a separate bounded tool-activity card at turn end.
+Raw reasoning is suppressed before it reaches the bridge. The terminal result includes
 `session_id`,
 `turn_id`, final redacted assistant text, and provider accounting. Errors are
 sanitized and retain a nonzero exit status. Malformed output is rejected.

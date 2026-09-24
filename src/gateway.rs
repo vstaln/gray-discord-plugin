@@ -36,11 +36,16 @@ pub fn slash_commands_json() -> Value {
 pub type ReactionHook = std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 pub type TypingHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 pub type ClockFn = std::sync::Arc<dyn Fn() -> f64 + Send + Sync>;
-/// Narration hook: (bubble text, was it an edit of the existing bubble?).
+/// Activity hook: (activity text, whether this was an edit of the live bubble).
+/// A final card uses the same hook with `false` because it is a new message.
 pub type ActivityHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
 
-/// The one status bubble per channel: its message id, the text last
-/// published (so a quiet turn edits nothing), and when.
+fn activity_key(channel: &str, conversation: &str) -> String {
+    format!("{channel}\u{0}{conversation}")
+}
+
+/// The live status bubble for one channel/conversation: its message id,
+/// last published text, and timestamp.
 #[derive(Clone)]
 struct ActivityBubble {
     id: String,
@@ -90,8 +95,8 @@ impl<R, D> Runtime<R, D> {
         }
     }
 
-    /// Wire the runner's progress sink: gray's rows in, the status bubble
-    /// out. Without it the plugin still runs (typing only).
+    /// Wire the runner's progress sink: gray's rows in, the live bubble and
+    /// final tool card out. Without it the plugin still runs (typing only).
     pub fn with_activity(mut self, sink: crate::activity::Sink) -> Self {
         self.activity = Some(sink);
         self
@@ -187,38 +192,75 @@ impl<R, D> Runtime<R, D> {
             .map(str::to_string)
     }
 
-    /// Narrate whatever the agent just did, Hermes-style: one status
-    /// bubble per channel, overwritten in place as the turn proceeds —
-    /// never one message per tool call. Best-effort throughout; narration
-    /// can never fail a turn.
+    /// Narrate whatever the agent just did: one live status bubble per
+    /// active channel/conversation, overwritten in place. Best-effort throughout; live
+    /// narration can never fail a turn.
     pub async fn report_activity(&self, channel: &str) {
-        self.report_activity_at(channel, false).await
+        self.report_activity_for(channel, "", false).await
+    }
+
+    /// Start a fresh live bubble and row history for one turn. Keeping this
+    /// beside the renderer makes the reset explicit for tests and for any
+    /// future non-queue caller.
+    pub async fn begin_activity(&self, channel: &str, conversation: &str) {
+        if let Some(ref sink) = self.activity {
+            crate::activity::begin(sink, conversation);
+        }
+        self.activity_bubbles
+            .lock()
+            .await
+            .remove(&activity_key(channel, conversation));
     }
 
     /// `force` skips the edit gap for the final flush at turn end, so the
-    /// last action of a turn is never swallowed by the rate limit.
+    /// last action of a turn is never swallowed by the rate limit. The final
+    /// flush also posts the persistent, bounded tool-activity card.
     pub async fn report_activity_at(&self, channel: &str, force: bool) {
+        self.report_activity_for(channel, "", force).await
+    }
+
+    /// Activity rows are scoped by conversation, not merely channel. A
+    /// daemon can run several channels concurrently; one global queue would
+    /// let a fast turn drain or finalize another turn's terminal output.
+    pub async fn report_activity_for(&self, channel: &str, conversation: &str, force: bool) {
         let Some(sink) = self.activity.clone() else {
             return;
         };
         if !crate::activity::enabled(&self.config) {
-            crate::activity::drain(&sink);
+            crate::activity::discard(&sink, conversation);
             return;
         }
-        let rows = crate::activity::drain(&sink);
-        let Some(text) = crate::activity::render(&rows) else {
-            return;
-        };
+        let rows = crate::activity::drain_for(&sink, conversation);
+        if let Some(text) = crate::activity::render(&rows) {
+            self.publish_live_activity(channel, conversation, &text, force)
+                .await;
+        }
+        if force {
+            let history = crate::activity::finish(&sink, conversation);
+            if let Some(card) = crate::activity::render_card(&history) {
+                self.publish_activity_card(channel, &card).await;
+            }
+        }
+    }
+
+    async fn publish_live_activity(
+        &self,
+        channel: &str,
+        conversation: &str,
+        text: &str,
+        force: bool,
+    ) {
+        let key = activity_key(channel, conversation);
         let now = self.now_secs();
         let prev = {
             let map = self.activity_bubbles.lock().await;
-            map.get(channel).cloned()
+            map.get(&key).cloned()
         };
         let (last_text, last_at) = match &prev {
             Some(b) => (Some(b.text.as_str()), b.at),
             None => (None, -1.0),
         };
-        if !force && !crate::activity::should_publish(&text, last_text, now, last_at) {
+        if !force && !crate::activity::should_publish(text, last_text, now, last_at) {
             return;
         }
         let Ok(ch) = channel.parse::<u64>() else {
@@ -228,21 +270,21 @@ impl<R, D> Runtime<R, D> {
             // Existing bubble: overwrite it.
             Some(b) => {
                 if let Some(ref rest) = self.rest {
-                    if !rest.edit_message(ch, &b.id, &text).await {
+                    if !rest.edit_message(ch, &b.id, text).await {
                         // The bubble was deleted (or is in another channel):
                         // forget it so the next line posts a fresh one.
-                        self.activity_bubbles.lock().await.remove(channel);
+                        self.activity_bubbles.lock().await.remove(&key);
                         return;
                     }
                 }
                 if let Some(ref hook) = self.activity_hook {
-                    hook(&text, true);
+                    hook(text, true);
                 }
             }
             // First line of the turn (or the first of the channel).
             None => {
                 let id = match self.rest {
-                    Some(ref rest) => match rest.send(ch, &text, None).await {
+                    Some(ref rest) => match rest.send(ch, text, None).await {
                         Ok(id) => id,
                         Err(_) => return,
                     },
@@ -250,21 +292,36 @@ impl<R, D> Runtime<R, D> {
                     None => "hook".to_string(),
                 };
                 self.activity_bubbles.lock().await.insert(
-                    channel.to_string(),
+                    key.clone(),
                     ActivityBubble {
                         id,
-                        text: text.clone(),
+                        text: text.to_string(),
                         at: now,
                     },
                 );
                 if let Some(ref hook) = self.activity_hook {
-                    hook(&text, false);
+                    hook(text, false);
                 }
             }
         }
-        if let Some(b) = self.activity_bubbles.lock().await.get_mut(channel) {
-            b.text = text;
+        if let Some(b) = self.activity_bubbles.lock().await.get_mut(&key) {
+            b.text = text.to_string();
             b.at = now;
+        }
+    }
+
+    async fn publish_activity_card(&self, channel: &str, text: &str) {
+        let Ok(ch) = channel.parse::<u64>() else {
+            return;
+        };
+        let text = crate::text::sanitize(text);
+        if let Some(ref rest) = self.rest {
+            if rest.send(ch, &text, None).await.is_err() {
+                return;
+            }
+        }
+        if let Some(ref hook) = self.activity_hook {
+            hook(&text, false);
         }
     }
 
@@ -322,6 +379,9 @@ where
 
         self.add_reaction(&item.channel, &item.id, "👀").await;
         self.report_progress(&item.channel).await;
+        // A new turn gets a new live bubble; the prior turn's persistent card
+        // remains in the channel history instead of being edited underneath.
+        self.begin_activity(&item.channel, &item.conversation).await;
         // Bind this conversation's cron jobs to this channel. The chat id
         // is the live session when we have one (so a cron reply continues
         // in context), else the conversation key.
@@ -350,9 +410,10 @@ where
                 }
                 _ = ticker.tick() => {
                     self.report_progress(&item.channel).await;
-                    self.report_activity(&item.channel).await;
+                    self.report_activity_for(&item.channel, &item.conversation, false).await;
                     if let Ok(Some(cur)) = self.store.get(&item.id) {
                         if cur.cancel {
+                            self.report_activity_for(&item.channel, &item.conversation, true).await;
                             self.store.fail(&item.id, "cancelled")?;
                             self.remove_reaction(&item.channel, &item.id, "👀").await;
                             self.add_reaction(&item.channel, &item.id, "❌").await;
@@ -365,7 +426,8 @@ where
 
         // Final flush before the answer lands: the bubble shows the last
         // thing the agent did, then the answer arrives as its own message.
-        self.report_activity_at(&item.channel, true).await;
+        self.report_activity_for(&item.channel, &item.conversation, true)
+            .await;
         match result {
             Some(Ok(answer)) => {
                 let receipt = serde_json::json!({});
@@ -642,7 +704,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let sink = runner_sink.clone();
         Box::pin(async move {
             let opts = crate::runner::RunOpts {
-                progress: Some(crate::activity::callback(sink)),
+                progress: Some(crate::activity::callback_for(sink, conv.clone())),
                 ..crate::runner::default_opts()
             };
             crate::runner::run_gray(&cfg, &pth, &conv, &prompt, opts).await

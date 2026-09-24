@@ -51,8 +51,9 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// Boxed progress callback: one `--json` progress row in, nothing out,
-/// never fails. The whole row (phase + tool + redacted detail) so a
-/// renderer can use everything gray emits without a second protocol.
+/// never fails. The whole disclosed row (phase, tool, safe detail/output,
+/// and internal call ID) so a renderer can use everything gray emits
+/// without a second protocol.
 pub type ProgressFn<'a> = Box<dyn FnMut(&Value) + Send + 'a>;
 
 /// Per-turn options. `timeout_secs` defaults to `timeout_seconds` from config
