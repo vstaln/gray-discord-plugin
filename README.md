@@ -9,11 +9,11 @@ queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY
 gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 
-**Experimental text-only integration.** Live Discord login, interactive pairing,
-and background-service deployment have been ported from Python to a single
-Rust binary. The service probes what this box actually supervises with
-(runit, systemd --user, or gray itself with no init) instead of assuming
-systemd.
+**Typed Components V2 integration.** Live Discord login, interactive pairing,
+background-service deployment, managed media, and typed component events are
+implemented in one Rust binary. The service probes what this box actually
+supervises with (runit, systemd --user, or gray itself with no init) instead
+of assuming systemd.
 
 ## Installation
 
@@ -119,7 +119,88 @@ protocol-1.1 stdio sidecar in gray's existing plugin lock, preserving other entr
 Restart existing gray sessions. `discord_send` accepts `{ "content": "hello" }`
 and only sends to the configured destination; it does not open a gateway connection.
 Its calls do not require the background service to be running. Long messages are
-split, with all mentions suppressed.
+split, with all mentions suppressed. New bot messages use Discord Components V2
+(`Text Display`, `Container`, and `Separator`) rather than legacy content/embeds;
+the durable queue keeps a legacy fallback only for rows created before the V2
+migration.
+
+## Typed Components V2
+
+The sidecar exposes a Gray-owned typed document protocol instead of asking the
+model to hand-write Discord numeric types or `custom_id` values:
+
+- `discord_ui_schema` returns the current protocol/limits and message/modal shape.
+- `discord_send_ui` accepts a `gray.discord.ui` version-1 document, compiles it,
+  allocates opaque state, and sends/edits a V2 message.
+- `discord_open_modal` accepts a typed modal document for the current interaction.
+- `discord_file` imports, inspects, or safely exposes files from the conversation
+  work directory; managed IDs and safe workdir paths never expose the host media
+  store or Discord tokens.
+
+Buttons, selects, modals, media, files, and the documented component limits are
+handled by the plugin. Interaction values are delivered into Gray as
+`gray.discord.input` version-1 user turns. Premium buttons require the
+`premium` capability and an explicitly allowed `premium_skus` entry.
+
+A message document is authored in the Gray protocol, not Discord wire JSON:
+
+```json
+{
+  "surface": "message",
+  "version": 1,
+  "document_id": "status-card",
+  "visibility": "public",
+  "components": [
+    {"type": "text", "content": "Build finished"},
+    {"type": "action_row", "children": [
+      {"type": "button", "logical_id": "refresh", "label": "Refresh", "style": "secondary"}
+    ]}
+  ]
+}
+```
+
+Call it through `discord_send_ui`. For a modal, use the same envelope with
+`"surface": "modal"`, a `title`, and `label` components, then call
+`discord_open_modal` with the interaction ID from the normalized event.
+`discord_file` supports `import`, `metadata`, and `path`; only `path` returns
+a file below the current conversation work directory.
+
+The compiler emits message types 1–3, 5–14, and 17, plus modal types 3–8,
+18–19, and 21–23. Numeric Discord types, custom IDs, and attachment URLs are
+owned by the compiler. Premium style 6 is represented in the protocol but
+fails closed unless both the capability and SKU allowlist are configured.
+
+## Native structured input
+
+The gateway and sidecar never put Discord interaction tokens or raw callback
+bodies in a model prompt. A normalized event is persisted as a versioned Gray
+input envelope and runs in the same conversation/session as the user's text:
+
+```sh
+gray --input-json /path/to/event.json --json --session <id>
+gray --input-json - --json --session <id> < event.json
+```
+
+`event.json` has the shape:
+
+```json
+{
+  "protocol": "gray.discord.input",
+  "version": 1,
+  "kind": "component_event",
+  "payload": {
+    "document_id": "refresh-card",
+    "component": "refresh",
+    "action": "button",
+    "values": {"id": "7"},
+    "files": []
+  }
+}
+```
+
+The envelope is capped at 1 MiB and is preserved as a typed user content block
+in the transcript. The provider sees a bounded, redacted marker, not a raw
+Discord token or file body.
 
 ## Burst guard and attachments
 
@@ -157,28 +238,27 @@ Reload by restarting the service (`gray discord restart`).
 
 While the agent works, one live status message per turn shows what it is
 doing, overwritten in place as the turn proceeds. At the end of the turn,
-Discord also keeps a separate bounded tool-activity card with the command
-and redacted terminal output, so activity does not disappear when the next
-turn starts:
+Discord also keeps a separate bounded tool-activity card, so activity does
+not disappear when the next turn starts. Both show actions only — one line
+per meaningful call, never tool output. Shell introspection (`ls`, `cat`,
+…) stays unnarrated, and shell work reads the way gray's own transcript
+labels it (`Running` live, `Ran` on the receipt):
 
 ````markdown
-💻 terminal: cargo test -p gray
+💻 Running `gray view /tmp/shot.png`
 
-🛠 Tool activity
-$ cargo test -p gray
-```text
-test result: ok. ...
-```
+⋯ 0.9s · ran 2 commands
+💻 Ran `gray view /tmp/shot.png` (0.3s)
 ````
 
 The rows come from gray core's `--json` progress stream (phase + tool +
-redacted detail/output), so every chat surface can render the same data;
-only the presentation is Discord-specific. Safe tool activity is shown by
-default. Raw model reasoning is never sent to Discord: the bridge always
-runs gray with `GRAY_SHOW_REASONING=0`, even when activity is enabled.
-Every disclosed detail and output is redacted and capped before it leaves
-gray. The card is bounded in rows and characters and never includes
-reasoning.
+detail), so every chat surface can render the same data; only the
+presentation is Discord-specific. Safe tool activity is shown by default.
+Raw model reasoning is never sent to Discord: the bridge always runs gray
+with `GRAY_SHOW_REASONING=0`, even when activity is enabled. Secrets are
+redacted and everything is capped before it leaves gray, but secret-free
+paths stay verbatim so narration names the actual file. The card keeps at
+most 5 actions plus a tally and never includes reasoning.
 
 Off in `config.json`:
 
@@ -298,7 +378,9 @@ exists is registered, handled and documented or none of the three.
 Anything that shells out to gray (`/memory`) acknowledges first and answers
 afterwards: Discord drops a callback that took longer than three seconds.
 Buttons arrive as `MessageComponent` interactions; only an allow-listed user
-can press one, because Discord does not filter presses for you.
+can press one, because Discord does not filter presses for you. Cron buttons
+carry short-lived, opaque, single-use state tokens rather than schedule IDs, and
+successful presses update the original V2 message.
 
 `/cron` fronts the plugin's own schedule store rather than gray's cron CLI.
 gray's cron is file-only and needs a ticker per home; this daemon ticks only
@@ -334,8 +416,9 @@ for exactly-once delivery limitations, unbounded archive retention, and the
 still-separate native cron scheduler. Voice, attachments and full Hermes parity
 are not included.
 
-`doctor` checks token, intent, channel permissions and local gray configuration;
-it does not test provider generation or prove gateway connectivity.
+`doctor` checks token, intent, effective channel/parent overwrite permissions
+(including the thread send bit), and local gray configuration; it does not test
+provider generation or prove gateway connectivity.
 `uninstall` removes the service only; config, sessions, jobs and the registered
 outgoing tool are deliberately retained. Use `gray plugin disable discord` to
 turn off that tool. Use `/new` or `/reset` to erase the current conversation;

@@ -2,13 +2,158 @@
 //!
 //! Port of gray_discord/gateway.py — see implementation plan Task 9.
 
+use crate::component_input::{normalize, normalize_autocomplete, NormalizedInteraction};
+use crate::component_media::FileStore;
+use crate::component_state::NewEvent;
 use crate::durable::{OutboxPart, Store};
-use crate::runner::RunError;
+use crate::runner::{RunError, RunInput};
 use crate::transport::Rest;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
+use twilight_model::application::interaction::InteractionType;
 use twilight_model::gateway::event::Event;
+
+struct NormalizedRoute<'a> {
+    raw: &'a Value,
+    interaction_token: &'a str,
+    app_id: &'a str,
+    rest: &'a Rest,
+    store: &'a Store,
+    file_store: Option<&'a FileStore>,
+    capacity: u64,
+    is_dm: bool,
+}
+
+async fn route_normalized_interaction(route: NormalizedRoute<'_>) -> Result<(), String> {
+    let NormalizedRoute {
+        raw,
+        interaction_token,
+        app_id,
+        rest,
+        store,
+        file_store,
+        capacity,
+        is_dm,
+    } = route;
+    let is_autocomplete = raw.get("type").and_then(Value::as_u64) == Some(4);
+    if is_autocomplete {
+        let values = normalize_autocomplete(raw).map_err(|error| error.to_string())?;
+        let resolved = store
+            .resolve_state(&values.state_token, &values.user_id, &values.channel_id)
+            .map_err(|error| error.to_string())?;
+        let conversation =
+            crate::session::conversation_key(&values.channel_id, &values.user_id, is_dm);
+        let payload = serde_json::json!({"values": values.values});
+        let _receipt = store
+            .accept_event(NewEvent {
+                interaction_id: values.interaction_id.clone(),
+                token: values.state_token.clone(),
+                user_id: values.user_id.clone(),
+                channel_id: values.channel_id.clone(),
+                kind: "autocomplete".to_string(),
+                payload,
+                conversation,
+                interaction_token: Some(interaction_token.to_string()),
+                app_id: Some(app_id.to_string()),
+                capacity,
+            })
+            .map_err(|error| error.to_string())?;
+        let choices = autocomplete_choices(&values.values, &resolved.state);
+        return rest
+            .autocomplete_response(&values.interaction_id, interaction_token, &choices)
+            .await
+            .map_err(|error| error.to_string());
+    }
+
+    let mut normalized = normalize(raw).map_err(|error| error.to_string())?;
+    let _resolved = store
+        .resolve_state(
+            &normalized.values().state_token,
+            &normalized.values().user_id,
+            &normalized.values().channel_id,
+        )
+        .map_err(|error| error.to_string())?;
+    let attachments = normalized.values().attachments.clone();
+    let mut managed_files = Vec::new();
+    if !attachments.is_empty() {
+        let file_store = file_store.ok_or_else(|| "managed media is unavailable".to_string())?;
+        for attachment in attachments {
+            let file = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                file_store.import_url_authenticated(
+                    &normalized.values().user_id,
+                    &attachment.url,
+                    Some(interaction_token),
+                ),
+            )
+            .await
+            .map_err(|_| "managed attachment import timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+            managed_files.push(file.id);
+        }
+    } else if !normalized.values().files.is_empty() {
+        return Err("managed media is unavailable".to_string());
+    }
+    normalized.values_mut().files = managed_files;
+    let values = normalized.values();
+    let mut payload = serde_json::json!({"values": values.values});
+    if !values.files.is_empty() {
+        payload["files"] = serde_json::json!(values.files);
+    }
+    let conversation = crate::session::conversation_key(&values.channel_id, &values.user_id, is_dm);
+    let _receipt = store
+        .accept_event(NewEvent {
+            interaction_id: values.interaction_id.clone(),
+            token: values.state_token.clone(),
+            user_id: values.user_id.clone(),
+            channel_id: values.channel_id.clone(),
+            kind: normalized.kind().to_string(),
+            payload,
+            conversation,
+            interaction_token: Some(interaction_token.to_string()),
+            app_id: Some(app_id.to_string()),
+            capacity,
+        })
+        .map_err(|error| error.to_string())?;
+    match normalized {
+        NormalizedInteraction::ModalSubmit(_) => rest
+            .defer_update(&values.interaction_id, interaction_token)
+            .await
+            .map_err(|error| error.to_string()),
+        NormalizedInteraction::Button(_) | NormalizedInteraction::Select(_) => rest
+            .defer_v2(&values.interaction_id, interaction_token, true)
+            .await
+            .map_err(|error| error.to_string()),
+        NormalizedInteraction::Autocomplete(_) => unreachable!("autocomplete handled above"),
+    }
+}
+
+fn autocomplete_choices(values: &Value, state: &Value) -> Vec<(String, String)> {
+    let query = values
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    state
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            let name = option.get("label").and_then(Value::as_str)?;
+            let value = option.get("value").and_then(Value::as_str)?;
+            if !query.is_empty()
+                && !name.to_ascii_lowercase().contains(&query)
+                && !value.to_ascii_lowercase().contains(&query)
+            {
+                return None;
+            }
+            Some((name.to_string(), value.to_string()))
+        })
+        .take(25)
+        .collect()
+}
 
 pub fn jobs_path(config_path: &Path) -> PathBuf {
     config_path
@@ -230,8 +375,35 @@ impl<R, D> Runtime<R, D> {
             crate::activity::discard(&sink, conversation);
             return;
         }
-        let rows = crate::activity::drain_for(&sink, conversation);
-        if let Some(text) = crate::activity::render(&rows) {
+        // Peek before consuming: rows drained ahead of the edit rate-limit
+        // gate are dropped when the gate refuses, sticking the bubble on a
+        // bare "Running" line with the command never following. Only consume
+        // on publish (or when nothing is narratable); a gated turn retries
+        // on the next tick after the gap passes.
+        let peeked = crate::activity::peek_for(&sink, conversation);
+        let text = match crate::activity::render(&peeked) {
+            None => {
+                crate::activity::drain_for(&sink, conversation);
+                None
+            }
+            Some(text) => {
+                if !force {
+                    let key = activity_key(channel, conversation);
+                    let bubbles = self.activity_bubbles.lock().await;
+                    let (last_text, last_at) = match bubbles.get(&key) {
+                        Some(b) => (Some(b.text.as_str()), b.at),
+                        None => (None, -1.0),
+                    };
+                    if !crate::activity::should_publish(&text, last_text, self.now_secs(), last_at)
+                    {
+                        return;
+                    }
+                }
+                crate::activity::drain_for(&sink, conversation);
+                Some(text)
+            }
+        };
+        if let Some(text) = text {
             self.publish_live_activity(channel, conversation, &text, force)
                 .await;
         }
@@ -270,7 +442,10 @@ impl<R, D> Runtime<R, D> {
             // Existing bubble: overwrite it.
             Some(b) => {
                 if let Some(ref rest) = self.rest {
-                    if !rest.edit_message(ch, &b.id, text).await {
+                    let Ok(components) = crate::render::activity(text) else {
+                        return;
+                    };
+                    if !rest.edit_message_v2(ch, &b.id, &components).await {
                         // The bubble was deleted (or is in another channel):
                         // forget it so the next line posts a fresh one.
                         self.activity_bubbles.lock().await.remove(&key);
@@ -284,10 +459,15 @@ impl<R, D> Runtime<R, D> {
             // First line of the turn (or the first of the channel).
             None => {
                 let id = match self.rest {
-                    Some(ref rest) => match rest.send(ch, text, None).await {
-                        Ok(id) => id,
-                        Err(_) => return,
-                    },
+                    Some(ref rest) => {
+                        let Ok(components) = crate::render::activity(text) else {
+                            return;
+                        };
+                        match rest.send_v2(ch, &components, None).await {
+                            Ok(id) => id,
+                            Err(_) => return,
+                        }
+                    }
                     // No REST (tests, dry runs): still narrate via the hook.
                     None => "hook".to_string(),
                 };
@@ -315,8 +495,12 @@ impl<R, D> Runtime<R, D> {
             return;
         };
         let text = crate::text::sanitize(text);
+        let components = match crate::render::tool_card(&text) {
+            Ok(components) => components,
+            Err(_) => return,
+        };
         if let Some(ref rest) = self.rest {
-            if rest.send(ch, &text, None).await.is_err() {
+            if rest.send_v2(ch, &components, None).await.is_err() {
                 return;
             }
         }
@@ -366,7 +550,7 @@ impl<R, D> Runtime<R, D> {
 
 impl<R, D, FutR, FutD> Runtime<R, D>
 where
-    R: Fn(&Value, &Path, &str, &str) -> FutR,
+    R: Fn(&Value, &Path, &str, &RunInput) -> FutR,
     FutR: std::future::Future<Output = Result<String, RunError>>,
     D: Fn(OutboxPart) -> FutD,
     FutD: std::future::Future<Output = Result<String, String>>,
@@ -392,12 +576,14 @@ where
             crate::cron::write_route(&home, &item.channel, &chat);
         }
 
-        let run_fut = (self.runner)(
-            &self.config,
-            &self.config_path,
-            &item.conversation,
-            &item.prompt,
-        );
+        let input = match item.input_json.as_deref() {
+            Some(encoded) => RunInput::Structured(
+                serde_json::from_str(encoded)
+                    .map_err(|_| "queued structured input is invalid".to_string())?,
+            ),
+            None => RunInput::Text(item.prompt.clone()),
+        };
+        let run_fut = (self.runner)(&self.config, &self.config_path, &item.conversation, &input);
         tokio::pin!(run_fut);
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -479,7 +665,7 @@ where
 
 impl<R, D, FutR, FutD> Runtime<R, D>
 where
-    R: Fn(&Value, &Path, &str, &str) -> FutR + Send + Sync + Clone + 'static,
+    R: Fn(&Value, &Path, &str, &RunInput) -> FutR + Send + Sync + Clone + 'static,
     FutR: std::future::Future<Output = Result<String, RunError>> + Send + 'static,
     D: Fn(OutboxPart) -> FutD + Send + Sync + Clone + 'static,
     FutD: std::future::Future<Output = Result<String, String>> + Send + 'static,
@@ -610,6 +796,15 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     config["budget_required"] = Value::Bool(crate::budget::gate(&config, model)?);
 
     let store = open_store(config_path)?;
+    let media_root = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("media");
+    let conversation_root = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("conversations");
+    let file_store = FileStore::new(store.clone(), media_root, conversation_root).ok();
 
     let token = config
         .get("token")
@@ -665,15 +860,62 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let deliver = move |part: OutboxPart| {
         let rest = rest_del.clone();
         Box::pin(async move {
+            let text = crate::text::sanitize(&part.content);
+            let v2 = part.render.as_deref() == Some("v2");
+            if let Some(document_json) = part.document_json.as_deref() {
+                let Ok(document) = serde_json::from_str::<Value>(document_json) else {
+                    return Err("stored component document is invalid".to_string());
+                };
+                if document
+                    .get("components")
+                    .and_then(Value::as_array)
+                    .is_none()
+                {
+                    return Err("stored component document has no components".to_string());
+                }
+                if let Some(ref token) = part.interaction_token {
+                    let app_id = part.app_id.as_deref().unwrap_or("");
+                    return rest
+                        .edit_original_stored_document(app_id, token, &document)
+                        .await
+                        .map_err(|error| error.to_string());
+                }
+                let ch: u64 = part
+                    .channel
+                    .parse()
+                    .map_err(|_| "Invalid channel ID".to_string())?;
+                return rest
+                    .send_stored_document(ch, &document, None)
+                    .await
+                    .map_err(|error| error.to_string());
+            }
             if let Some(ref token) = part.interaction_token {
                 let app_id = part.app_id.as_deref().unwrap_or("");
-                let ids = rest
-                    .followup(app_id, token, &crate::text::sanitize(&part.content))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                ids.into_iter()
-                    .next()
-                    .ok_or_else(|| "Delivery returned no message ID".to_string())
+                if v2 {
+                    if part.part == 0 {
+                        let components =
+                            crate::render::text_message(&text).map_err(|e| e.to_string())?;
+                        rest.edit_original_v2(app_id, token, &components, true)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let ids = rest
+                            .followup_v2(app_id, token, &text)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        ids.into_iter()
+                            .next()
+                            .ok_or_else(|| "Delivery returned no message ID".to_string())
+                    }
+                } else {
+                    let ids = rest
+                        .followup(app_id, token, &text)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    ids.into_iter()
+                        .next()
+                        .ok_or_else(|| "Delivery returned no message ID".to_string())
+                }
             } else {
                 let ch: u64 = part
                     .channel
@@ -683,11 +925,15 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     crate::runner::hex_sha256(format!("{}:{}", part.id, part.part).as_bytes())
                         [..24]
                         .to_string();
-                let id = rest
-                    .send(ch, &crate::text::sanitize(&part.content), Some(&nonce))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(id)
+                if v2 {
+                    rest.send_text_v2(ch, &text, Some(&nonce))
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    rest.send(ch, &text, Some(&nonce))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }
         })
     };
@@ -696,18 +942,18 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     // rows, the Runtime drains them into the channel's status bubble.
     let activity = crate::activity::sink();
     let runner_sink = activity.clone();
-    let runner = move |cfg: &Value, pth: &Path, conv: &str, prompt: &str| {
+    let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
         let conv = conv.to_string();
-        let prompt = prompt.to_string();
+        let input = input.clone();
         let sink = runner_sink.clone();
         Box::pin(async move {
             let opts = crate::runner::RunOpts {
                 progress: Some(crate::activity::callback_for(sink, conv.clone())),
                 ..crate::runner::default_opts()
             };
-            crate::runner::run_gray(&cfg, &pth, &conv, &prompt, opts).await
+            crate::runner::run_gray_input(&cfg, &pth, &conv, input, opts).await
         })
     };
 
@@ -750,7 +996,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         continue;
                     };
                     let body = crate::text::sanitize(&delivery.text);
-                    let _ = cron_rest.send(ch, &body, None).await;
+                    let _ = cron_rest.send_text_v2(ch, &body, None).await;
                 }
             }
         }
@@ -876,7 +1122,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     .unwrap_or(1);
                                 if let Ok(ch) = channel_id.parse::<u64>() {
                                     let _ = rest
-                                        .send(
+                                        .send_text_v2(
                                             ch,
                                             &format!("Too fast — try again in {wait}s."),
                                             None,
@@ -927,7 +1173,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             {
                                 if let Ok(ch) = channel_id.parse::<u64>() {
                                     let _ = rest
-                                        .send(
+                                        .send_text_v2(
                                             ch,
                                             "Queue full or message invalid; this message was not accepted.",
                                             None,
@@ -944,9 +1190,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             if let Ok(ch) = channel_id.parse::<u64>() {
                                 let embed =
                                     crate::pairing::unconfigured_embed(&author_id, &paired.code);
-                                match rest.send_embed(ch, &paired.text, &embed).await {
-                                    Ok(_) => eprintln!("[discord] pairing reply sent"),
-                                    Err(e) => eprintln!("[discord] pairing reply failed: {e}"),
+                                match crate::render::from_embed(&embed, &[]) {
+                                    Ok(components) => match rest.send_v2(ch, &components, None).await {
+                                        Ok(_) => eprintln!("[discord] pairing reply sent"),
+                                        Err(e) => eprintln!("[discord] pairing reply failed: {e}"),
+                                    },
+                                    Err(e) => eprintln!("[discord] pairing render failed: {e}"),
                                 }
                             }
                         }
@@ -968,12 +1217,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             .or_else(|| interaction.channel_id.map(|c| c.to_string()))
                             .unwrap_or_default();
 
+                        let int_id = interaction.id.to_string();
                         // One context object for every handler; twilight
                         // never travels past this line.
                         let effective_app = app_id
                             .clone()
                             .unwrap_or_else(|| interaction.application_id.to_string());
-                        let int_id = interaction.id.to_string();
                         let ctx = crate::command_dispatch::Ctx {
                             user_id: &user_id,
                             channel_id: &channel_id,
@@ -986,6 +1235,82 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             config: &config,
                             config_path,
                         };
+                        let is_component = matches!(
+                            &interaction.data,
+                            Some(
+                                twilight_model::application::interaction::InteractionData::MessageComponent(_)
+                                    | twilight_model::application::interaction::InteractionData::ModalSubmit(_)
+                            )
+                        );
+                        let is_autocomplete = interaction.kind == InteractionType::ApplicationCommandAutocomplete;
+                        if is_component || is_autocomplete {
+                            let raw = serde_json::to_value(interaction)
+                                .map_err(|_| "interaction could not be normalized".to_string())?;
+                            let capacity = config
+                                .get("queue_capacity")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(1000);
+                            let result = route_normalized_interaction(NormalizedRoute {
+                                raw: &raw,
+                                interaction_token: &interaction.token,
+                                app_id: &effective_app,
+                                rest: &rest,
+                                store: &store,
+                                file_store: file_store.as_ref(),
+                                capacity,
+                                is_dm: interaction.guild_id.is_none(),
+                            })
+                            .await;
+                            if let Err(error) = result {
+                                let legacy_id = raw
+                                    .pointer("/data/custom_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let legacy_handled = if legacy_id.starts_with("cron:remove:") {
+                                    match &interaction.data {
+                                        Some(twilight_model::application::interaction::InteractionData::MessageComponent(_component)) => {
+                                            crate::command_dispatch::button(&ctx, legacy_id).await;
+                                            true
+                                        }
+                                        Some(twilight_model::application::interaction::InteractionData::ModalSubmit(_component)) => {
+                                            crate::command_dispatch::modal(&ctx, legacy_id).await;
+                                            true
+                                        }
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !legacy_handled {
+                                    if is_autocomplete {
+                                        let _ = rest
+                                            .autocomplete_response(&int_id, &interaction.token, &[])
+                                            .await;
+                                    } else {
+                                        let error_components = crate::render::error_card(
+                                            "This component is no longer available.",
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            vec![serde_json::json!({
+                                                "type": 10,
+                                                "content": "This component is no longer available."
+                                            })]
+                                        });
+                                        let _ = rest
+                                            .interaction_v2(
+                                                &int_id,
+                                                &interaction.token,
+                                                &error_components,
+                                                false,
+                                            )
+                                            .await;
+                                    }
+                                    eprintln!("[discord] component interaction rejected: {error}");
+                                }
+                            }
+                            continue;
+                        }
+
                         if let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(ref cmd)) = interaction.data {
                         // Flatten what Discord nests: a sub-command arrives as
                         // one option that carries its own options. Handlers
@@ -1024,12 +1349,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     "[discord] unparseable slash command: {} {sub:?}",
                                     cmd.name.as_str()
                                 );
+                                crate::command_dispatch::unknown(&ctx).await;
                             }
                         }
                         }
-                        if let Some(twilight_model::application::interaction::InteractionData::MessageComponent(ref mc)) = interaction.data {
-                            crate::command_dispatch::button(&ctx, mc.custom_id.as_str()).await;
-                        }
+                        // Message-component and modal events are handled above
+                        // through the typed state/event path. The old raw
+                        // custom-id handlers remain available for legacy rows
+                        // but are never selected for new interactions.
                     }
                     Some(Err(e)) => {
                         eprintln!("[discord] gateway error: {e}");
@@ -1051,4 +1378,24 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::autocomplete_choices;
+    use serde_json::json;
+
+    #[test]
+    fn autocomplete_choices_are_filtered_and_bounded() {
+        let state = json!({"options": [
+            {"label": "Gray Cloud", "value": "gray"},
+            {"label": "Local", "value": "local"},
+            {"label": "Other", "value": "other"}
+        ]});
+        let choices = autocomplete_choices(&json!({"query": "gr"}), &state);
+        assert_eq!(
+            choices,
+            vec![("Gray Cloud".to_string(), "gray".to_string())]
+        );
+    }
 }

@@ -8,6 +8,19 @@ use gray_discord::gateway::Runtime;
 use gray_discord::transport::Rest;
 use serde_json::json;
 
+fn component_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => items.iter().map(component_text).collect(),
+        serde_json::Value::Object(map) => map
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| map.get("components").map(component_text))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 // ── rendering (Hermes parity) ──
 
 fn rows(v: serde_json::Value) -> Vec<serde_json::Value> {
@@ -17,17 +30,88 @@ fn rows(v: serde_json::Value) -> Vec<serde_json::Value> {
 #[test]
 fn bash_line_matches_hermes_format() {
     let r = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": "ls -la"}));
-    assert_eq!(activity::render(&r).as_deref(), Some("💻 terminal: ls -la"));
+    assert_eq!(activity::render(&r).as_deref(), Some("💻 Running `ls -la`"));
 }
 
 #[test]
-fn tool_start_is_visible_before_a_long_call_returns() {
-    let started = rows(json!({"phase": "tool_started", "tool": "bash"}));
-    assert_eq!(activity::render(&started).as_deref(), Some("💻 terminal"));
-    let ran = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": "sleep 30"}));
+fn a_start_line_is_replaced_by_its_own_ran_line() {
+    let started = rows(json!({"phase": "tool_started", "call_id": "a", "tool": "bash"}));
+    assert_eq!(activity::render(&started).as_deref(), Some("💻 Running"));
+    let ran =
+        rows(json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "sleep 30"}));
     assert_eq!(
         activity::render(&ran).as_deref(),
-        Some("💻 terminal: sleep 30")
+        Some("💻 Running `sleep 30`")
+    );
+    let mut both = started.clone();
+    both.extend(ran.clone());
+    assert_eq!(
+        activity::render(&both).as_deref(),
+        Some("💻 Running `sleep 30`"),
+        "one call must not cost two lines"
+    );
+}
+
+#[test]
+fn a_line_carries_the_duration_once_the_call_returns() {
+    let ran = rows(json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "ls"}));
+    assert_eq!(activity::render(&ran).as_deref(), Some("💻 Running `ls`"));
+    let mut with_done = ran.clone();
+    with_done
+        .push(json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "elapsed_ms": 420}));
+    assert_eq!(
+        activity::render(&with_done).as_deref(),
+        Some("💻 Running `ls` (0.4s)")
+    );
+}
+
+#[test]
+fn a_chained_command_previews_as_one_command() {
+    let r = rows(json!({
+        "phase": "tool_ran",
+        "tool": "bash",
+        "detail": "gray memory list 2>&1; echo \"---PROJECT---\"; gray memory list"
+    }));
+    assert_eq!(
+        activity::render(&r).as_deref(),
+        Some("💻 Running `gray memory list … +2`")
+    );
+}
+
+#[test]
+fn a_long_command_is_capped_at_the_preview_length() {
+    let detail = "x".repeat(200);
+    let r = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": detail}));
+    let line = activity::render(&r).unwrap();
+    let preview = line.split('`').nth(1).expect("backticked preview");
+    assert!(
+        preview.chars().count() <= 80,
+        "uncapped preview: {}",
+        preview.chars().count()
+    );
+}
+
+#[test]
+fn quiet_tools_stay_off_the_bubble_until_they_are_all_there_is() {
+    let read = json!({"phase": "tool_ran", "tool": "read", "detail": "src/lib.rs"});
+    let run = json!({"phase": "tool_ran", "tool": "bash", "detail": "cargo test"});
+    assert_eq!(
+        activity::render(&[read.clone(), run]).as_deref(),
+        Some("💻 Running `cargo test`"),
+        "a read must not crowd out an action"
+    );
+    // Shell introspection is quiet too: an all-quiet turn falls back to
+    // showing everything rather than going silent.
+    let ls = json!({"phase": "tool_ran", "tool": "bash", "detail": "ls"});
+    assert_eq!(
+        activity::render(&[read.clone(), ls]).as_deref(),
+        Some("📖 read `src/lib.rs`\n💻 Running `ls`"),
+        "all-quiet turns still narrate"
+    );
+    assert_eq!(
+        activity::render(&[read]).as_deref(),
+        Some("📖 read `src/lib.rs`"),
+        "a pure research turn still narrates"
     );
 }
 
@@ -36,7 +120,7 @@ fn read_line_names_the_file_and_range() {
     let r = rows(json!({"phase": "tool_ran", "tool": "read", "detail": "config.yaml L110-139"}));
     assert_eq!(
         activity::render(&r).as_deref(),
-        Some("📖 Reading config.yaml L110-139")
+        Some("📖 read `config.yaml L110-139`")
     );
 }
 
@@ -45,12 +129,12 @@ fn write_and_edit_lines_distinguish_themselves() {
     let w = rows(json!({"phase": "tool_ran", "tool": "write", "detail": "src/lib.rs"}));
     assert_eq!(
         activity::render(&w).as_deref(),
-        Some("✍️ Writing src/lib.rs")
+        Some("✍️ write `src/lib.rs`")
     );
     let e = rows(json!({"phase": "tool_ran", "tool": "edit", "detail": "src/lib.rs"}));
     assert_eq!(
         activity::render(&e).as_deref(),
-        Some("✍️ Editing src/lib.rs")
+        Some("✍️ edit `src/lib.rs`")
     );
 }
 
@@ -61,7 +145,7 @@ fn unknown_tool_still_names_itself() {
     let p = rows(json!({"phase": "tool_ran", "tool": "gray_plugin", "detail": "do thing"}));
     assert_eq!(
         activity::render(&p).as_deref(),
-        Some("🔧 gray_plugin: do thing")
+        Some("🔧 gray_plugin `do thing`")
     );
 }
 
@@ -87,45 +171,104 @@ fn quiet_rows_render_to_nothing() {
     let ok = rows(json!({"phase": "tool_finished", "tool": "bash"}));
     assert!(activity::render(&ok).is_none());
     let started = rows(json!({"phase": "tool_started", "tool": "bash"}));
-    assert_eq!(activity::render(&started).as_deref(), Some("💻 terminal"));
+    assert_eq!(activity::render(&started).as_deref(), Some("💻 Running"));
     let thinking_empty = rows(json!({"phase": "thinking", "detail": ""}));
     assert!(activity::render(&thinking_empty).is_none());
 }
 
 #[test]
 fn repeated_lines_collapse_and_the_tail_is_kept() {
-    let batch: Vec<serde_json::Value> = ["ls", "ls", "cat x", "grep y", "cargo test"]
-        .iter()
-        .map(|c| json!({"phase": "tool_ran", "tool": "bash", "detail": c}))
-        .collect();
+    let batch: Vec<serde_json::Value> = [
+        "cargo build",
+        "cargo build",
+        "git status",
+        "cargo clippy",
+        "cargo test",
+    ]
+    .iter()
+    .map(|c| json!({"phase": "tool_ran", "tool": "bash", "detail": c}))
+    .collect();
     let text = activity::render(&batch).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "keeps the last three: {text}");
-    assert_eq!(lines[2], "💻 terminal: cargo test");
+    assert_eq!(lines[0], "💻 Running `git status`", "a repeat collapsed");
+    assert_eq!(lines[2], "💻 Running `cargo test`");
 }
 
 #[test]
-fn the_card_contains_command_and_bounded_output() {
+fn shell_introspection_is_quiet_like_its_tool_twin() {
+    // `ls` through the shell is nobody's status: a `gray view` turn narrates
+    // literally only the view, never its `ls` neighbor.
+    let ls = rows(json!({
+        "phase": "tool_ran", "tool": "bash",
+        "detail": "ls -la /home/u 2>/dev/null | head -50"
+    }));
+    let view = rows(json!({
+        "phase": "tool_ran", "tool": "bash",
+        "detail": "gray view /tmp/shot.png"
+    }));
+    let mut both = ls.clone();
+    both.extend(view.clone());
+    assert_eq!(
+        activity::render(&both).as_deref(),
+        Some("💻 Running `gray view /tmp/shot.png`"),
+        "the ls neighbor must not crowd out the view"
+    );
+    // Alone, a quiet turn still narrates rather than going silent.
+    assert_eq!(
+        activity::render(&ls).as_deref(),
+        Some("💻 Running `ls -la /home/u … +1`"),
+    );
+}
+
+#[test]
+fn the_card_lists_the_view_not_its_ls_neighbor() {
     let batch = vec![
-        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
-        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "line one\nline two"}),
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "gray view /tmp/shot.png"}),
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "ls -la /home/u"}),
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash",
+               "output": "Image shown: /tmp/shot.png", "elapsed_ms": 300, "turn_ms": 900}),
+        json!({"phase": "tool_finished", "call_id": "b", "tool": "bash",
+               "output": "total 0", "elapsed_ms": 200, "turn_ms": 900}),
     ];
     let card = activity::render_card(&batch).unwrap();
-    assert!(card.starts_with("🛠 Tool activity\n$ cargo test"), "{card}");
-    assert!(card.contains("line one\nline two"), "{card}");
+    assert!(
+        card.contains("💻 Ran `gray view /tmp/shot.png` (0.3s)"),
+        "{card}"
+    );
+    assert!(!card.contains("ls -la"), "ls neighbor leaked: {card}");
+    assert!(!card.contains("Image shown"), "tool output leaked: {card}");
 }
 
 #[test]
-fn the_card_pairs_parallel_results_by_call_id() {
+fn the_card_lists_actions_and_never_their_output() {
+    let batch = vec![
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash",
+               "output": "line one\nline two", "elapsed_ms": 1200, "turn_ms": 3400}),
+    ];
+    let card = activity::render_card(&batch).unwrap();
+    assert!(card.starts_with("⋯ 3.4s · ran 1 command"), "{card}");
+    assert!(card.contains("💻 Ran `cargo test` (1.2s)"), "{card}");
+    assert!(!card.contains("line one"), "tool output leaked: {card}");
+    assert!(!card.contains("```"), "output fenced into the card: {card}");
+}
+
+#[test]
+fn the_card_pairs_parallel_calls_by_call_id() {
     let batch = vec![
         json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "first"}),
         json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "second"}),
-        json!({"phase": "tool_finished", "call_id": "b", "tool": "bash", "output": "B"}),
-        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "A"}),
+        json!({"phase": "tool_finished", "call_id": "b", "tool": "bash",
+               "output": "B", "elapsed_ms": 900, "turn_ms": 2500}),
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash",
+               "output": "A", "elapsed_ms": 400, "turn_ms": 2000}),
     ];
     let card = activity::render_card(&batch).unwrap();
-    assert!(card.contains("$ first\n```text\nA\n```"), "{card}");
-    assert!(card.contains("$ second\n```text\nB\n```"), "{card}");
+    assert!(card.starts_with("⋯ 2.5s · ran 2 commands"), "{card}");
+    assert!(card.contains("💻 Ran `first` (0.4s)"), "{card}");
+    assert!(card.contains("💻 Ran `second` (0.9s)"), "{card}");
+    assert!(!card.contains("```"), "output fenced into the card: {card}");
 }
 
 // ── the gate ──
@@ -156,6 +299,34 @@ fn the_sink_is_bounded_and_drains() {
     assert!(activity::drain(&s).is_empty(), "drain empties the queue");
     assert!(activity::finish(&s, "").len() <= 128);
     assert!(activity::finish(&s, "").is_empty(), "finish is one-shot");
+}
+
+#[test]
+fn the_sink_stamps_durations_and_the_turn_clock() {
+    let s = activity::sink();
+    activity::begin(&s, "");
+    activity::push(
+        &s,
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "ls"}),
+    );
+    activity::push(
+        &s,
+        json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "output": "secret output"}),
+    );
+    let rows = activity::finish(&s, "");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1]["elapsed_ms"].is_u64(),
+        "no call duration: {}",
+        rows[1]
+    );
+    assert!(rows[1]["turn_ms"].is_u64(), "no turn clock: {}", rows[1]);
+    let card = activity::render_card(&rows).unwrap();
+    assert!(card.contains("ran 1 command"), "{card}");
+    assert!(
+        !card.contains("secret output"),
+        "tool output leaked: {card}"
+    );
 }
 
 #[test]
@@ -254,11 +425,45 @@ async fn the_second_line_edits_the_first_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], ("💻 terminal: ls".to_string(), false), "first post");
+    assert_eq!(log[0], ("💻 Running `ls`".to_string(), false), "first post");
     assert_eq!(
         log[1],
-        ("💻 terminal: cargo test".to_string(), true),
+        ("💻 Running `cargo test`".to_string(), true),
         "then an edit"
+    );
+}
+
+#[tokio::test]
+async fn gated_rows_are_kept_until_the_gap_passes() {
+    // The stuck-bubble repro: `tool_started` posts a bare "Running" line and
+    // the `tool_ran` with the command arrives inside the edit gap. Dropping
+    // the gated rows sticks the bubble bare until the turn ends; keeping
+    // them updates it on the next tick.
+    let sink = activity::sink();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+    let rt = narrated!(json!({}), sink, seen, clock);
+
+    activity::push(
+        &sink,
+        json!({"phase": "tool_started", "call_id": "a", "tool": "bash"}),
+    );
+    rt.report_activity("42").await;
+    activity::push(
+        &sink,
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
+    );
+    rt.report_activity("42").await;
+    *clock.lock().unwrap() = 5.0;
+    rt.report_activity("42").await;
+
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[0], ("💻 Running".to_string(), false), "first post");
+    assert_eq!(
+        log[1],
+        ("💻 Running `cargo test`".to_string(), true),
+        "the command must follow, not stick bare"
     );
 }
 
@@ -293,12 +498,18 @@ async fn final_flush_posts_a_separate_card_and_next_turn_gets_a_new_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 3, "{log:?}");
-    assert_eq!(log[0], ("💻 terminal: ls".to_string(), false));
-    assert!(log[1].0.starts_with("🛠 Tool activity"), "card: {log:?}");
-    assert!(log[1].0.contains("one\ntwo"), "output missing: {log:?}");
+    assert!(
+        log[0].0.starts_with("💻 Running `ls`"),
+        "first post: {log:?}"
+    );
+    assert!(log[1].0.starts_with("⋯ "), "card: {log:?}");
+    assert!(
+        !log[1].0.contains("one\ntwo"),
+        "tool output leaked: {log:?}"
+    );
     assert_eq!(
         log[2],
-        ("💻 terminal: pwd".to_string(), false),
+        ("💻 Running `pwd`".to_string(), false),
         "new turn bubble"
     );
 }
@@ -327,9 +538,13 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
 
     let sent = stub.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 2, "expected live bubble plus card");
-    let card = sent[1].body["content"].as_str().unwrap();
-    assert!(card.contains("Tool activity"), "{card}");
-    assert!(card.contains("hi"), "{card}");
+    let card = component_text(&sent[1].body["components"]);
+    assert!(card.contains("gray · done"), "{card}");
+    assert!(card.contains("💻 Ran `printf hi`"), "{card}");
+    assert!(!card.contains("```"), "output fenced into the card: {card}");
+    assert_eq!(sent[1].body["flags"], json!(32768));
+    assert!(sent[1].body.get("content").is_none());
+    assert!(sent[1].body.get("embeds").is_none());
 }
 
 #[tokio::test]
@@ -429,9 +644,17 @@ async fn a_real_gray_turn_narrates_end_to_end() {
     let rows = activity::drain(&sink);
     assert_eq!(rows.len(), 4, "one row per progress event: {rows:?}");
     let bubble = activity::render(&rows).unwrap();
-    assert_eq!(bubble, "💻 terminal\n💻 terminal: cargo test -p gray");
+    assert!(
+        bubble.starts_with("💻 Running `cargo test -p gray`"),
+        "{bubble}"
+    );
+    assert!(bubble.ends_with(')'), "duration missing: {bubble}");
     let card = activity::render_card(&activity::finish(&sink, "")).unwrap();
-    assert!(card.contains("test result: ok\n0 passed"), "{card}");
+    assert!(card.contains("cargo test -p gray"), "{card}");
+    assert!(
+        !card.contains("test result: ok"),
+        "tool output leaked: {card}"
+    );
     assert!(
         !card.contains("run the tests first"),
         "reasoning leaked: {card}"
