@@ -3,9 +3,13 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// Exact OAuth2 invite URL (bot scope, view/send/history permissions).
+/// OAuth2 invite URL with the bridge's least-privilege message permissions,
+/// including the separate permission Discord requires for threads.
 pub fn invite(app_id: &str) -> String {
-    format!("https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions=68608")
+    format!(
+        "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions={}",
+        crate::transport::INVITE_PERMISSIONS
+    )
 }
 
 /// Terminal IO. The real implementation talks to stdin/stderr; tests inject

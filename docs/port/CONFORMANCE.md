@@ -64,7 +64,7 @@ Status legend:
 | `doctor(config)` | `crate::doctor::doctor` in `src/doctor.rs` | PORTED | Connectivity, authorization, channel permission, and binary check. |
 | `/users/@me` validation | `src/doctor.rs` | PORTED | Confirms bot token is valid. |
 | `/gateway/bot` check | `src/doctor.rs` | PORTED | Checks intents and rate limit recommendations. |
-| Channel permissions check | `src/doctor.rs` | PORTED | Confirms bot has `READ_MESSAGE_HISTORY` and `SEND_MESSAGES`. |
+| Channel permissions check | `src/doctor.rs`, `src/transport.rs` | DIVERGED | Resolves ordered channel/parent overwrites; checks `SEND_MESSAGES_IN_THREADS` for native threads. |
 | Gray installation check | `src/doctor.rs` | PORTED | Validates `gray_bin` executable and `gray_home` config. |
 
 ### `gray_discord.durable`
@@ -72,6 +72,7 @@ Status legend:
 |---|---|---|---|
 | SQLite schema (`inbox`, `outbox`, `schedules`, `meta`) | `src/durable.rs` | PORTED | Bundled SQLite with WAL mode and busy timeout. |
 | `enqueue(...)` | `Store::enqueue` in `src/durable.rs` | PORTED | Message deduplication and transactional insertion. |
+| Typed input/document rows | `Store::enqueue_component_json`, `Store::complete_document` | PORTED | Structured input and compiled V2 documents survive restart; legacy text rows remain readable. |
 | `claim(...)` | `Store::claim` in `src/durable.rs` | PORTED | Single active worker per conversation/channel. |
 | `complete(...)` | `Store::complete` in `src/durable.rs` | PORTED | Splits output text into parts and queues for delivery. |
 | `fail(...)` | `Store::fail` in `src/durable.rs` | PORTED | Records terminal failure codes (`agent_failed`, `timeout`, `budget_blocked`, etc.). |
@@ -91,7 +92,7 @@ Status legend:
 | Delivery background loop | `src/gateway.rs` | PORTED | Dedicated delivery task consuming outbox parts with stable nonces. |
 | Schedule ticker | `src/gateway.rs` | PORTED | 1-second ticker checking due schedules and enqueuing items. |
 | Slash command registration | `src/gateway.rs` | PORTED | Bulk overwrite with app ID; hash caching via `meta` table; the command table includes `/new`. |
-| Slash command handlers | `src/command_dispatch.rs` | PORTED | `/ask` (allowlisted prompt), `/new` and `/reset` (session clear), `/status` (queue depth), `/stop` (cancel), plus cron/model/memory/help handlers. |
+| Slash command handlers | `src/command_dispatch.rs` | DIVERGED | Uses Components V2 callbacks/original-response edits; `/ask` (allowlisted prompt), `/new` and `/reset` (session clear), `/status` (queue depth), `/stop` (cancel), plus cron/model/memory/help handlers. |
 
 ### `gray_discord.policy`
 | Python Symbol / Behavior | Rust Implementation | Status | Notes |
@@ -105,7 +106,7 @@ Status legend:
 ### `gray_discord.runner`
 | Python Symbol / Behavior | Rust Implementation | Status | Notes |
 |---|---|---|---|
-| `run_turn(...)` | `crate::runner::run_turn` in `src/runner.rs` | PORTED | Child process execution of `gray -p <prompt> --json`. |
+| `run_turn(...)` | `crate::runner::run_gray_input` in `src/runner.rs` | PORTED | Text uses `-p`; typed events use private `turn-input.json` plus `gray --input-json ... --json`. |
 | Environment sanitization | `src/runner.rs` | PORTED | Filters out sensitive prefixes (`GRAY_`, `DISCORD_`, `OPENAI_`, `ANTHROPIC_`). |
 | Child process isolation | `src/runner.rs` | PORTED | Private working directory and isolated gray home. |
 | NDJSON event streaming | `src/runner.rs` | PORTED | Parses streaming JSON lines (`agent_state`, `content`, `done`, `error`). |
@@ -126,7 +127,7 @@ Status legend:
 |---|---|---|---|
 | `run(...)` | `crate::setup::run` in `src/setup.rs` | PORTED | Full interactive pairing wizard. |
 | Hidden terminal token input | `src/setup.rs` | PORTED | Disables terminal echo during token entry. |
-| Invite URL generation | `src/setup.rs` | PORTED | `https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions=68608`. |
+| Invite URL generation | `src/setup.rs` | DIVERGED | Uses the permission expression `INVITE_PERMISSIONS` (View + Send + Read History + Send Messages in Threads), rather than a stale numeric constant. |
 | One-time DM pairing code | `src/setup.rs` | PORTED | Generates 18-byte URL-safe code, 300s expiration, validates DM. |
 | Local owner confirmation | `src/setup.rs` | PORTED | Confirms user ID in terminal before persisting. |
 
@@ -137,13 +138,16 @@ Status legend:
 | `plugin/manifest` | `src/sidecar.rs` | PORTED | Returns static manifest (`name: discord`, `version: 0.1.0`, `protocol: 1.1`). |
 | `prompt/context` | `src/sidecar.rs` | PORTED | Emits prompt hook guidance. |
 | `tool/call` (`discord_send`) | `src/sidecar.rs` | PORTED | Sends message to home channel via REST transport. |
+| `tool/call` (`discord_send_ui`, `discord_open_modal`) | `src/sidecar.rs`, `src/component_compile.rs` | PORTED | Accepts Gray-owned typed documents; numeric types and opaque state IDs are compiler-owned. |
+| `tool/call` (`discord_file`, `discord_ui_schema`) | `src/component_media.rs`, `src/sidecar.rs` | PORTED | Imports only conversation-workdir files and exposes the typed schema without host paths. |
+| Component interaction delivery | `src/component_input.rs`, `src/component_state.rs` | PORTED | Normalizes buttons/selects/modals/autocomplete into versioned Gray input events with idempotent durable enqueue. |
 | Secret suppression | `src/sidecar.rs` | PORTED | Returns generic error envelope without leaking token or configuration. |
 
 ### `gray_discord.text`
 | Python Symbol / Behavior | Rust Implementation | Status | Notes |
 |---|---|---|---|
 | `split_message(text, limit)` | `crate::text::split_message` in `src/text.rs` | PORTED | UTF-16 code unit boundary splitting, paragraph/line preference. |
-| Mention suppression | `src/transport.rs` | PORTED | Outgoing REST payload specifies `allowed_mentions: { parse: [] }`. |
+| Mention suppression | `src/transport.rs` | PORTED | Every V2 REST payload specifies `allowed_mentions: { parse: [] }`; V2 messages carry no legacy `content`/`embeds`. |
 
 ---
 
@@ -157,21 +161,35 @@ Status legend:
 | Completion reactions (`✅` / `❌`) | Hermes `on_processing_complete` | `src/gateway.rs` | PORTED | Removes `👀` and posts `✅` on delivery completion or `❌` on error/timeout/cancel. |
 | Typing indicator cadence | Hermes typing loop | `src/gateway.rs` | PORTED | Sends typing POST every 8 seconds during turn generation. |
 | Slash command registration | Hermes `_safe_sync_slash_commands` | `src/gateway.rs` | PORTED | Bulk overwrite with SHA-256 hash caching in SQLite `meta` table. |
-| `/ask` slash command | Hermes `/ask` | `src/gateway.rs` | PORTED | Submits prompt; defers interaction, routes followup reply. |
+| `/ask` slash command | Hermes `/ask` | `src/gateway.rs` | DIVERGED | Defers with the V2 interaction route and edits the original response through the app webhook; later chunks use V2 followups. |
 | `/new` and `/reset` slash commands | Hermes `/new`, `/reset` | `src/command_dispatch.rs` | PORTED | Cancels pending work, removes the caller's JSONL transcript, and advances the generation marker. |
 | `/status` slash command | Hermes `/status` | `src/gateway.rs` | PORTED | Replies ephemerally with pending queue depth. |
 | `/stop` slash command | Hermes `/stop` | `src/gateway.rs` | PORTED | Sets cancel flag on the caller's active turn. |
 | Allowlist authorization | Hermes `_is_allowed_user` | `src/policy.rs`, `src/cli.rs` | PORTED | Snowflake allowlist; defaults to owner-only when empty. |
 | Thread and group isolation | Hermes conversation thread keys | `src/session.rs`, `src/gateway.rs` | PORTED | Native thread channel IDs remain distinct; guild messages are keyed per user. |
 | 7-day queue retention prune | Hermes `recovery.py` | `src/durable.rs` | PORTED | Prunes terminal inbox/outbox items older than 7 days. |
+| Components V2 wire contract | Discord Components overview | `src/component_compile.rs`, `src/transport.rs` | PORTED | Exhaustive message/modal type coverage, 40-component/custom-ID validation, V2 flags, callbacks 4/5/6/7/8/9, multipart files, and legacy-row fallback. |
 
 ---
+
+## 2a. Components V2 Matrix
+
+| Surface | Supported protocol nodes / wire types |
+|---|---|
+| Message | Action Row (1), Button (2), String Select (3), User/Role/Mentionable/Channel Select (5–8), Section (9), Text Display (10), Thumbnail (11), Media Gallery (12), File (13), Separator (14), Container (17) |
+| Modal | String/Entity Select (3, 5–8), Text Input (4), Label (18), File Upload (19), Radio Group (21), Checkbox Group (22), Checkbox (23) |
+| Interaction responses | Callback 4, deferred callback 5, deferred update 6, message update 7, autocomplete 8, modal 9, original webhook edit |
+| File lifecycle | SHA-256 managed IDs, private 0600 storage, bounded remote/generated import, safe workdir path, multipart upload, expiry cleanup |
+
+Interaction values enter the same Gray session through `gray.discord.input`
+version 1. State tokens and interaction tokens remain in SQLite/plugin
+memory and are never serialized into the model envelope.
 
 ## 3. Explicitly Deferred Features (Phase 2)
 
 The following capabilities from Hermes full suite are deliberately deferred to Phase 2 per design spec (§3):
 1. **Voice / Opus / TTS**: Voice channels, real-time voice synthesis, audio mixing.
-2. **Media & Attachments**: Text/image downloads are implemented; OCR, file uploads, and Discord rich embeds remain deferred.
+2. **Advanced media processing**: Managed file import, authenticated CDN download, private workdir exposure, and multipart uploads are implemented; OCR, transcription, and media editing remain deferred.
 3. **Channel Skill Bindings**: Restricting specific gray skills to specific Discord channels.
 4. **Free-Response Channels**: Responding to every message in a channel without an `@mention`.
 5. **Role-Based Authorization**: Authorizing users based on Discord guild roles rather than snowflake user IDs.

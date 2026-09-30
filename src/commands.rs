@@ -361,9 +361,13 @@ pub fn help_for(name: &str) -> Option<Value> {
     })
 }
 
-/// A scheduled-job listing plus one remove button per job. Buttons are the
-/// only reason the bridge has to look at rows at all; the rest is text.
-pub fn cron_view(jobs: &[(String, String, i64, String)], channel: &str) -> (Value, Vec<Value>) {
+/// A scheduled-job listing plus one remove button per exposed state token.
+/// Resource ids stay in SQLite; the wire sees only opaque token values.
+pub fn cron_view(
+    jobs: &[(String, String, i64, String)],
+    channel: &str,
+    state_tokens: &[String],
+) -> (Value, Vec<Value>) {
     let fields: Vec<Value> = jobs
         .iter()
         .map(|(id, prompt, interval, status)| {
@@ -384,13 +388,14 @@ pub fn cron_view(jobs: &[(String, String, i64, String)], channel: &str) -> (Valu
     };
     let buttons: Vec<Value> = jobs
         .iter()
+        .zip(state_tokens.iter())
         .take(MAX_BUTTONS)
-        .map(|(id, _, _, _)| {
+        .map(|(_, token)| {
             json!({
                 "type": 2,
                 "label": "Remove",
                 "style": 4,
-                "custom_id": format!("cron:remove:{id}"),
+                "custom_id": format!("cron:remove:{token}"),
             })
         })
         .collect();
@@ -799,13 +804,15 @@ mod tests {
             1800,
             "scheduled".into(),
         )];
-        let (embed, buttons) = cron_view(&jobs, "777");
+        let tokens = vec!["state-token-1".to_string()];
+        let (embed, buttons) = cron_view(&jobs, "777", &tokens);
         let fields = embed["fields"].as_array().unwrap();
         assert_eq!(fields.len(), 1);
         assert!(fields[0]["name"].as_str().unwrap().contains("abc123"));
         assert!(embed["description"].as_str().unwrap().contains("<#777>"));
         assert_eq!(buttons.len(), 1);
-        assert_eq!(buttons[0]["custom_id"], json!("cron:remove:abc123"));
+        assert_eq!(buttons[0]["custom_id"], json!("cron:remove:state-token-1"));
+        assert!(!buttons[0]["custom_id"].as_str().unwrap().contains("abc123"));
         assert_eq!(buttons[0]["style"], json!(4), "red destructive button");
     }
 
@@ -821,7 +828,10 @@ mod tests {
                 )
             })
             .collect();
-        let (_embed, buttons) = cron_view(&jobs, "1");
+        let tokens = (0..MAX_BUTTONS)
+            .map(|i| format!("state-token-{i}"))
+            .collect::<Vec<_>>();
+        let (_embed, buttons) = cron_view(&jobs, "1", &tokens);
         assert_eq!(buttons.len(), MAX_BUTTONS);
     }
 

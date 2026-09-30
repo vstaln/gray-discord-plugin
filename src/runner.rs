@@ -86,12 +86,38 @@ pub fn default_opts() -> RunOpts<'static> {
     RunOpts::default()
 }
 
-/// Run one isolated agent turn. See module docs for the safety model.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunInput {
+    Text(String),
+    Structured(Value),
+}
+
+/// Run one isolated text turn. Compatibility wrapper for existing callers.
 pub async fn run_gray(
     config: &Value,
     config_path: &Path,
     conversation: &str,
     prompt: &str,
+    opts: RunOpts<'_>,
+) -> Result<String, RunError> {
+    run_gray_input(
+        config,
+        config_path,
+        conversation,
+        RunInput::Text(prompt.to_string()),
+        opts,
+    )
+    .await
+}
+
+/// Run one isolated turn with either ordinary text or a versioned structured
+/// input event. Structured JSON is written to a private per-turn file and
+/// passed through Gray's native `--input-json` mode.
+pub async fn run_gray_input(
+    config: &Value,
+    config_path: &Path,
+    conversation: &str,
+    input: RunInput,
     mut opts: RunOpts<'_>,
 ) -> Result<String, RunError> {
     let timeout_secs = match opts.timeout_secs {
@@ -105,10 +131,14 @@ pub async fn run_gray(
     if timeout_secs == 0 {
         return Err(RunError::Io("Timeout must be positive".to_string()));
     }
-    if prompt.trim().is_empty() || prompt.chars().count() > 32000 {
-        return Err(RunError::Io(
-            "Prompt must contain 1–32000 characters".to_string(),
-        ));
+    match &input {
+        RunInput::Text(prompt) if prompt.trim().is_empty() || prompt.chars().count() > 32000 => {
+            return Err(RunError::Io(
+                "Prompt must contain 1–32000 characters".to_string(),
+            ));
+        }
+        RunInput::Structured(value) => validate_structured_input(value)?,
+        RunInput::Text(_) => {}
     }
 
     let key = hex_sha256(conversation.as_bytes());
@@ -260,14 +290,31 @@ pub async fn run_gray(
         .get("max_requests")
         .and_then(Value::as_u64)
         .unwrap_or(32);
-    let mut args: Vec<String> = vec![
-        gray_bin.to_string(),
-        "-p".to_string(),
-        prompt.to_string(),
+    let mut input_file = InputFileGuard::default();
+    let mut args: Vec<String> = vec![gray_bin.to_string()];
+    match &input {
+        RunInput::Text(prompt) => {
+            args.push("-p".to_string());
+            args.push(prompt.clone());
+        }
+        RunInput::Structured(value) => {
+            let path = home.join("turn-input.json");
+            let encoded = serde_json::to_vec(value)
+                .map_err(|_| RunError::Io("structured input could not be encoded".to_string()))?;
+            std::fs::write(&path, encoded).map_err(|_| {
+                RunError::Io("structured input file could not be written".to_string())
+            })?;
+            set_private_file(&path)?;
+            input_file.path = Some(path.clone());
+            args.push("--input-json".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        }
+    }
+    args.extend([
         "--json".to_string(),
         "--max-requests".to_string(),
         max_requests.to_string(),
-    ];
+    ]);
     let policy = config.get("budget").cloned().unwrap_or(Value::Null);
     let budget_required = config
         .get("budget_required")
@@ -439,6 +486,56 @@ pub async fn run_gray(
     // matters when several workers are created in one Tokio process.
     drop(_lock);
     answer
+}
+
+#[derive(Default)]
+struct InputFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for InputFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn set_private_file(path: &Path) -> Result<(), RunError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
+            RunError::Io("structured input file could not be protected".to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_structured_input(value: &Value) -> Result<(), RunError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| RunError::Io("structured input must be an object".to_string()))?;
+    if object.len() != 4
+        || object.get("protocol").and_then(Value::as_str) != Some("gray.discord.input")
+        || object.get("version").and_then(Value::as_u64) != Some(1)
+        || object
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(|kind| kind.is_empty() || kind.len() > 64)
+        || !object.get("payload").is_some_and(Value::is_object)
+    {
+        return Err(RunError::Io(
+            "structured input envelope is invalid".to_string(),
+        ));
+    }
+    if serde_json::to_vec(value)
+        .map(|bytes| bytes.len() > 1_048_576)
+        .unwrap_or(true)
+    {
+        return Err(RunError::Io("structured input exceeds 1 MiB".to_string()));
+    }
+    Ok(())
 }
 
 struct ConversationLock {

@@ -14,6 +14,7 @@
 
 use crate::commands::{self, JobRow, Request};
 use crate::durable::Store;
+use crate::render;
 use crate::transport::Rest;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -139,54 +140,52 @@ async fn gray_cli(ctx: &Ctx<'_>, argv: &[String]) -> Result<(String, String), St
 
 /// Answer in the same call as the interaction (the 3-second path).
 async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
-    let mut data = json!({"embeds": [embed]});
-    if !public {
-        data["flags"] = json!(64);
-    }
-    if !buttons.is_empty() {
-        data["components"] = json!([{"type": 1, "components": buttons}]);
-    }
+    let components = match render::from_embed(embed, buttons) {
+        Ok(components) => components,
+        Err(e) => {
+            eprintln!("[discord] invalid command render: {e}");
+            vec![json!({"type": 10, "content": "Gray could not render this response."})]
+        }
+    };
     if let Err(e) = ctx
         .rest
-        .interaction_callback(ctx.int_id, ctx.int_token, &json!({"type": 4, "data": data}))
+        .interaction_v2(ctx.int_id, ctx.int_token, &components, public)
         .await
     {
         eprintln!("[discord] command reply failed: {e}");
     }
 }
 
-/// Acknowledge first, then post through the webhook — the path for anything
-/// that calls out. `public` rides on the deferral, because the followup
-/// inherits its visibility from there.
+async fn edit_deferred(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
+    let components = match render::from_embed(embed, buttons) {
+        Ok(components) => components,
+        Err(e) => {
+            eprintln!("[discord] invalid deferred render: {e}");
+            vec![json!({"type": 10, "content": "Gray could not render this response."})]
+        }
+    };
+    if let Err(e) = ctx
+        .rest
+        .edit_original_v2(ctx.app_id, ctx.int_token, &components, public)
+        .await
+    {
+        eprintln!("[discord] command original edit failed: {e}");
+    }
+}
+
+/// Acknowledge first, then edit the original response. `public` is fixed by
+/// the deferral because Discord does not let a later edit change visibility.
 async fn answer_deferred(
     ctx: &Ctx<'_>,
-    label: &str,
     public: bool,
     render: impl std::future::Future<Output = Value>,
 ) {
-    // The followup inherits its visibility from this ack, so a private question
-    // has to be acked private; it cannot be made private afterwards.
-    let mut data = json!({"content": label});
-    if !public {
-        data["flags"] = json!(64);
-    }
-    let defer = json!({"type": 5, "data": data});
-    if let Err(e) = ctx
-        .rest
-        .interaction_callback(ctx.int_id, ctx.int_token, &defer)
-        .await
-    {
+    if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, public).await {
         eprintln!("[discord] command defer failed: {e}");
         return;
     }
     let embed = render.await;
-    if let Err(e) = ctx
-        .rest
-        .followup_embed(ctx.app_id, ctx.int_token, &embed)
-        .await
-    {
-        eprintln!("[discord] command followup failed: {e}");
-    }
+    edit_deferred(ctx, &embed, &[], public).await;
 }
 
 /// Execute one parsed request. Every arm ends in a reply, so a request that
@@ -222,7 +221,24 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                     .into_iter()
                     .cloned()
                     .collect();
-            let (embed, buttons) = commands::cron_view(&mine, ctx.channel_id);
+            let mut state_tokens = Vec::new();
+            for job in mine.iter().take(5) {
+                match ctx.store.component_state_create(
+                    "cron_remove",
+                    ctx.user_id,
+                    ctx.channel_id,
+                    &job.0,
+                    86_400,
+                ) {
+                    Ok(token) => state_tokens.push(token),
+                    Err(e) => {
+                        eprintln!("[discord] could not create cron button state: {e}");
+                        state_tokens.clear();
+                        break;
+                    }
+                }
+            }
+            let (embed, buttons) = commands::cron_view(&mine, ctx.channel_id, &state_tokens);
             answer(ctx, &embed, &buttons, true).await;
         }
         Request::CronAdd { every, prompt } => {
@@ -370,7 +386,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                 )
                 .await;
             } else {
-                answer_deferred(ctx, "reading memory…", true, async move {
+                answer_deferred(ctx, true, async move {
                     match gray_cli(ctx, &argv).await {
                         Ok((stdout, stderr)) => commands::cli_embed(
                             "Memory",
@@ -403,12 +419,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
         Request::Ask { prompt } => {
             // The 3-second rule: acknowledge now, enqueue the turn, and let
             // the delivery loop answer through the webhook when gray is done.
-            let defer = json!({"type": 5});
-            if let Err(e) = ctx
-                .rest
-                .interaction_callback(ctx.int_id, ctx.int_token, &defer)
-                .await
-            {
+            if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, true).await {
                 eprintln!("[discord] /ask defer failed: {e}");
                 return;
             }
@@ -428,29 +439,27 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                         .set_interaction(ctx.int_id, ctx.int_token, ctx.app_id);
                 }
                 Ok(false) => {
-                    let _ = ctx
-                        .rest
-                        .followup_embed(
-                            ctx.app_id,
-                            ctx.int_token,
-                            &commands::embed(
-                                "/ask",
-                                "That turn is already queued (Discord redelivered it).",
-                                &[],
-                            ),
-                        )
-                        .await;
+                    edit_deferred(
+                        ctx,
+                        &commands::embed(
+                            "/ask",
+                            "That turn is already queued (Discord redelivered it).",
+                            &[],
+                        ),
+                        &[],
+                        true,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     eprintln!("[discord] /ask enqueue failed: {e}");
-                    let _ = ctx
-                        .rest
-                        .followup_embed(
-                            ctx.app_id,
-                            ctx.int_token,
-                            &commands::embed("/ask", format!("Cannot queue that: {e}"), &[]),
-                        )
-                        .await;
+                    edit_deferred(
+                        ctx,
+                        &commands::embed("/ask", format!("Cannot queue that: {e}"), &[]),
+                        &[],
+                        true,
+                    )
+                    .await;
                 }
             }
         }
@@ -488,21 +497,97 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
     }
 }
 
-/// A pressed button: `cron:remove:<id>`. Only two words of freedom, and the
-/// allow-list gate already ran before we got here.
-pub async fn button(ctx: &Ctx<'_>, custom_id: &str) {
-    if let Some(id) = custom_id.strip_prefix("cron:remove:") {
-        match ctx.store.schedule_remove(id) {
-            Ok(()) => {
-                answer(
-                    ctx,
-                    &commands::embed("Cron", format!("Deleted `{id}`."), &[]),
-                    &[],
-                    false,
-                )
-                .await
-            }
-            Err(e) => answer(ctx, &commands::embed("Cron", e, &[]), &[], false).await,
+/// Acknowledge an interaction shape the current bridge does not understand.
+pub async fn unknown(ctx: &Ctx<'_>) {
+    answer(
+        ctx,
+        &commands::embed("Command", "That command is no longer available.", &[]),
+        &[],
+        false,
+    )
+    .await;
+}
+
+/// Modal submissions are acknowledged even when no modal workflow is
+/// currently registered. This prevents Discord's three-second retry storm if
+/// an old or manually-created modal reaches the bridge.
+pub async fn modal(ctx: &Ctx<'_>, custom_id: &str) {
+    eprintln!("[discord] unhandled modal submission: {custom_id}");
+    answer(
+        ctx,
+        &commands::embed("Modal", "This Gray dialog is no longer active.", &[]),
+        &[],
+        false,
+    )
+    .await;
+}
+
+async fn update_original_or_answer(ctx: &Ctx<'_>, embed: &Value) {
+    let components = match render::from_embed(embed, &[]) {
+        Ok(components) => components,
+        Err(e) => {
+            eprintln!("[discord] invalid component update: {e}");
+            return;
         }
+    };
+    if let Err(e) = ctx
+        .rest
+        .interaction_update_v2(ctx.int_id, ctx.int_token, &components)
+        .await
+    {
+        eprintln!("[discord] component update failed; sending fallback: {e}");
+        answer(ctx, embed, &[], false).await;
+    }
+}
+
+/// A pressed button: `cron:remove:<opaque-token>`. The token is
+/// consumed atomically and is valid only for the original user/channel.
+pub async fn button(ctx: &Ctx<'_>, custom_id: &str) {
+    let Some(token) = custom_id.strip_prefix("cron:remove:") else {
+        answer(
+            ctx,
+            &commands::embed("Action", "That action is no longer available.", &[]),
+            &[],
+            false,
+        )
+        .await;
+        return;
+    };
+    let resource =
+        ctx.store
+            .component_state_take(token, ctx.user_id, ctx.channel_id, "cron_remove");
+    let id = match resource {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            answer(
+                ctx,
+                &commands::embed("Cron", "That action expired; list the jobs again.", &[]),
+                &[],
+                false,
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            eprintln!("[discord] component state failed: {e}");
+            answer(
+                ctx,
+                &commands::embed("Cron", "The action could not be completed.", &[]),
+                &[],
+                false,
+            )
+            .await;
+            return;
+        }
+    };
+    match ctx.store.schedule_remove(&id) {
+        Ok(()) => {
+            update_original_or_answer(
+                ctx,
+                &commands::embed("Cron", format!("Deleted `{id}`."), &[]),
+            )
+            .await
+        }
+        Err(e) => answer(ctx, &commands::embed("Cron", e, &[]), &[], false).await,
     }
 }

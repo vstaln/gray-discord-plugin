@@ -1,4 +1,5 @@
 use gray_discord::durable::Store;
+use gray_discord::runner::RunInput;
 
 #[tokio::test]
 async fn failed_delivery_restart_does_not_repeat_agent() {
@@ -9,15 +10,20 @@ async fn failed_delivery_restart_does_not_repeat_agent() {
     let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let calls_runner = calls.clone();
-    let runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, prompt: &str| {
-            let calls = calls_runner.clone();
-            let prompt = prompt.to_string();
-            Box::pin(async move {
-                calls.lock().unwrap().push(prompt);
-                Ok("answer".to_string())
-            })
+    let runner = move |_config: &serde_json::Value,
+                       _path: &std::path::Path,
+                       _conv: &str,
+                       input: &RunInput| {
+        let calls = calls_runner.clone();
+        let prompt = match input {
+            RunInput::Text(prompt) => prompt.clone(),
+            RunInput::Structured(_) => "component-event".to_string(),
         };
+        Box::pin(async move {
+            calls.lock().unwrap().push(prompt);
+            Ok("answer".to_string())
+        })
+    };
 
     let broken = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Err("private error body".to_string()) })
@@ -78,16 +84,18 @@ async fn cancel_running_work_and_shutdown_marks_uncertain() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
 
-    let runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            let tx = started_tx.clone();
-            Box::pin(async move {
-                if let Some(t) = tx.lock().unwrap().take() {
-                    let _ = t.send(());
-                }
-                std::future::pending::<Result<String, gray_discord::runner::RunError>>().await
-            })
-        };
+    let runner = move |_config: &serde_json::Value,
+                       _path: &std::path::Path,
+                       _conv: &str,
+                       _input: &RunInput| {
+        let tx = started_tx.clone();
+        Box::pin(async move {
+            if let Some(t) = tx.lock().unwrap().take() {
+                let _ = t.send(());
+            }
+            std::future::pending::<Result<String, gray_discord::runner::RunError>>().await
+        })
+    };
 
     let deliver = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok("reply".to_string()) })
@@ -130,10 +138,12 @@ async fn slash_followup_routing_marks_part_as_interaction() {
     let path = tmp.path().join("config.json");
     let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
 
-    let runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Ok("slash answer".to_string()) })
-        };
+    let runner = move |_config: &serde_json::Value,
+                       _path: &std::path::Path,
+                       _conv: &str,
+                       _input: &RunInput| {
+        Box::pin(async move { Ok("slash answer".to_string()) })
+    };
 
     let delivered_parts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let delivered_parts_clone = delivered_parts.clone();
@@ -192,9 +202,10 @@ async fn reaction_call_sequence_on_success_and_failure() {
     });
 
     let runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Ok("done".to_string()) })
-        };
+        move |_config: &serde_json::Value,
+              _path: &std::path::Path,
+              _conv: &str,
+              _input: &RunInput| { Box::pin(async move { Ok("done".to_string()) }) };
 
     let deliver = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok("m1".to_string()) })
@@ -240,10 +251,12 @@ async fn reaction_call_sequence_on_success_and_failure() {
 
     // Test failure sequence
     reactions_log.lock().unwrap().clear();
-    let failing_runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Err(gray_discord::runner::RunError::Timeout) })
-        };
+    let failing_runner = move |_config: &serde_json::Value,
+                               _path: &std::path::Path,
+                               _conv: &str,
+                               _input: &RunInput| {
+        Box::pin(async move { Err(gray_discord::runner::RunError::Timeout) })
+    };
     let deliver2 = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok("m2".to_string()) })
     };
@@ -292,10 +305,12 @@ async fn typing_cadence_throttles_within_8_seconds() {
         fake_time_clone.load(std::sync::atomic::Ordering::SeqCst) as f64
     });
 
-    let dummy_runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
-        };
+    let dummy_runner = move |_config: &serde_json::Value,
+                             _path: &std::path::Path,
+                             _conv: &str,
+                             _input: &RunInput| {
+        Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
+    };
     let dummy_deliver = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok::<String, String>("".to_string()) })
     };
@@ -344,9 +359,10 @@ async fn reactions_disabled_when_config_flag_false() {
     });
 
     let runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Ok("done".to_string()) })
-        };
+        move |_config: &serde_json::Value,
+              _path: &std::path::Path,
+              _conv: &str,
+              _input: &RunInput| { Box::pin(async move { Ok("done".to_string()) }) };
     let deliver = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok("m1".to_string()) })
     };
@@ -390,10 +406,12 @@ async fn typing_indicator_disabled_when_config_flag_false() {
         fake_time_clone.load(std::sync::atomic::Ordering::SeqCst) as f64
     });
 
-    let dummy_runner =
-        move |_config: &serde_json::Value, _path: &std::path::Path, _conv: &str, _prompt: &str| {
-            Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
-        };
+    let dummy_runner = move |_config: &serde_json::Value,
+                             _path: &std::path::Path,
+                             _conv: &str,
+                             _input: &RunInput| {
+        Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".to_string()) })
+    };
     let dummy_deliver = move |_part: gray_discord::durable::OutboxPart| {
         Box::pin(async move { Ok::<String, String>("".to_string()) })
     };
@@ -429,7 +447,7 @@ async fn typing_indicator_defaults_on_and_omitting_the_key_is_not_off() {
     for config in [serde_json::json!({}), serde_json::json!({"token": "x"})] {
         let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
         let dummy_runner =
-            move |_c: &serde_json::Value, _p: &std::path::Path, _v: &str, _q: &str| {
+            move |_c: &serde_json::Value, _p: &std::path::Path, _v: &str, _q: &RunInput| {
                 Box::pin(async move { Ok::<String, gray_discord::runner::RunError>("".into()) })
             };
         let dummy_deliver = move |_p: gray_discord::durable::OutboxPart| {
@@ -447,4 +465,50 @@ async fn typing_indicator_defaults_on_and_omitting_the_key_is_not_off() {
             "typing is on unless explicitly disabled"
         );
     }
+}
+
+#[tokio::test]
+async fn structured_component_input_reaches_the_same_conversation_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let store = Store::new(&tmp.path().join("queue.sqlite")).unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_runner = observed.clone();
+    let runner = move |_config: &serde_json::Value,
+                       _path: &std::path::Path,
+                       conversation: &str,
+                       input: &RunInput| {
+        let observed = observed_runner.clone();
+        let conversation = conversation.to_string();
+        let input = input.clone();
+        Box::pin(async move {
+            observed.lock().unwrap().push((conversation, input));
+            Ok("structured answer".to_string())
+        })
+    };
+    let deliver = |_part: gray_discord::durable::OutboxPart| {
+        Box::pin(async { Ok("m-structured".to_string()) })
+    };
+    let runtime = gray_discord::gateway::Runtime::new(
+        serde_json::json!({}),
+        path,
+        store.clone(),
+        deliver,
+        runner,
+    );
+    let envelope = serde_json::json!({
+        "protocol": "gray.discord.input",
+        "version": 1,
+        "kind": "component_event",
+        "payload": {"action": "run", "values": {"id": "7"}}
+    });
+    store
+        .enqueue_component_json("component-1", "42", "chat:42", &envelope, 100)
+        .unwrap();
+    assert!(runtime.generate_one().await.unwrap());
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        &[("chat:42".to_string(), RunInput::Structured(envelope),)]
+    );
+    assert!(runtime.deliver_one().await.unwrap());
 }

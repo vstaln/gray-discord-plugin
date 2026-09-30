@@ -8,7 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone, Default)]
 pub struct Sent {
+    pub method: String,
+    pub path: String,
     pub auth: Option<String>,
+    pub headers: HashMap<String, String>,
     pub body: serde_json::Value,
 }
 
@@ -93,6 +96,39 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+fn decode_request_body(headers: &HashMap<String, String>, body: &[u8]) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_slice(body) {
+        return value;
+    }
+    let Some(content_type) = headers.get("content-type") else {
+        return serde_json::Value::Null;
+    };
+    let Some(boundary) = content_type.split("boundary=").nth(1) else {
+        return serde_json::Value::Null;
+    };
+    let marker = format!("--{boundary}").into_bytes();
+    for part in body.split(|byte| byte == &marker[0]) {
+        if part.is_empty() || part.starts_with(b"--") {
+            continue;
+        }
+        let Some(split) = part.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&part[..split]).to_ascii_lowercase();
+        if !name.contains("name=\"payload_json\"") {
+            continue;
+        }
+        let start = split + 4;
+        let end = part.len().saturating_sub(2);
+        if end >= start {
+            if let Ok(value) = serde_json::from_slice(&part[start..end]) {
+                return value;
+            }
+        }
+    }
+    serde_json::Value::Null
+}
+
 // flags 262144 = 1<<18 APP_FLAG_MESSAGE_CONTENT so doctor intent checks pass.
 const USER: &str = r#"{"id":"123","username":"fixture","bot":true}"#;
 
@@ -152,16 +188,88 @@ impl Stub {
                             .await;
                         } else if path == "/api/v10/guilds/77/members/123" {
                             respond(&mut stream, 200, r#"{"roles":["78"]}"#).await;
-                        } else if path == "/api/v10/channels/42/messages" && method == "POST" {
-                            // Record before the fail toggle, like the Python
-                            // fixture: the refused attempt still reached the server.
-                            let body: serde_json::Value =
-                                serde_json::from_slice(&body).unwrap_or_default();
+                        } else if method == "PATCH"
+                            && (path == "/api/v10/channels/42/messages/1000"
+                                || path == "/api/v10/channels/42/messages/1001")
+                        {
+                            let body = decode_request_body(&headers, &body);
                             let n = {
                                 let mut sent = sent.lock().unwrap();
                                 let n = sent.len();
                                 sent.push(Sent {
+                                    method: method.clone(),
+                                    path: path.clone(),
                                     auth: headers.get("authorization").cloned(),
+                                    headers: headers.clone(),
+                                    body,
+                                });
+                                n
+                            };
+                            let reply = format!(r#"{{"id":"{}","channel_id":"42"}}"#, 1000 + n);
+                            respond(&mut stream, 200, &reply).await;
+                        } else if method == "POST"
+                            && path.starts_with("/api/v10/interactions/")
+                            && path.ends_with("/callback")
+                        {
+                            let body = decode_request_body(&headers, &body);
+                            {
+                                let mut sent = sent.lock().unwrap();
+                                sent.push(Sent {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    auth: headers.get("authorization").cloned(),
+                                    headers: headers.clone(),
+                                    body,
+                                });
+                            }
+                            respond(&mut stream, 204, "").await;
+                        } else if method == "PATCH"
+                            && path.starts_with("/api/v10/webhooks/")
+                            && path.ends_with("/messages/@original")
+                        {
+                            let body = decode_request_body(&headers, &body);
+                            let n = {
+                                let mut sent = sent.lock().unwrap();
+                                let n = sent.len();
+                                sent.push(Sent {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    auth: headers.get("authorization").cloned(),
+                                    headers: headers.clone(),
+                                    body,
+                                });
+                                n
+                            };
+                            let reply = format!(r#"{{"id":"{}","channel_id":"42"}}"#, 2000 + n);
+                            respond(&mut stream, 200, &reply).await;
+                        } else if method == "POST" && path.starts_with("/api/v10/webhooks/") {
+                            let body = decode_request_body(&headers, &body);
+                            let n = {
+                                let mut sent = sent.lock().unwrap();
+                                let n = sent.len();
+                                sent.push(Sent {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    auth: headers.get("authorization").cloned(),
+                                    headers: headers.clone(),
+                                    body,
+                                });
+                                n
+                            };
+                            let reply = format!(r#"{{"id":"{}","channel_id":"42"}}"#, 3000 + n);
+                            respond(&mut stream, 200, &reply).await;
+                        } else if path == "/api/v10/channels/42/messages" && method == "POST" {
+                            // Record before the fail toggle, like the Python
+                            // fixture: the refused attempt still reached the server.
+                            let body = decode_request_body(&headers, &body);
+                            let n = {
+                                let mut sent = sent.lock().unwrap();
+                                let n = sent.len();
+                                sent.push(Sent {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    auth: headers.get("authorization").cloned(),
+                                    headers: headers.clone(),
                                     body,
                                 });
                                 n

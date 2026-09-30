@@ -1,9 +1,9 @@
 # Runtime reliability changes (isolated development version)
 
-Requires the matching gray core changes implementing `gray -p --json` protocol 1.
-Do not install this branch with an older gray executable. Upgrade the gray binary
-and this plugin together, then restart the service so the two protocol versions
-match.
+Requires the matching gray core changes implementing `gray -p --json` and
+`gray --input-json` protocol 1. Do not install this branch with an older gray
+executable. Upgrade the gray binary and this plugin together, then restart the
+service so the two protocol versions match.
 
 ## Structured execution
 
@@ -22,6 +22,22 @@ the channel key, native Discord threads use their thread channel key, and guild
 messages use a per-user key. The default reset policy is `both`: 1,440 idle
 minutes or the next 04:00 local boundary. `/new` and `/reset` remove the
 conversation's JSONL transcripts and advance a generation marker.
+
+### Typed component turns
+
+The plugin runner supports two input modes. Ordinary messages retain `-p` and
+legacy text semantics. Normalized Discord components are written to a private
+`turn-input.json` beneath the conversation home and invoke the native command:
+
+```sh
+gray --input-json /path/to/turn-input.json --json --session <id>
+```
+
+The file is mode 0600, removed after the child exits, and never placed in
+argv. Gray parses the `gray.discord.input` version-1 envelope, preserves it as
+a typed user block, and continues the same session. Component state tokens and
+Discord interaction tokens stay in the plugin's SQLite rows; managed file IDs
+are metadata, not file contents.
 
 `gray discord limits --timeout-seconds 1800 --concurrency 4 --max-requests 32`
 sets runtime policy; restart to apply. Defaults: 600 seconds, 2 workers, 32
