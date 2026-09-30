@@ -225,6 +225,14 @@ impl Rest {
                 .and_then(|v| v.get("retry_after").and_then(Value::as_f64));
             return Err(TransportError::RateLimited(header_retry.or(body_retry)));
         }
+        if code == 400 {
+            // A 400 body is Discord's validation report: field paths and error
+            // codes, never credentials. Keep a bounded copy so a rejected
+            // components tree is diagnosable; `Display` still prints only the
+            // status, and no other code path prints this string.
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TransportError::Http(code, body.chars().take(400).collect()));
+        }
         let _ = resp.bytes().await;
         Err(TransportError::Http(code, "request failed".into()))
     }

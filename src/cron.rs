@@ -74,7 +74,18 @@ pub fn origin_env(home: &Path) -> Option<String> {
 pub struct Delivery {
     pub job_id: String,
     pub channel: String,
+    /// Legacy rendered text. Only used when `final_text` is absent (an older
+    /// core, which still wraps the answer in its own frame).
     pub text: String,
+    /// The final assistant message, or the stored reminder text (newer
+    /// core). Rendered literally, never parsed.
+    pub final_text: Option<String>,
+    pub name: Option<String>,
+    pub kind: crate::cron_card::Kind,
+    pub status: crate::cron_card::Status,
+    pub elapsed: Option<Duration>,
+    /// Where core saved the full output. Logged, never shown.
+    pub path: Option<String>,
 }
 
 /// Split tick stdout into deliveries and drop everything else. Core emits
@@ -111,10 +122,22 @@ pub fn parse_tick(stdout: &str) -> Vec<Delivery> {
         if channel.is_empty() || text.trim().is_empty() {
             continue;
         }
+        let str_field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         out.push(Delivery {
             job_id: job_id.to_string(),
             channel,
             text: text.to_string(),
+            final_text: str_field("final_text"),
+            name: str_field("name"),
+            kind: crate::cron_card::Kind::from_wire(v.get("kind").and_then(Value::as_str)),
+            status: crate::cron_card::Status::from_wire(v.get("status").and_then(Value::as_str)),
+            // 0 means "no agent turn" (a reminder): show no timing at all.
+            elapsed: v
+                .get("elapsed_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(Duration::from_millis),
+            path: str_field("path"),
         });
     }
     out
@@ -155,5 +178,178 @@ pub async fn tick_home(gray_bin: &Path, home: &Path) -> Vec<Delivery> {
     match out {
         Ok(o) => parse_tick(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => Vec::new(),
+    }
+}
+
+/// The card for one delivery. Pure (no network), so it is unit-tested.
+/// Structured deliveries are rendered literally; only legacy text goes
+/// through the lossy frame stripper. Deliberately does NOT call
+/// `text::sanitize`: it rewrites URLs into `<…>` and `:done:`-style emoji
+/// names, which would break "the reminder text is delivered byte for byte".
+pub fn card_for(d: &Delivery) -> crate::cron_card::CronCard {
+    use crate::cron_card::CronCard;
+    let mut card = match &d.final_text {
+        Some(text) => CronCard::from_final_text(d.name.clone(), text, d.kind, d.status),
+        None => CronCard::from_raw(&d.text, d.kind, d.status),
+    };
+    card.elapsed = d.elapsed;
+    card
+}
+
+/// Post one cron delivery as a Components V2 card. Returns true when the
+/// message is delivered (or there was nothing to deliver).
+///
+/// * 429: wait `retry_after` (bounded to 30s) and retry once.
+/// * 400 (Discord rejected the V2 tree) or a local validation refusal: send
+///   plain text instead, which the transport splits to fit.
+/// * anything else (401/403/404/5xx/network): logged with its status, no
+///   retry loop; the caller decides what a failed delivery means.
+///
+/// The full-output path is logged here and never appears in Discord.
+pub async fn post_delivery(rest: &crate::transport::Rest, channel: u64, d: &Delivery) -> bool {
+    use crate::transport::TransportError;
+    let card = card_for(d);
+    if let Some(path) = card.parsed.full_output.as_deref().or(d.path.as_deref()) {
+        eprintln!("[discord] cron full output: {path}");
+    }
+    let Some(components) = card.components() else {
+        eprintln!("[discord] cron delivery for channel {channel} has an empty body; not posting");
+        return true;
+    };
+    let mut retried = false;
+    loop {
+        match rest.send_v2(channel, &components, None).await {
+            Ok(_) => return true,
+            Err(TransportError::RateLimited(after)) if !retried => {
+                retried = true;
+                let secs = after
+                    .filter(|s| s.is_finite())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 30.0);
+                eprintln!("[discord] cron delivery rate limited; retrying in {secs:.1}s");
+                tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            }
+            Err(TransportError::Http(400, body)) => {
+                eprintln!("[discord] cron card rejected (HTTP 400): {body}; sending plain text");
+                return send_plain(rest, channel, &card).await;
+            }
+            Err(TransportError::Invalid(msg)) => {
+                eprintln!("[discord] cron card refused locally: {msg}; sending plain text");
+                return send_plain(rest, channel, &card).await;
+            }
+            Err(e) => {
+                eprintln!("[discord] cron delivery to channel {channel} failed: {e:?}");
+                return false;
+            }
+        }
+    }
+}
+
+async fn send_plain(
+    rest: &crate::transport::Rest,
+    channel: u64,
+    card: &crate::cron_card::CronCard,
+) -> bool {
+    match rest.send(channel, &card.plain_text(), None).await {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("[discord] cron plain fallback to channel {channel} failed: {e:?}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use crate::cron_card::{Kind, Status};
+
+    fn one(line: serde_json::Value) -> Vec<Delivery> {
+        parse_tick(&line.to_string())
+    }
+
+    #[test]
+    fn a_structured_delivery_keeps_its_kind_status_and_literal_text() {
+        let ds = one(serde_json::json!({
+            "type": "cron_delivery", "job_id": "8d90cd866db9", "name": "clean-my-roo",
+            "platform": "discord", "chat": "c", "route": "42",
+            "kind": "reminder", "status": "ok", "elapsed_ms": 300,
+            "final_text": ":done:  clean my roo\n\n\nhttps://x.y/z",
+            "text": "clean-my-roo\n\nlegacy", "path": "/tmp/secret/out.md"
+        }));
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].kind, Kind::Reminder);
+        assert_eq!(ds[0].status, Status::Ok);
+        assert_eq!(ds[0].elapsed, Some(Duration::from_millis(300)));
+        let shown = serde_json::to_string(&card_for(&ds[0]).components().unwrap()).unwrap();
+        // literal: no emoji-name rewrite, no <url> wrapping, no whitespace
+        // collapse. The serialized JSON escapes the newlines, so match the
+        // raw spelling.
+        assert!(
+            shown.contains(r#":done:  clean my roo\n\n\nhttps://x.y/z"#),
+            "{shown}"
+        );
+        assert!(!shown.contains("8d90cd866db9"), "job id leaked");
+        assert!(!shown.contains("/tmp/secret"), "output path leaked");
+    }
+
+    #[test]
+    fn a_reminder_shows_no_timing() {
+        let ds = one(serde_json::json!({
+            "type": "cron_delivery", "job_id": "j", "platform": "discord", "route": "42",
+            "kind": "reminder", "elapsed_ms": 0, "final_text": "clean my roo", "text": "x"
+        }));
+        assert_eq!(ds[0].elapsed, None);
+        let shown = serde_json::to_string(&card_for(&ds[0]).components().unwrap()).unwrap();
+        assert!(
+            !shown.contains("done ·"),
+            "a reminder has no agent turn to time"
+        );
+    }
+
+    #[test]
+    fn a_failed_status_is_red() {
+        let ds = one(serde_json::json!({
+            "type": "cron_delivery", "job_id": "j", "platform": "discord", "route": "42",
+            "status": "failed", "kind": "task", "name": "nightly",
+            "final_text": "agent run failed: boom", "text": "x"
+        }));
+        let c = card_for(&ds[0]).components().unwrap();
+        assert_eq!(c[0]["accent_color"], crate::render::DANGER_ACCENT);
+        assert!(c[0]["components"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("nightly failed"));
+    }
+
+    #[test]
+    fn legacy_core_output_is_stripped_to_the_answer() {
+        let legacy = "Cronjob Response: clean-room\n(job_id: 8d90cd866db9)\n-------------\n\n[tool:bash]\n[result:exit 0 · 0.3s · 45 lines]\n<untrusted-output>\ndrwxr-xr-x 2 u u 4096 supervise\n</untrusted-output>\n\nclean my roo\n\nTo stop or manage this job, send me a new message (e.g. \"stop reminder clean-room\").\nFull output: /home/u/.config/gray-discord/conversations/h/cron/output/8d90cd866db9.md";
+        let ds = one(serde_json::json!({
+            "type": "cron_delivery", "job_id": "8d90cd866db9", "platform": "discord",
+            "route": "42", "text": legacy
+        }));
+        let shown = serde_json::to_string(&card_for(&ds[0]).components().unwrap()).unwrap();
+        assert!(shown.contains("clean my roo"), "{shown}");
+        for bad in [
+            "8d90cd866db9",
+            "job_id",
+            "Cronjob Response",
+            "[tool:",
+            "untrusted",
+            "Full output",
+            "supervise",
+        ] {
+            assert!(!shown.contains(bad), "leaked {bad}");
+        }
+    }
+
+    #[test]
+    fn a_line_without_a_route_is_never_delivered() {
+        assert!(one(serde_json::json!({
+            "type": "cron_delivery", "job_id": "j", "platform": "discord",
+            "final_text": "hi", "text": "hi"
+        }))
+        .is_empty());
     }
 }
