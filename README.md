@@ -9,11 +9,11 @@ queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY
 gray core `--json` implementation.
 See [runtime policy, commands and remaining limits](docs/RUNTIME.md).
 
-**Experimental text-only integration.** Live Discord login, interactive pairing,
-and background-service deployment have been ported from Python to a single
-Rust binary. The service probes what this box actually supervises with
-(runit, systemd --user, or gray itself with no init) instead of assuming
-systemd.
+**Typed Components V2 integration.** Live Discord login, interactive pairing,
+background-service deployment, managed media, and typed component events are
+implemented in one Rust binary. The service probes what this box actually
+supervises with (runit, systemd --user, or gray itself with no init) instead
+of assuming systemd.
 
 ## Installation
 
@@ -119,7 +119,211 @@ protocol-1.1 stdio sidecar in gray's existing plugin lock, preserving other entr
 Restart existing gray sessions. `discord_send` accepts `{ "content": "hello" }`
 and only sends to the configured destination; it does not open a gateway connection.
 Its calls do not require the background service to be running. Long messages are
-split, with all mentions suppressed.
+split, with all mentions suppressed. New bot messages use Discord Components V2
+(`Text Display`, `Container`, and `Separator`) rather than legacy content/embeds;
+the durable queue keeps a legacy fallback only for rows created before the V2
+migration.
+
+## Typed Components V2
+
+The sidecar exposes a Gray-owned typed document protocol instead of asking the
+model to hand-write Discord numeric types or `custom_id` values:
+
+- `discord_ui_schema` returns the current protocol/limits and message/modal shape.
+- `discord_send_ui` accepts a `gray.discord.ui` version-1 document, compiles it,
+  allocates opaque state, and sends/edits a V2 message.
+- `discord_open_modal` accepts a typed modal document for the current interaction.
+- `discord_file` imports, inspects, or safely exposes files from the conversation
+  work directory; managed IDs and safe workdir paths never expose the host media
+  store or Discord tokens.
+
+Buttons, selects, modals, media, files, and the documented component limits are
+handled by the plugin. Interaction values are delivered into Gray as
+`gray.discord.input` version-1 user turns. Premium buttons require the
+`premium` capability and an explicitly allowed `premium_skus` entry.
+
+A message document is authored in the Gray protocol, not Discord wire JSON:
+
+```json
+{
+  "surface": "message",
+  "version": 1,
+  "document_id": "status-card",
+  "visibility": "public",
+  "components": [
+    {"type": "text", "content": "Build finished"},
+    {"type": "action_row", "children": [
+      {"type": "button", "logical_id": "refresh", "label": "Refresh", "style": "secondary"}
+    ]}
+  ]
+}
+```
+
+Call it through `discord_send_ui`. For a modal, use the same envelope with
+`"surface": "modal"`, a `title`, and `label` components, then call
+`discord_open_modal` with the interaction ID from the normalized event.
+`discord_file` supports `import`, `metadata`, and `path`; only `path` returns
+a file below the current conversation work directory.
+
+The compiler emits message types 1–3, 5–14, and 17, plus modal types 3–8,
+18–19, and 21–23. Numeric Discord types, custom IDs, and attachment URLs are
+owned by the compiler. Premium style 6 is represented in the protocol but
+fails closed unless both the capability and SKU allowlist are configured.
+
+## Native structured input
+
+The gateway and sidecar never put Discord interaction tokens or raw callback
+bodies in a model prompt. A normalized event is persisted as a versioned Gray
+input envelope and runs in the same conversation/session as the user's text:
+
+```sh
+gray --input-json /path/to/event.json --json --session <id>
+gray --input-json - --json --session <id> < event.json
+```
+
+`event.json` has the shape:
+
+```json
+{
+  "protocol": "gray.discord.input",
+  "version": 1,
+  "kind": "component_event",
+  "payload": {
+    "document_id": "refresh-card",
+    "component": "refresh",
+    "action": "button",
+    "values": {"id": "7"},
+    "files": []
+  }
+}
+```
+
+The envelope is capped at 1 MiB and is preserved as a typed user content block
+in the transcript. The provider sees a bounded, redacted marker, not a raw
+Discord token or file body.
+
+## Burst guard and attachments
+
+Two ports from the grayai_legacy bot (Python, `vstaln/grayai_legacy`), kept
+minimal:
+
+- `rate_limit_capacity` + `rate_limit_window_secs` (8 / 60s defaults) — a
+  sliding-window guard per user. Without it one eager DMer is twenty
+  concurrent `gray` processes; the ninth message inside the window gets
+  "Too fast — try again in Ns" instead of a fork.
+- `max_attachment_bytes` (8MB default) — DM attachments are saved under
+  `workdir/attachments/<msg-id>-<name>` and named in the prompt
+  (`[attached file: …]`), so gray's own tools read them: `cat` for text,
+  `cat <image>` for vision. Nothing is decoded here.
+- Outbound text is sanitized before Discord renders it (bare links wrapped
+  so they do not become embed cards, `:fire:` names replaced, doubled
+  heading hashes collapsed) — a port of `services/text_sanitizer.py`.
+
+## Typing indicator
+
+On by default, and re-poked every 8 seconds while the agent is working — so
+from Discord it reads as a permanent "typing…" bubble on a long turn. Turn
+it off in `config.json`:
+
+```json
+{"typing_indicator": false}
+```
+
+Same key, default, and gate placement as Hermes' `discord.typing_indicator`:
+the check happens in the adapter before any typing call, so `false` stops
+the whole path (the REST poke and the host hook) rather than one loop of it.
+Reload by restarting the service (`gray discord restart`).
+
+## Activity narration
+
+While the agent works, one live status message per turn shows what it is
+doing, overwritten in place as the turn proceeds. At the end of the turn,
+Discord also keeps a separate bounded tool-activity card, so activity does
+not disappear when the next turn starts. Both show actions only — one line
+per meaningful call, never tool output. Shell introspection (`ls`, `cat`,
+…) stays unnarrated, and shell work reads the way gray's own transcript
+labels it (`Running` live, `Ran` on the receipt):
+
+````markdown
+💻 Running `gray view /tmp/shot.png`
+
+⋯ 0.9s · ran 2 commands
+💻 Ran `gray view /tmp/shot.png` (0.3s)
+````
+
+The rows come from gray core's `--json` progress stream (phase + tool +
+detail), so every chat surface can render the same data; only the
+presentation is Discord-specific. Safe tool activity is shown by default.
+Raw model reasoning is never sent to Discord: the bridge always runs gray
+with `GRAY_SHOW_REASONING=0`, even when activity is enabled. Secrets are
+redacted and everything is capped before it leaves gray, but secret-free
+paths stay verbatim so narration names the actual file. The card keeps at
+most 5 actions plus a tally and never includes reasoning.
+
+Off in `config.json`:
+
+```json
+{"activity_indicator": false}
+```
+
+Absent means on. Turning it off stops both the live status bubble and the
+persistent tool card; it never enables raw reasoning. Reload by restarting the service
+(`gray discord restart`).
+
+## Sessions and new conversations
+
+A DM is one conversation. A native Discord thread is already a separate
+conversation because Discord sends that thread's channel ID. Guild messages
+are isolated per user, so two people in one channel do not share a transcript.
+
+By default Gray follows the local Hermes policy: a session is replaced after
+24 hours idle or at the next 04:00 local boundary, whichever comes first.
+The policy is configurable:
+
+```json
+{
+  "session_reset": {
+    "mode": "both",
+    "idle_minutes": 1440,
+    "at_hour": 4
+  }
+}
+```
+
+`mode` may be `none`, `idle`, `daily`, or `both`. `/new` and `/reset` both
+forget the caller's transcript, cancel work already queued for that
+conversation, and leave a fresh generation marker so an old in-flight turn
+cannot restore its previous session.
+
+## Cron that comes back to the chat
+
+Ask for a reminder in Discord ("remind me to check the deploy every hour")
+and the job posts its result back to the channel it was added from:
+
+```
+Cronjob Response: check the deploy
+(job_id: 125c6c57422c)
+-------------
+
+the deploy is green
+
+To stop or manage this job, send me a new message (e.g. "stop reminder check the deploy").
+```
+
+The frame is gray core's, byte-for-byte Hermes' `_deliver_result`; this
+plugin only carries it. How it fits together:
+
+- Each turn runs in its own gray home, so a job added from a conversation
+  lives in that conversation's store and fires with its credentials,
+  workdir, and skills.
+- The channel binding is a `route.json` next to that store, written where
+  the channel is known and read where the home is known, so a plain
+  `gray cron add` from the model is already bound — no ids in the prompt.
+- A background task ticks each conversation every 60s via
+  `gray cron tick --json` and posts what comes back. Runs as its own task,
+  so a firing never stalls shard events.
+- Output that is `[SILENT]` is not posted (core suppresses it), and the
+  full transcript of every run stays on disk.
 
 ## Allowlisted users
 
@@ -150,11 +354,49 @@ The next run advances before execution; interrupted jobs are not replayed. These
 are interval jobs, not cron expressions and not gray's native cron scheduler.
 Avoid calling `discord_send` in job prompts: the scheduler already sends the reply.
 
+## Slash commands
+
+The bridge answers native Discord slash commands. Registration, dispatch and
+`/help` are all derived from one table (`src/commands.rs`), so a command that
+exists is registered, handled and documented or none of the three.
+
+| Command | What it does | Visibility |
+|---|---|---|
+| `/help [command]` | Lists every command, or one in detail | public |
+| `/ask prompt:…` | Enqueues a turn for gray | public |
+| `/cron list` | This channel's scheduled jobs, with a Remove button each | public |
+| `/cron add every:30m prompt:…` | Schedules a prompt **for the channel it is typed in** | public |
+| `/cron remove id:…` | Deletes a job | private |
+| `/model` | Which model answers here, and where it comes from | public |
+| `/model set model:…` | Pins a model for this channel only | public |
+| `/memory list\|show\|set\|remove` | gray's curated cross-session memory | list/show/set public, remove private |
+| `/status` | Queue depth, model, bridge version | public |
+| `/new` | Starts a fresh session for you | private |
+| `/reset` | Alias of `/new` | private |
+| `/stop` | Cancels the running turn | private |
+
+Anything that shells out to gray (`/memory`) acknowledges first and answers
+afterwards: Discord drops a callback that took longer than three seconds.
+Buttons arrive as `MessageComponent` interactions; only an allow-listed user
+can press one, because Discord does not filter presses for you. Cron buttons
+carry short-lived, opaque, single-use state tokens rather than schedule IDs, and
+successful presses update the original V2 message.
+
+`/cron` fronts the plugin's own schedule store rather than gray's cron CLI.
+gray's cron is file-only and needs a ticker per home; this daemon ticks only
+its own table, so a `gray cron add` issued from Discord would never fire.
+Schedules therefore carry the channel and conversation they belong to, and a
+job created in one channel delivers to that channel — a job added by
+`gray discord schedule add` targets the configured home channel.
+
 ## Sessions and safety boundaries
 
 Each conversation and each job gets its own private gray home, provider config
 snapshot, sessions and working directory below the plugin config directory.
-Turns resume the existing ID; ambiguous session stores fail rather than guessing.
+Turns resume the existing ID until the reset policy or `/new` starts a new one;
+ambiguous session stores fail rather than guessing. Native Discord threads use
+their own channel key, and guild chats use a per-user key. Resets remove the
+private conversation transcript rather than merely deleting its pointer.
 A gray profile explicitly enables `tools-minimal` and the outgoing sidecar.
 Tools run on the server, not your desktop. This is **not a sandbox**: allowlisted
 users and model tool execution have the OS user's permissions. Prefer a dedicated
@@ -174,11 +416,13 @@ for exactly-once delivery limitations, unbounded archive retention, and the
 still-separate native cron scheduler. Voice, attachments and full Hermes parity
 are not included.
 
-`doctor` checks token, intent, channel permissions and local gray configuration;
-it does not test provider generation or prove gateway connectivity.
+`doctor` checks token, intent, effective channel/parent overwrite permissions
+(including the thread send bit), and local gray configuration; it does not test
+provider generation or prove gateway connectivity.
 `uninstall` removes the service only; config, sessions, jobs and the registered
 outgoing tool are deliberately retained. Use `gray plugin disable discord` to
-turn off that tool. Remove private state yourself only if you want to erase it.
+turn off that tool. Use `/new` or `/reset` to erase the current conversation;
+remove other private state yourself only if you want to erase it.
 
 ## Development / verification
 

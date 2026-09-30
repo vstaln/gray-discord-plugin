@@ -1,17 +1,43 @@
 # Runtime reliability changes (isolated development version)
 
-Requires the matching gray core changes implementing `gray -p --json` protocol 1.
-Do not install this branch with an older gray executable. No active service was
-updated or started as part of this work.
+Requires the matching gray core changes implementing `gray -p --json` and
+`gray --input-json` protocol 1. Do not install this branch with an older gray
+executable. Upgrade the gray binary and this plugin together, then restart the
+service so the two protocol versions match.
 
 ## Structured execution
 
 The runner consumes NDJSON, not terminal output or session-file text searches.
-Progress contains phase names only. The terminal result includes `session_id`,
+Progress contains safe phase/tool labels, redacted one-line details, and a
+bounded redacted output for completed tools (plus an internal call ID for
+pairing parallel results). Discord drains rows per conversation, keeps a live
+status bubble, and posts a separate bounded tool-activity card at turn end.
+Raw reasoning is suppressed before it reaches the bridge. The terminal result includes
+`session_id`,
 `turn_id`, final redacted assistant text, and provider accounting. Errors are
 sanitized and retain a nonzero exit status. Malformed output is rejected.
 Each conversation keeps an explicit session pointer. Existing single-file
-conversation homes migrate on first use; ambiguous stores fail closed.
+conversation homes migrate on first use; ambiguous stores fail closed. DMs use
+the channel key, native Discord threads use their thread channel key, and guild
+messages use a per-user key. The default reset policy is `both`: 1,440 idle
+minutes or the next 04:00 local boundary. `/new` and `/reset` remove the
+conversation's JSONL transcripts and advance a generation marker.
+
+### Typed component turns
+
+The plugin runner supports two input modes. Ordinary messages retain `-p` and
+legacy text semantics. Normalized Discord components are written to a private
+`turn-input.json` beneath the conversation home and invoke the native command:
+
+```sh
+gray --input-json /path/to/turn-input.json --json --session <id>
+```
+
+The file is mode 0600, removed after the child exits, and never placed in
+argv. Gray parses the `gray.discord.input` version-1 envelope, preserves it as
+a typed user block, and continues the same session. Component state tokens and
+Discord interaction tokens stay in the plugin's SQLite rows; managed file IDs
+are metadata, not file contents.
 
 `gray discord limits --timeout-seconds 1800 --concurrency 4 --max-requests 32`
 sets runtime policy; restart to apply. Defaults: 600 seconds, 2 workers, 32

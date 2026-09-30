@@ -109,7 +109,7 @@ async fn run_offline(path: &Path, io: &mut Fake, w: &Wiring, pair: bool) -> Resu
 fn invite_url_is_exact() {
     assert_eq!(
         invite("999"),
-        "https://discord.com/oauth2/authorize?client_id=999&scope=bot&permissions=68608"
+        "https://discord.com/oauth2/authorize?client_id=999&scope=bot&permissions=274877975552"
     );
 }
 

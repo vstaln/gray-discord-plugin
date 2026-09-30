@@ -26,6 +26,28 @@ fn private_config_and_fail_closed() {
 }
 
 #[test]
+fn session_reset_configuration_is_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut data = base(tmp.path());
+    data["session_reset"] = json!({
+        "mode": "both",
+        "idle_minutes": 1440,
+        "at_hour": 4
+    });
+    assert!(config::validate_config(&data).is_ok());
+
+    for bad in [
+        json!({"mode": "sometimes"}),
+        json!({"idle_minutes": 0}),
+        json!({"idle_minutes": 10081}),
+        json!({"at_hour": 24}),
+    ] {
+        data["session_reset"] = bad.clone();
+        assert!(config::validate_config(&data).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn unicode_split_preserves_all_text() {
     let text: String = "😀\nhello ".repeat(1200);
     let chunks = text::split_message(&text, 2000).unwrap();
@@ -113,7 +135,7 @@ fn slash_admission_checks_owner_and_allowlist() {
         None
     );
     // /reset, /status, /stop admitted for allowed users
-    for cmd in ["reset", "status", "stop"] {
+    for cmd in ["new", "reset", "status", "stop"] {
         assert_eq!(
             policy::slash_admission("123", "123", &allowed, cmd, None),
             Some(cmd.into())

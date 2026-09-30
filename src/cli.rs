@@ -356,7 +356,8 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             }
             config["shared_plugins"] = Value::Array(plugins);
 
-            let tmp_dir = std::env::temp_dir().join(format!("gray-cap-{}", uuid_hex()));
+            let tmp_dir =
+                std::env::temp_dir().join(format!("gray-cap-{}", crate::durable::uuid_hex()));
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create tempdir: {e}"))?;
             let res = crate::capabilities::prepare(&config, &tmp_dir);
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -426,17 +427,43 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             }
         },
         Command::Schedule { action } => {
+            let config = crate::config::load_config(config_path)?;
             let store = crate::gateway::open_store(config_path)?;
             match action {
                 ScheduleAction::Add { every, prompt } => {
-                    let job_id = uuid_hex();
-                    store.schedule_add(&job_id, *every, prompt, crate::durable::now_secs())?;
+                    // No channel context here, so a CLI-added job targets the
+                    // configured home channel and shares that channel's gray
+                    // home — the same result `/cron add` gives in the home
+                    // channel, so the two entry points cannot drift.
+                    let home = config
+                        .get("channel_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "channel_id missing".to_string())?;
+                    let job_id = crate::durable::uuid_hex();
+                    store.schedule_add(
+                        &job_id,
+                        *every,
+                        prompt,
+                        home,
+                        &format!("chat:{home}"),
+                        crate::durable::now_secs(),
+                    )?;
                     println!("{job_id}");
                     Ok(())
                 }
                 ScheduleAction::List => {
                     for job in store.schedules()? {
-                        println!("{} {} {}", job.id, job.interval, job.status);
+                        println!(
+                            "{} {} {} {}",
+                            job.id,
+                            job.interval,
+                            job.status,
+                            if job.channel.is_empty() {
+                                "(home)"
+                            } else {
+                                job.channel.as_str()
+                            }
+                        );
                     }
                     Ok(())
                 }
@@ -518,16 +545,4 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             }
         }
     }
-}
-
-fn uuid_hex() -> String {
-    let mut buf = [0u8; 16];
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut buf);
-        }
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
 }

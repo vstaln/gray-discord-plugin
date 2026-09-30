@@ -3,9 +3,13 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// Exact OAuth2 invite URL (bot scope, view/send/history permissions).
+/// OAuth2 invite URL with the bridge's least-privilege message permissions,
+/// including the separate permission Discord requires for threads.
 pub fn invite(app_id: &str) -> String {
-    format!("https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions=68608")
+    format!(
+        "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions={}",
+        crate::transport::INVITE_PERMISSIONS
+    )
 }
 
 /// Terminal IO. The real implementation talks to stdin/stderr; tests inject
@@ -234,7 +238,12 @@ pub async fn run_wired(
         "channel_id": dm_channel.to_string(),
         "gray_bin": absolutize(Path::new(&gray)).to_string_lossy(),
         "gray_home": gray_home.to_string_lossy(),
-        "workdir": workdir
+        "workdir": workdir,
+        "session_reset": {
+            "mode": "both",
+            "idle_minutes": 1_440,
+            "at_hour": 4
+        }
     });
     if !allowed.is_empty() {
         saved["allowed_users"] = Value::Array(allowed.into_iter().map(Value::String).collect());

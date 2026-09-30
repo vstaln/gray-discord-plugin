@@ -2,7 +2,7 @@
 //! Every failure is a category string; transport/config bodies never surface.
 use serde_json::Value;
 
-use crate::transport::{Rest, HOME_PERMS};
+use crate::transport::{Rest, HOME_PERMS, THREAD_PERMS};
 
 /// Production entry point: checks `config` against the live Discord API.
 pub async fn doctor(config: &Value) -> Result<(), String> {
@@ -47,17 +47,25 @@ pub async fn check(config: &Value, rest: &Rest) -> Result<(), String> {
         .parse()
         .map_err(|_| "channel_id must be a Discord ID".to_string())?;
     let channel = rest.fetch_channel(id).await.map_err(|e| e.to_string())?;
-    // The Python resolves channel overwrites via `permissions_for`; doctor
-    // checks the guild-level grant, which is the actionable diagnostic.
-    if let Some(guild_id) = channel.guild_id {
+    // Resolve the effective channel permissions, including ordered parent and
+    // channel overwrites; Discord's thread rule needs its own send bit.
+    if channel.guild_id.is_some() {
         let perms = rest
-            .guild_member_permissions(&guild_id, &bot_id)
+            .effective_channel_permissions(&channel, &bot_id)
             .await
             .map_err(|e| e.to_string())?;
-        if perms & HOME_PERMS != HOME_PERMS {
-            return Err(
-                "Home channel requires View, Send and Read History permissions".to_string(),
-            );
+        let required = if channel.is_thread() {
+            THREAD_PERMS
+        } else {
+            HOME_PERMS
+        };
+        if perms & required != required {
+            return Err(if channel.is_thread() {
+                "Thread requires View, Read History and Send Messages in Threads permissions"
+                    .to_string()
+            } else {
+                "Home channel requires View, Send and Read History permissions".to_string()
+            });
         }
     }
     println!("Bot token, intent, channel access and local gray configuration verified.");
