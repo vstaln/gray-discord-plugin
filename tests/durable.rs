@@ -170,3 +170,106 @@ fn a_pre_conversation_schedule_keeps_the_configured_home_channel() {
     assert_eq!(row.channel, "legacy-home");
     assert_eq!(row.conversation, "job:old");
 }
+
+#[test]
+fn new_outbox_rows_are_v2_and_component_state_is_single_use() {
+    let (_tmp, store) = store();
+    let token = store
+        .component_state_create("cron_remove", "user", "channel", "job-1", 3600)
+        .unwrap();
+    assert!(!token.contains("job-1"));
+    assert_eq!(
+        store
+            .component_state_take(&token, "user", "channel", "cron_remove")
+            .unwrap()
+            .as_deref(),
+        Some("job-1")
+    );
+    assert!(store
+        .component_state_take(&token, "user", "channel", "cron_remove")
+        .unwrap()
+        .is_none());
+
+    let other = store
+        .component_state_create("cron_remove", "user", "channel", "job-2", 3600)
+        .unwrap();
+    assert!(store
+        .component_state_take(&other, "other-user", "channel", "cron_remove")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .component_state_take(&other, "user", "channel", "cron_remove")
+        .unwrap()
+        .is_none());
+
+    store.enqueue("v2", "42", "question", None, 100).unwrap();
+    let item = store.claim().unwrap().unwrap();
+    store
+        .complete(&item.id, "answer", &serde_json::json!({}))
+        .unwrap();
+    let part = store.next_delivery(0.0).unwrap().unwrap();
+    assert_eq!(part.render.as_deref(), Some("v2"));
+}
+
+#[test]
+fn compiled_document_outbox_survives_and_keeps_wire_shape() {
+    let (_tmp, store) = store();
+    store.enqueue("doc", "42", "question", None, 100).unwrap();
+    let item = store.claim().unwrap().unwrap();
+    store
+        .complete_document(
+            &item.id,
+            &serde_json::json!({
+                "flags": 1 << 17,
+                "components": [{"type": 10, "content": "typed"}]
+            }),
+            &serde_json::json!({"ok": true}),
+        )
+        .unwrap();
+    let part = store.next_delivery(0.0).unwrap().unwrap();
+    assert_eq!(part.render.as_deref(), Some("v2"));
+    assert_eq!(part.document_version, Some(1));
+    let document: serde_json::Value =
+        serde_json::from_str(part.document_json.as_deref().unwrap()).unwrap();
+    assert_eq!(document["components"][0]["type"], 10);
+    assert!(document.get("content").is_none());
+    store.ack(&part.id, part.part, "message").unwrap();
+    assert_eq!(store.get("doc").unwrap().unwrap().state, "sent");
+}
+
+#[test]
+fn pre_v2_databases_gain_missing_columns_on_open() {
+    // The live daemon crash-looped on startup: its queue.sqlite predated the
+    // `render` column, `next_delivery` failed with `no such column`, and the
+    // worker took the whole runtime down with it. Fresh test databases have
+    // every column, so only a legacy-shaped file reproduces it.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("queue.sqlite");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE inbox (
+                id TEXT PRIMARY KEY, channel TEXT NOT NULL, conversation TEXT NOT NULL,
+                prompt TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+                created REAL NOT NULL, error TEXT, receipt TEXT, cancel INTEGER DEFAULT 0,
+                interaction_token TEXT, app_id TEXT);
+             CREATE TABLE outbox (
+                id TEXT NOT NULL, part INTEGER NOT NULL, content TEXT NOT NULL,
+                message_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                next_at REAL NOT NULL DEFAULT 0, error TEXT,
+                PRIMARY KEY(id,part));
+             INSERT INTO inbox(id,channel,conversation,prompt,created)
+                VALUES('1','42','c','hi',1.0);
+             INSERT INTO outbox(id,part,content,next_at)
+                VALUES('1',0,'hello',0.0);",
+        )
+        .unwrap();
+    }
+    let store = Store::new(&path).unwrap();
+    let part = store
+        .next_delivery(9_999_999_999.0)
+        .unwrap()
+        .expect("legacy part must deliver after migration");
+    assert_eq!(part.content, "hello");
+    assert!(part.render.is_none(), "old rows keep the legacy renderer");
+}

@@ -18,6 +18,9 @@ pub struct InboxItem {
     pub cancel: bool,
     pub interaction_token: Option<String>,
     pub app_id: Option<String>,
+    /// Canonical structured input JSON for component turns; `None` keeps
+    /// legacy prompt rows unchanged.
+    pub input_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +36,12 @@ pub struct OutboxPart {
     pub interaction_token: Option<String>,
     /// Application id paired with `interaction_token` for webhook followups.
     pub app_id: Option<String>,
+    /// `Some("v2")` for new Components V2 rows; `None` preserves old rows
+    /// written before the renderer migration.
+    pub render: Option<String>,
+    /// Serialized typed document for new V2 output rows.
+    pub document_json: Option<String>,
+    pub document_version: Option<u32>,
 }
 
 /// One row of the `queue list` view.
@@ -57,11 +66,12 @@ CREATE TABLE IF NOT EXISTS inbox (
     id TEXT PRIMARY KEY, channel TEXT NOT NULL, conversation TEXT NOT NULL,
     prompt TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
     created REAL NOT NULL, error TEXT, receipt TEXT, cancel INTEGER DEFAULT 0,
-    interaction_token TEXT, app_id TEXT);
+    interaction_token TEXT, app_id TEXT, input_json TEXT);
 CREATE TABLE IF NOT EXISTS outbox (
     id TEXT NOT NULL, part INTEGER NOT NULL, content TEXT NOT NULL,
     message_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-    next_at REAL NOT NULL DEFAULT 0, error TEXT,
+    next_at REAL NOT NULL DEFAULT 0, error TEXT, render TEXT,
+    document_json TEXT, document_version INTEGER,
     PRIMARY KEY(id,part));
 CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY, interval INTEGER NOT NULL, prompt TEXT NOT NULL,
@@ -70,6 +80,62 @@ CREATE TABLE IF NOT EXISTS schedules (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS pairings (
     code TEXT PRIMARY KEY, user_id TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS component_states (
+    token TEXT PRIMARY KEY, kind TEXT NOT NULL, user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL, resource_id TEXT NOT NULL,
+    created REAL NOT NULL, expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS ui_component_documents (
+    document_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    guild_id TEXT,
+    channel_id TEXT NOT NULL,
+    message_id TEXT,
+    modal_id TEXT,
+    surface TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ui_component_states (
+    token TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    logical_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    one_shot INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at REAL,
+    FOREIGN KEY(document_id) REFERENCES ui_component_documents(document_id)
+);
+CREATE TABLE IF NOT EXISTS ui_component_events (
+    interaction_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    token TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    conversation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    delivered_at REAL
+);
+CREATE TABLE IF NOT EXISTS ui_component_files (
+    file_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    ref_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ui_component_states_document_idx
+    ON ui_component_states(document_id, expires_at);
+CREATE INDEX IF NOT EXISTS ui_component_events_document_idx
+    ON ui_component_events(document_id, created_at);
 ";
 
 fn connect(path: &Path) -> Result<Connection, String> {
@@ -89,6 +155,8 @@ fn connect(path: &Path) -> Result<Connection, String> {
         .map_err(|_| "cannot open queue".to_string())?;
     conn.execute_batch("PRAGMA synchronous=FULL")
         .map_err(|_| "cannot open queue".to_string())?;
+    conn.execute_batch("PRAGMA foreign_keys=ON")
+        .map_err(|_| "cannot open queue".to_string())?;
     conn.execute_batch(SCHEMA)
         .map_err(|_| "cannot open queue".to_string())?;
     // Migrate pre-slash databases that lack the followup columns.
@@ -104,6 +172,29 @@ fn connect(path: &Path) -> Result<Connection, String> {
             }
         }
     }
+    // Migrate pre-V2 databases without changing the renderer of old rows.
+    // Every column in SCHEMA that an old database may lack belongs here:
+    // `render` was missed once and the live daemon crash-looped on
+    // `next_delivery` (`no such column: o.render`) while all tests, which
+    // build fresh databases, stayed green.
+    for (table, column) in [
+        ("inbox", "input_json TEXT"),
+        ("outbox", "render TEXT"),
+        ("outbox", "document_json TEXT"),
+        ("outbox", "document_version INTEGER"),
+    ] {
+        let name = column.split_whitespace().next().unwrap_or(column);
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column}");
+        match conn.execute_batch(&sql) {
+            Ok(()) => {}
+            Err(e) => {
+                if !e.to_string().contains(name) {
+                    return Err("cannot migrate queue".to_string());
+                }
+            }
+        }
+    }
+
     // Migrate pre-slash databases whose schedules carried no target.
     for col in [
         "channel TEXT NOT NULL DEFAULT ''",
@@ -128,7 +219,7 @@ fn connect(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn with_conn<T>(
+pub(crate) fn with_conn<T>(
     path: &Path,
     f: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
@@ -161,6 +252,7 @@ fn row_item(r: &rusqlite::Row) -> Result<InboxItem, rusqlite::Error> {
         cancel: r.get::<_, i64>("cancel")? != 0,
         interaction_token: r.get("interaction_token")?,
         app_id: r.get("app_id")?,
+        input_json: r.get("input_json")?,
     })
 }
 
@@ -196,34 +288,55 @@ impl Store {
         if prompt.trim().is_empty() || prompt.len() > 32000 {
             return Err("Prompt must contain 1–32000 characters".to_string());
         }
+        let conv = conversation
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chat:{channel}"));
         with_conn(&self.path, |db| {
-            let dup: bool = db
-                .query_row("SELECT 1 FROM inbox WHERE id=?1", params![id], |_| Ok(true))
-                .optional_str()?
-                .is_some();
-            if dup {
-                return Ok(false);
-            }
-            let pending: i64 = db
-                .query_row(
-                    "SELECT count(*) FROM inbox WHERE state IN ('queued','running','delivery')",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| "cannot enqueue".to_string())?;
-            if pending >= capacity as i64 {
-                return Err("Queue is full; message was not accepted".to_string());
-            }
-            let conv = conversation
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("chat:{channel}"));
-            let now = now_secs();
-            db.execute(
-                "INSERT INTO inbox(id,channel,conversation,prompt,created) VALUES(?1,?2,?3,?4,?5)",
-                params![id, channel, conv, prompt, now],
+            enqueue_in_tx(
+                db,
+                EnqueueRequest {
+                    id,
+                    channel,
+                    conversation: &conv,
+                    prompt,
+                    input_json: None,
+                    interaction_token: None,
+                    app_id: None,
+                    capacity,
+                },
             )
-            .map_err(|_| "cannot enqueue".to_string())?;
-            Ok(true)
+        })
+    }
+
+    /// Enqueue a validated structured input without turning it into prompt
+    /// prose. The canonical JSON remains available to the native runner.
+    pub fn enqueue_component_json(
+        &self,
+        id: &str,
+        channel: &str,
+        conversation: &str,
+        input_json: &Value,
+        capacity: u64,
+    ) -> Result<bool, String> {
+        if !input_json.is_object() {
+            return Err("Structured input must be an object".to_string());
+        }
+        let encoded = serde_json::to_string(input_json)
+            .map_err(|_| "cannot encode structured input".to_string())?;
+        with_conn(&self.path, |db| {
+            enqueue_in_tx(
+                db,
+                EnqueueRequest {
+                    id,
+                    channel,
+                    conversation,
+                    prompt: "component_event",
+                    input_json: Some(&encoded),
+                    interaction_token: None,
+                    app_id: None,
+                    capacity,
+                },
+            )
         })
     }
 
@@ -308,11 +421,50 @@ impl Store {
             }
             for (part, chunk) in capped.iter().enumerate() {
                 db.execute(
-                    "INSERT INTO outbox(id,part,content) VALUES(?1,?2,?3)",
+                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'v2',NULL,NULL)",
                     params![id, part as i64, chunk],
                 )
                 .map_err(|_| "cannot complete".to_string())?;
             }
+            Ok(())
+        })
+    }
+
+    /// Complete a turn with a precompiled V2 document. The document is kept
+    /// as JSON in the durable row so delivery can resume after a restart;
+    /// callers must run it through the compiler before calling this method.
+    pub fn complete_document(
+        &self,
+        id: &str,
+        document: &Value,
+        receipt: &Value,
+    ) -> Result<(), String> {
+        if !document.is_object()
+            || document
+                .get("components")
+                .and_then(Value::as_array)
+                .is_none()
+        {
+            return Err("compiled document is invalid".to_string());
+        }
+        let encoded = serde_json::to_string(document)
+            .map_err(|_| "cannot encode compiled document".to_string())?;
+        with_conn(&self.path, |db| {
+            let updated = db.execute(
+                "UPDATE inbox SET state='delivery',error=NULL,receipt=?1 WHERE id=?2 AND state='running'",
+                params![receipt.to_string(), id],
+            ).map_err(|_| "cannot complete document".to_string())?;
+            if updated == 0 {
+                return Err("Item is not running".to_string());
+            }
+            db.execute("DELETE FROM outbox WHERE id=?1", params![id])
+                .map_err(|_| "cannot replace document output".to_string())?;
+            db.execute(
+                "INSERT INTO outbox(id,part,content,render,document_json,document_version)
+                 VALUES(?1,0,'','v2',?2,1)",
+                params![id, encoded],
+            )
+            .map_err(|_| "cannot store compiled document".to_string())?;
             Ok(())
         })
     }
@@ -331,7 +483,7 @@ impl Store {
             )
             .map_err(|_| "cannot fail".to_string())?;
             db.execute(
-                "INSERT OR IGNORE INTO outbox(id,part,content) VALUES(?1,0,?2)",
+                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,0,?2,'v2',NULL,NULL)",
                 params![id, notice],
             )
             .map_err(|_| "cannot fail".to_string())?;
@@ -359,12 +511,12 @@ impl Store {
     pub fn next_delivery(&self, now: f64) -> Result<Option<OutboxPart>, String> {
         with_conn(&self.path, |db| {
             db.query_row(
-                "SELECT o.id,o.part,o.content,i.channel,o.attempts,i.interaction_token,i.app_id FROM outbox o JOIN inbox i ON i.id=o.id
+                "SELECT o.id,o.part,o.content,i.channel,o.attempts,i.interaction_token,i.app_id,o.render,o.document_json,o.document_version FROM outbox o JOIN inbox i ON i.id=o.id
                  WHERE message_id IS NULL AND next_at<=?1 AND NOT EXISTS
                  (SELECT 1 FROM outbox p WHERE p.id=o.id AND p.part<o.part AND p.message_id IS NULL)
                  ORDER BY i.created,o.part LIMIT 1",
                 params![now],
-                |r| Ok(OutboxPart { id: r.get(0)?, part: r.get(1)?, content: r.get(2)?, channel: r.get(3)?, attempts: r.get(4)?, interaction_token: r.get(5)?, app_id: r.get(6)? }),
+                |r| Ok(OutboxPart { id: r.get(0)?, part: r.get(1)?, content: r.get(2)?, channel: r.get(3)?, attempts: r.get(4)?, interaction_token: r.get(5)?, app_id: r.get(6)?, render: r.get(7)?, document_json: r.get(8)?, document_version: r.get(9)? }),
             ).optional_str()
         })
     }
@@ -476,6 +628,86 @@ impl Store {
                 return Err("Schedule not found".to_string());
             }
             Ok(())
+        })
+    }
+
+    /// Create an opaque, expiring state token for an interactive component.
+    /// The resource id stays in SQLite; it is never placed in `custom_id`.
+    pub fn component_state_create(
+        &self,
+        kind: &str,
+        user_id: &str,
+        channel_id: &str,
+        resource_id: &str,
+        ttl_secs: u64,
+    ) -> Result<String, String> {
+        if kind.trim().is_empty()
+            || user_id.trim().is_empty()
+            || channel_id.trim().is_empty()
+            || resource_id.trim().is_empty()
+        {
+            return Err("Component state fields must not be empty".to_string());
+        }
+        let token = uuid_hex();
+        let now = now_secs();
+        let expires = now + ttl_secs.clamp(60, 86_400) as f64;
+        with_conn(&self.path, |db| {
+            db.execute(
+                "DELETE FROM component_states WHERE expires < ?1",
+                params![now],
+            )
+            .map_err(|_| "cannot prune component state".to_string())?;
+            db.execute(
+                "INSERT INTO component_states(token,kind,user_id,channel_id,resource_id,created,expires)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![token, kind, user_id, channel_id, resource_id, now, expires],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store component state".to_string())
+        })?;
+        Ok(token)
+    }
+
+    /// Consume a component token only for its original user, channel, and
+    /// action kind. Expired and mismatched tokens are removed/fail closed.
+    pub fn component_state_take(
+        &self,
+        token: &str,
+        user_id: &str,
+        channel_id: &str,
+        kind: &str,
+    ) -> Result<Option<String>, String> {
+        let now = now_secs();
+        with_conn(&self.path, |db| {
+            let row: Option<(String, String, String, String, f64)> = db
+                .query_row(
+                    "SELECT kind,user_id,channel_id,resource_id,expires
+                     FROM component_states WHERE token=?1",
+                    params![token],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional_str()?;
+            let Some((stored_kind, stored_user, stored_channel, resource, expires)) = row else {
+                return Ok(None);
+            };
+            let valid = expires >= now
+                && stored_kind == kind
+                && stored_user == user_id
+                && stored_channel == channel_id;
+            if valid {
+                db.execute(
+                    "DELETE FROM component_states WHERE token=?1",
+                    params![token],
+                )
+                .map_err(|_| "cannot consume component state".to_string())?;
+            } else {
+                db.execute(
+                    "DELETE FROM component_states WHERE token=?1",
+                    params![token],
+                )
+                .map_err(|_| "cannot remove component state".to_string())?;
+            }
+            Ok(valid.then_some(resource))
         })
     }
 
@@ -749,6 +981,57 @@ pub fn now_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+pub(crate) struct EnqueueRequest<'a> {
+    pub id: &'a str,
+    pub channel: &'a str,
+    pub conversation: &'a str,
+    pub prompt: &'a str,
+    pub input_json: Option<&'a str>,
+    pub interaction_token: Option<&'a str>,
+    pub app_id: Option<&'a str>,
+    pub capacity: u64,
+}
+
+pub(crate) fn enqueue_in_tx(db: &Connection, request: EnqueueRequest<'_>) -> Result<bool, String> {
+    let dup: bool = db
+        .query_row(
+            "SELECT 1 FROM inbox WHERE id=?1",
+            params![request.id],
+            |_| Ok(true),
+        )
+        .optional_str()?
+        .is_some();
+    if dup {
+        return Ok(false);
+    }
+    let pending: i64 = db
+        .query_row(
+            "SELECT count(*) FROM inbox WHERE state IN ('queued','running','delivery')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| "cannot enqueue".to_string())?;
+    if pending >= request.capacity as i64 {
+        return Err("Queue is full; message was not accepted".to_string());
+    }
+    db.execute(
+        "INSERT INTO inbox(id,channel,conversation,prompt,created,input_json,interaction_token,app_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            request.id,
+            request.channel,
+            request.conversation,
+            request.prompt,
+            now_secs(),
+            request.input_json,
+            request.interaction_token,
+            request.app_id
+        ],
+    )
+    .map_err(|_| "cannot enqueue".to_string())?;
+    Ok(true)
 }
 
 trait OptionalStr<T> {
