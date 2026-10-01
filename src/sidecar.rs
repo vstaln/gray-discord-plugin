@@ -469,10 +469,12 @@ fn import_file(params: &Value, config_path: &Path) -> Value {
                 Ok(file) => json!({
                     "content": format!(
                         "Imported a private managed Discord file. file_id={} ({}). \
-                         Show it with a discord_send_ui component like \
-                         {{\"type\": \"media_gallery\", \"items\": [{{\"media\": \
-                         {{\"kind\": \"file\", \"file_id\": \"{}\"}}}}]}}.",
-                        file.id, file.name, file.id
+                         Images and mp4: {{\"type\": \"media_gallery\", \"items\": \
+                         [{{\"media\": {{\"kind\": \"file\", \"file_id\": \"{}\"}}}}]}}. \
+                         Anything else (pdf, audio, text, archives): {{\"type\": \"file\", \
+                         \"media\": {{\"kind\": \"file\", \"file_id\": \"{}\"}}}} — a media \
+                         gallery only draws images and video.",
+                        file.id, file.name, file.id, file.id
                     ),
                     "file": {
                         "file_id": file.id,
@@ -646,6 +648,7 @@ fn ui_schema(params: &Value) -> Value {
         "notes": [
             "interactive controls belong inside action_row",
             "file_id values come only from discord_file",
+            "a media_gallery item must be image/* or video/*; any other media needs a file component",
             "custom_id and Discord numeric type values are compiler-owned"
         ]
     });
@@ -670,12 +673,24 @@ fn collect_file_refs(
     ids.dedup();
     ids.into_iter()
         .map(|id| {
-            files.metadata(owner, &id).map(|metadata| FileRef {
-                id: metadata.id,
-                name: metadata.name,
-                media_type: metadata.media_type,
-                size: metadata.size,
-                sha256: metadata.sha256,
+            files.metadata(owner, &id).and_then(|metadata| {
+                // Managed media is retained for an hour. Expiry used to surface
+                // from the upload as a redacted transport error, so the model
+                // was told to run doctor over its own stale id; name it here,
+                // where re-importing is the whole fix.
+                if metadata.expires_at < crate::durable::now_secs() {
+                    return Err(format!(
+                        "managed file {} expired; import it again with discord_file",
+                        metadata.name
+                    ));
+                }
+                Ok(FileRef {
+                    id: metadata.id,
+                    name: metadata.name,
+                    media_type: metadata.media_type,
+                    size: metadata.size,
+                    sha256: metadata.sha256,
+                })
             })
         })
         .collect()
