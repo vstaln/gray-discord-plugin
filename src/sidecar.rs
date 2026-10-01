@@ -431,7 +431,13 @@ fn import_file(params: &Value, config_path: &Path) -> Value {
             };
             match files.import_generated(owner, Path::new(path)) {
                 Ok(file) => json!({
-                    "content": "Imported a private managed Discord file.",
+                    "content": format!(
+                        "Imported a private managed Discord file. file_id={} ({}). \
+                         Reference it in a discord_send_ui document as \
+                         {{\"kind\": \"file\", \"file_id\": \"{}\"}} inside a \
+                         media_gallery item or a file component.",
+                        file.id, file.name, file.id
+                    ),
                     "file": {
                         "file_id": file.id,
                         "name": file.name,
@@ -563,7 +569,7 @@ fn ui_schema(params: &Value) -> Value {
             {"type": 11}, {"type": 12}, {"type": 13}, {"type": 14}, {"type": 17}
         ])
     };
-    json!({
+    let mut reply = json!({
         "protocol": "gray.discord.ui",
         "version": 1,
         "surface": surface,
@@ -581,7 +587,13 @@ fn ui_schema(params: &Value) -> Value {
             "file_id values come only from discord_file",
             "custom_id and Discord numeric type values are compiler-owned"
         ]
-    })
+    });
+    // The tool protocol requires `content`, and gray hands the model only that
+    // field. Without it the host rejects the whole reply, so the schema is
+    // unreachable exactly when someone asks for it.
+    let rendered = serde_json::to_string_pretty(&reply).unwrap_or_default();
+    reply["content"] = json!(format!("{surface} surface schema:\n{rendered}"));
+    reply
 }
 
 fn collect_file_refs(
