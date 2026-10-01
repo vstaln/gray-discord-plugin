@@ -78,6 +78,50 @@ fn is_error() -> Value {
     })
 }
 
+/// A document or file the model can fix. Nothing reached Discord, and the
+/// reason names only the model's own input (never config or token text), so
+/// it is safe to hand back. "Delivery failed" sent the model to `doctor` for
+/// what was a typo in its own document.
+fn rejected(reason: impl std::fmt::Display) -> Value {
+    json!({
+        "content": format!(
+            "Not sent: {reason}. Nothing reached Discord; fix it and call again \
+             (discord_ui_schema shows the document shape)."
+        ),
+        "is_error": true
+    })
+}
+
+/// Parse a model-authored document. The tool already names the surface, so a
+/// missing `surface` tag is filled in rather than rejected.
+fn parse_document(document: &Value, surface: &str) -> Result<DocumentRequest, Value> {
+    let mut document = document.clone();
+    if let Some(map) = document.as_object_mut() {
+        map.entry("surface").or_insert_with(|| json!(surface));
+    }
+    if has_numeric_type(&document) {
+        return Err(rejected(
+            "component `type` is a name like \"text\", \"media_gallery\" or \"file\", \
+             never a Discord number",
+        ));
+    }
+    serde_json::from_value(json!({"document": document, "origin": "agent"}))
+        .map_err(|e| rejected(format!("invalid document: {e}")))
+}
+
+/// serde reads a numeric enum tag as the *variant index*, so Discord's
+/// `"type": 12` (media gallery) silently parsed as our 12th variant, a
+/// separator. Numbers are refused instead of reinterpreted.
+fn has_numeric_type(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("type").is_some_and(Value::is_number) || map.values().any(has_numeric_type)
+        }
+        Value::Array(items) => items.iter().any(has_numeric_type),
+        _ => false,
+    }
+}
+
 /// Dispatch one protocol method. Never echoes config/token text: every
 /// failure path returns the fixed `is_error` shape above.
 pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value {
@@ -181,16 +225,15 @@ async fn send_ui(params: &Value, config_path: &Path) -> Value {
     {
         return is_error();
     }
-    let request: DocumentRequest =
-        match serde_json::from_value(json!({"document": document, "origin": "agent"})) {
-            Ok(request) => request,
-            Err(_) => return is_error(),
-        };
+    let request = match parse_document(document, "message") {
+        Ok(request) => request,
+        Err(reply) => return reply,
+    };
     if request.origin != Origin::Agent {
         return is_error();
     }
     if matches!(request.document, UiDocument::Modal(_)) {
-        return is_error();
+        return rejected("a modal opens with discord_open_modal, not discord_send_ui");
     }
     let files = match FileStore::new(
         store.clone(),
@@ -201,22 +244,19 @@ async fn send_ui(params: &Value, config_path: &Path) -> Value {
         Err(_) => return is_error(),
     };
     let document_id = request.document.document_id().0.clone();
-    if store
-        .create_document(crate::component_state::NewDocument {
-            document_id: document_id.clone(),
-            owner_id: owner.to_string(),
-            guild_id: None,
-            channel_id: channel.to_string(),
-            message_id: None,
-            modal_id: None,
-            surface: "message".to_string(),
-            revision: 1,
-            protocol_version: 1,
-            ttl_secs: 3600,
-        })
-        .is_err()
-    {
-        return is_error();
+    if let Err(e) = store.create_document(crate::component_state::NewDocument {
+        document_id: document_id.clone(),
+        owner_id: owner.to_string(),
+        guild_id: None,
+        channel_id: channel.to_string(),
+        message_id: None,
+        modal_id: None,
+        surface: "message".to_string(),
+        revision: 1,
+        protocol_version: 1,
+        ttl_secs: 3600,
+    }) {
+        return rejected(e);
     }
     let mut allocator = StoreAllocator::new(&store, &files, &document_id, owner.clone(), channel);
     allocator.one_shot = !matches!(
@@ -248,14 +288,14 @@ async fn send_ui(params: &Value, config_path: &Path) -> Value {
     };
     let compiled = match compiled {
         Ok(compiled) => compiled,
-        Err(_) => {
+        Err(e) => {
             let _ = store.invalidate_document(&document_id);
-            return is_error();
+            return rejected(e);
         }
     };
     let file_refs = match collect_file_refs(&request.document, &files, &owner) {
         Ok(refs) => refs,
-        Err(_) => return is_error(),
+        Err(e) => return rejected(e),
     };
     let rest = crate::transport::Rest::production(token);
     let result = if args.get("interaction_id").and_then(Value::as_str).is_some() {
@@ -329,16 +369,15 @@ async fn open_modal(params: &Value, config_path: &Path) -> Value {
     let (Some(interaction_token), Some(_app_id)) = (item.interaction_token, item.app_id) else {
         return is_error();
     };
-    let request: DocumentRequest =
-        match serde_json::from_value(json!({"document": document, "origin": "agent"})) {
-            Ok(request) => request,
-            Err(_) => return is_error(),
-        };
+    let request = match parse_document(document, "modal") {
+        Ok(request) => request,
+        Err(reply) => return reply,
+    };
     if request.origin != Origin::Agent {
         return is_error();
     }
     let UiDocument::Modal(modal) = &request.document else {
-        return is_error();
+        return rejected("discord_open_modal takes a modal document (surface \"modal\")");
     };
     let document_id = request.document.document_id().0.clone();
     if store
@@ -377,7 +416,7 @@ async fn open_modal(params: &Value, config_path: &Path) -> Value {
         &mut CompileContext::new(Origin::Agent, &mut allocator),
     ) {
         Ok(compiled) => compiled,
-        Err(_) => return is_error(),
+        Err(e) => return rejected(e),
     };
     let rest = crate::transport::Rest::production(token);
     match rest
@@ -412,11 +451,8 @@ fn import_file(params: &Value, config_path: &Path) -> Value {
         Ok(store) => store,
         Err(_) => return is_error(),
     };
-    let files = match FileStore::new(
-        store,
-        parent.join("media"),
-        std::env::current_dir().unwrap_or_else(|_| parent.to_path_buf()),
-    ) {
+    let files_root = std::env::current_dir().unwrap_or_else(|_| parent.to_path_buf());
+    let files = match FileStore::new(store, parent.join("media"), files_root.clone()) {
         Ok(files) => files,
         Err(_) => return is_error(),
     };
@@ -433,9 +469,9 @@ fn import_file(params: &Value, config_path: &Path) -> Value {
                 Ok(file) => json!({
                     "content": format!(
                         "Imported a private managed Discord file. file_id={} ({}). \
-                         Reference it in a discord_send_ui document as \
-                         {{\"kind\": \"file\", \"file_id\": \"{}\"}} inside a \
-                         media_gallery item or a file component.",
+                         Show it with a discord_send_ui component like \
+                         {{\"type\": \"media_gallery\", \"items\": [{{\"media\": \
+                         {{\"kind\": \"file\", \"file_id\": \"{}\"}}}}]}}.",
                         file.id, file.name, file.id
                     ),
                     "file": {
@@ -446,7 +482,10 @@ fn import_file(params: &Value, config_path: &Path) -> Value {
                         "sha256": file.sha256
                     }
                 }),
-                Err(_) => is_error(),
+                Err(e) => rejected(format!(
+                    "{e}; save generated files under {} and import that path",
+                    files_root.display()
+                )),
             }
         }
         "metadata" => {
@@ -562,18 +601,40 @@ fn ui_schema(params: &Value) -> Value {
             {"type": "action_row", "required": ["children"], "max_items": 5}
         ])
     } else {
+        // `type` is always one of these names: the numeric Discord codes are
+        // compiler-owned, and listing them here taught the model to send them.
         json!([
-            {"type": "action_row", "required": ["children"], "max_items": 5, "child_types": [2, 3, 5, 6, 7, 8]},
             {"type": "text", "required": ["content"]},
-            {"type": "section", "required": ["children", "accessory"]},
-            {"type": 11}, {"type": 12}, {"type": 13}, {"type": 14}, {"type": 17}
+            {"type": "action_row", "required": ["children"], "max_items": 5,
+             "child_types": ["button", "string_select", "user_select", "role_select", "mentionable_select", "channel_select"]},
+            {"type": "button", "required": ["style"], "optional": ["logical_id", "label", "url", "emoji", "disabled"],
+             "style": ["primary", "secondary", "success", "danger", "link"]},
+            {"type": "string_select", "required": ["logical_id", "options"], "option": {"required": ["label", "value"]}},
+            {"type": "section", "required": ["children", "accessory"], "children": "text components",
+             "accessory": "a button or a thumbnail"},
+            {"type": "thumbnail", "required": ["media"]},
+            {"type": "media_gallery", "required": ["items"], "item": {"required": ["media"], "optional": ["description", "spoiler"]}},
+            {"type": "file", "required": ["media"], "optional": ["name"]},
+            {"type": "separator", "optional": ["divider", "spacing"]},
+            {"type": "container", "required": ["components"], "optional": ["accent_color", "spoiler"]}
         ])
     };
     let mut reply = json!({
         "protocol": "gray.discord.ui",
         "version": 1,
         "surface": surface,
-        "document": {"version": 1, "document_id": "stable logical id", "components": components},
+        "document": {"surface": surface, "version": 1, "document_id": "stable logical id", "components": components},
+        "media": [
+            {"kind": "file", "file_id": "from discord_file import"},
+            {"kind": "remote", "url": "https://…"}
+        ],
+        "example": if surface == "modal" { Value::Null } else { json!({
+            "surface": "message", "version": 1, "document_id": "plunger-1",
+            "components": [
+                {"type": "text", "content": "here it is"},
+                {"type": "media_gallery", "items": [{"media": {"kind": "file", "file_id": "<id>"}}]}
+            ]
+        }) },
         "limits": {
             "max_components": 40,
             "max_action_row_items": 5,
@@ -699,5 +760,41 @@ pub fn serve(config_path: &Path) -> ! {
         if out.flush().is_err() {
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe the model sent: valid in every field but the `surface` tag,
+    /// which the tool already implies.
+    #[test]
+    fn a_document_without_surface_parses_for_its_tool() {
+        let probe = json!({
+            "components": [{"type": "text", "content": "probe: ui path"}],
+            "document_id": "probe-1",
+            "version": 1
+        });
+        let request = parse_document(&probe, "message").expect("parses");
+        assert!(matches!(request.document, UiDocument::Message(_)));
+        // An explicit tag still wins, so a modal sent to send_ui stays a modal.
+        let modal = json!({"surface": "modal", "title": "t", "components": [],
+                           "document_id": "m", "version": 1});
+        let request = parse_document(&modal, "message").expect("parses");
+        assert!(matches!(request.document, UiDocument::Modal(_)));
+    }
+
+    /// `"type": 12` is Discord's media gallery but our 12th variant is a
+    /// separator; it must be refused, not reinterpreted.
+    #[test]
+    fn a_numeric_component_type_is_refused() {
+        let doc = json!({"version": 1, "document_id": "d",
+                         "components": [{"type": 12}]});
+        let reply = parse_document(&doc, "message").expect_err("refused");
+        assert!(reply["content"]
+            .as_str()
+            .unwrap()
+            .contains("never a Discord number"));
     }
 }
