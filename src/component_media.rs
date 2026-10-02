@@ -456,13 +456,18 @@ fn allowed_media_type(value: &str) -> bool {
             | "application/pdf"
             | "application/json"
             | "application/octet-stream"
+            | "text/csv"
+            | "application/zip"
             | "video/mp4"
+            | "video/webm"
+            | "video/quicktime"
             | "audio/mpeg"
             | "audio/ogg"
+            | "audio/wav"
     )
 }
 
-fn infer_media_type(name: &str) -> &'static str {
+pub fn infer_media_type(name: &str) -> &'static str {
     match name
         .rsplit('.')
         .next()
@@ -478,9 +483,14 @@ fn infer_media_type(name: &str) -> &'static str {
         "md" => "text/markdown",
         "pdf" => "application/pdf",
         "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
         "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
         "mp3" => "audio/mpeg",
         "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
         _ => "application/octet-stream",
     }
 }

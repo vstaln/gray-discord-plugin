@@ -1,0 +1,352 @@
+//! Hermes-style `MEDIA:<path>` delivery for ordinary replies.
+//!
+//! The agent writes `MEDIA:/abs/path/chart.png` anywhere in its answer; the
+//! gateway strips the tag, uploads the file, and posts it as a Components V2
+//! message: images and videos in one media gallery, everything else as file
+//! cards. Tags that cannot be delivered (missing file, blocked path, unknown
+//! location) are left in the text so nothing silently disappears.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+
+/// Discord's attachment cap per message.
+pub const MAX_UPLOADS_PER_MESSAGE: usize = 10;
+/// Upper bound per file; servers without boosts reject earlier and the
+/// transport reports that as a 413.
+pub const MAX_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Upload {
+    pub name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Upload {
+    pub fn is_visual(&self) -> bool {
+        self.media_type.starts_with("image/") || self.media_type.starts_with("video/")
+    }
+}
+
+/// Split `text` into its prose and the deliverable files its `MEDIA:` tags
+/// name. Relative paths resolve against `cwd`.
+pub fn extract(text: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
+    let mut out = String::with_capacity(text.len());
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("MEDIA:") {
+        let (before, after) = rest.split_at(at);
+        let body = &after["MEDIA:".len()..];
+        let trimmed = body.trim_start_matches([' ', '\t']);
+        let end = trimmed
+            .find(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\'')
+            .unwrap_or(trimmed.len());
+        let end = trimmed[..end].find("MEDIA:").unwrap_or(end);
+        let raw = trimmed[..end]
+            .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '*', '_', '!', '?']);
+        let consumed = body.len() - trimmed.len() + end;
+        match resolve(raw, cwd).and_then(|path| deliverable(&path).ok()) {
+            Some(path) => {
+                // Drop markdown emphasis or code ticks wrapped around the tag.
+                out.push_str(before.trim_end_matches(['*', '_', '`']));
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+                rest = body[consumed..].trim_start_matches(['*', '_', '`']);
+            }
+            None => {
+                out.push_str(before);
+                out.push_str("MEDIA:");
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    (tidy(&out), paths)
+}
+
+fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.strip_prefix("file://").unwrap_or(raw);
+    let path = if let Some(home_relative) = raw.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(home_relative)
+    } else {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+    Some(path)
+}
+
+/// A path may be delivered when it is a regular, bounded file that is not a
+/// credential or configuration secret.
+pub fn deliverable(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| format!("{} does not exist", path.display()))?;
+    let metadata = std::fs::metadata(&canonical).map_err(|_| "file cannot be read".to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", canonical.display()));
+    }
+    if metadata.len() == 0 {
+        return Err(format!("{} is empty", canonical.display()));
+    }
+    if metadata.len() > MAX_UPLOAD_BYTES {
+        return Err(format!("{} is larger than 25 MiB", canonical.display()));
+    }
+    if is_sensitive(&canonical) {
+        return Err(format!(
+            "{} looks like a credential or config file and is never uploaded",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn is_sensitive(path: &Path) -> bool {
+    const DIRS: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".password-store",
+        "keyrings",
+    ];
+    // Gray's own state directories hold tokens and sessions; only the
+    // per-conversation `work` directory inside them is the agent's output.
+    const FILES: &[&str] = &[
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+        "credentials",
+        "credentials.json",
+        "config.json",
+        "auth.json",
+        "token",
+        "tokens.json",
+        "secrets.json",
+        "queue.sqlite",
+    ];
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let Some(name) = components.last() else {
+        return true;
+    };
+    if components.iter().any(|part| DIRS.contains(&part.as_str())) {
+        return true;
+    }
+    let in_gray_state = components
+        .iter()
+        .any(|part| part == "gray-discord" || part == ".gray");
+    if in_gray_state && !components.iter().any(|part| part == "work") {
+        return true;
+    }
+    if FILES.contains(&name.as_str()) || name.starts_with(".env") {
+        return true;
+    }
+    name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx")
+}
+
+/// Read deliverable files into uploads with unique, Discord-safe names.
+pub fn load(paths: &[PathBuf]) -> Vec<Upload> {
+    let mut used: Vec<String> = Vec::new();
+    let mut uploads = Vec::new();
+    for path in paths {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let original = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let mut name = safe_name(original);
+        if used.contains(&name) {
+            let (stem, ext) = match name.rsplit_once('.') {
+                Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
+                None => (name.clone(), String::new()),
+            };
+            let mut index = 2;
+            while used.contains(&format!("{stem}-{index}{ext}")) {
+                index += 1;
+            }
+            name = format!("{stem}-{index}{ext}");
+        }
+        used.push(name.clone());
+        uploads.push(Upload {
+            media_type: crate::component_media::infer_media_type(&name).to_string(),
+            name,
+            bytes,
+        });
+    }
+    uploads
+}
+
+fn safe_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Components for one batch of uploads (at most ten): visuals in a single
+/// gallery, other files as file cards, with an optional caption on top.
+pub fn components(uploads: &[Upload], caption: Option<&str>) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(caption) = caption.map(str::trim).filter(|caption| !caption.is_empty()) {
+        let caption: String = caption.chars().take(2000).collect();
+        out.push(json!({"type": 10, "content": caption}));
+    }
+    let visuals: Vec<Value> = uploads
+        .iter()
+        .filter(|upload| upload.is_visual())
+        .map(|upload| json!({"media": {"url": format!("attachment://{}", upload.name)}}))
+        .collect();
+    if !visuals.is_empty() {
+        out.push(json!({"type": 12, "items": visuals}));
+    }
+    for upload in uploads.iter().filter(|upload| !upload.is_visual()) {
+        out.push(json!({"type": 13, "file": {"url": format!("attachment://{}", upload.name)}}));
+    }
+    out
+}
+
+fn tidy(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut out = Vec::new();
+    let mut blank = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim_start_matches('\n').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tags_are_stripped_only_when_deliverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("chart.png");
+        std::fs::write(&image, b"png").unwrap();
+        let text = format!(
+            "Here you go:\n**MEDIA:{}**\nand MEDIA:/nope/missing.png stays.",
+            image.display()
+        );
+        let (prose, paths) = extract(&text, dir.path());
+        assert_eq!(paths, vec![image.canonicalize().unwrap()]);
+        assert!(!prose.contains("chart.png"), "{prose}");
+        assert!(prose.contains("MEDIA:/nope/missing.png"), "{prose}");
+        assert!(prose.starts_with("Here you go:"));
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("report.pdf"), b"%PDF").unwrap();
+        let (prose, paths) = extract("Report: MEDIA:report.pdf.", dir.path());
+        assert_eq!(paths.len(), 1);
+        assert_eq!(prose, "Report:");
+    }
+
+    #[test]
+    fn secrets_are_never_deliverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join(".env"), b"KEY=1").unwrap();
+        std::fs::write(dir.path().join("server.pem"), b"x").unwrap();
+        let state = dir.path().join("gray-discord");
+        std::fs::create_dir_all(state.join("conversations/abc/work")).unwrap();
+        std::fs::write(state.join("config.json"), b"{}").unwrap();
+        std::fs::write(state.join("notes.md"), b"x").unwrap();
+        std::fs::write(state.join("conversations/abc/work/out.png"), b"x").unwrap();
+        let (_, paths) = extract(
+            "MEDIA:gray-discord/conversations/abc/work/out.png",
+            dir.path(),
+        );
+        assert_eq!(paths.len(), 1, "conversation work output is deliverable");
+        for name in [
+            ".ssh/notes.txt",
+            ".env",
+            "server.pem",
+            "gray-discord/notes.md",
+        ] {
+            let (_, paths) = extract(&format!("MEDIA:{name}"), dir.path());
+            assert!(paths.is_empty(), "{name} must not be delivered");
+        }
+    }
+
+    #[test]
+    fn visuals_share_a_gallery_and_files_get_cards() {
+        let uploads = vec![
+            Upload {
+                name: "a.png".into(),
+                media_type: "image/png".into(),
+                bytes: vec![1],
+            },
+            Upload {
+                name: "b.pdf".into(),
+                media_type: "application/pdf".into(),
+                bytes: vec![1],
+            },
+        ];
+        let components = components(&uploads, Some("Results"));
+        crate::render::validate_components(&components).unwrap();
+        assert_eq!(components[1]["type"], 12);
+        assert_eq!(components[2]["file"]["url"], "attachment://b.pdf");
+    }
+
+    #[test]
+    fn duplicate_names_are_made_unique() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        std::fs::write(one.path().join("x.png"), b"1").unwrap();
+        std::fs::write(two.path().join("x.png"), b"2").unwrap();
+        let uploads = load(&[one.path().join("x.png"), two.path().join("x.png")]);
+        assert_eq!(uploads[0].name, "x.png");
+        assert_eq!(uploads[1].name, "x-2.png");
+    }
+}

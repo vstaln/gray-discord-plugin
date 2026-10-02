@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 
 use gray_discord::component_media::FileStore;
@@ -62,4 +64,56 @@ async fn remote_private_hosts_are_rejected_and_multipart_part_is_available() {
         .import_bytes("user-1", "ok.png", "image/png", b"png")
         .unwrap();
     assert!(files.multipart_part("user-1", &file.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn media_uploads_post_a_v2_gallery_with_attachment_metadata() {
+    let stub = common::Stub::start().await;
+    let rest = gray_discord::transport::Rest::new(&stub.base, "TESTTOKEN");
+    let uploads = vec![
+        gray_discord::media_tags::Upload {
+            name: "chart.png".into(),
+            media_type: "image/png".into(),
+            bytes: b"png".to_vec(),
+        },
+        gray_discord::media_tags::Upload {
+            name: "report.pdf".into(),
+            media_type: "application/pdf".into(),
+            bytes: b"%PDF".to_vec(),
+        },
+    ];
+    let components = gray_discord::media_tags::components(&uploads, Some("**Results**"));
+    rest.send_v2_uploads(42, &components, &uploads, None)
+        .await
+        .expect("upload sends");
+    let sent = stub.sent.lock().unwrap().clone();
+    let body = &sent.last().expect("request recorded").body;
+    assert_eq!(body["flags"], 32768);
+    assert_eq!(body["attachments"][0]["filename"], "chart.png");
+    assert_eq!(body["attachments"][1]["filename"], "report.pdf");
+    assert_eq!(body["components"][0]["content"], "**Results**");
+    assert_eq!(
+        body["components"][1]["items"][0]["media"]["url"],
+        "attachment://chart.png"
+    );
+    assert_eq!(
+        body["components"][2]["file"]["url"],
+        "attachment://report.pdf"
+    );
+}
+
+#[test]
+fn discord_validation_errors_are_flattened_to_paths() {
+    let body = serde_json::json!({
+        "code": 50035,
+        "message": "Invalid Form Body",
+        "errors": {"components": {"0": {"components": {"1": {"spacing": {"_errors": [
+            {"code": "NUMBER_TYPE_COERCE", "message": "Value \"small\" is not int."}
+        ]}}}}}}
+    });
+    let detail = gray_discord::transport::discord_error_detail(400, &body);
+    assert_eq!(
+        detail,
+        "Invalid Form Body: components[0].components[1].spacing: Value \"small\" is not int."
+    );
 }

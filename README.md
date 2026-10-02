@@ -129,31 +129,62 @@ migration.
 The sidecar exposes a Gray-owned typed document protocol instead of asking the
 model to hand-write Discord numeric types or `custom_id` values:
 
-- `discord_ui_schema` returns the current protocol/limits and message/modal shape.
-- `discord_send_ui` accepts a `gray.discord.ui` version-1 document, compiles it,
+- `discord_ui_schema` returns every component's fields, Discord's limits,
+  design tips, and copy-ready examples (status card, image post, item with
+  thumbnail, button choice).
+- `discord_send_ui` accepts a `gray.discord.ui` document, compiles it,
   allocates opaque state, and sends/edits a V2 message.
 - `discord_open_modal` accepts a typed modal document for the current interaction.
-- `discord_file` imports, inspects, or safely exposes files from the conversation
-  work directory; managed IDs and safe workdir paths never expose the host media
-  store or Discord tokens.
+- `discord_file` posts local files straight to the channel (`action: "send"`,
+  images in one gallery, other files as file cards, optional `caption`), or
+  imports one privately and returns a `file_id` for `discord_send_ui` media.
+  Any readable path works (absolute, `~/`, or relative to the session's working
+  directory) except credential and config files (`.ssh`, `.env`, `*.pem`,
+  Gray's own state, ...).
+
+### Forgiving input, exact errors
+
+Documents are normalized before the strict types see them, so the shapes models
+naturally write all work: Discord's own numeric JSON (`{"type": 17, ...}`),
+`text_display`, a bare list of components, a JSON string, bare URLs or
+`file_id` strings as media, `#RRGGBB` colours, bare buttons (grouped into rows
+automatically), and top-level `title`/`accent_color` shortcuts that wrap the
+message in one accented card. `version`, `document_id`, and `surface` are
+filled in when missing.
+
+Anything still wrong comes back as `Not sent: invalid document: $.components[0].components[2] (type text): unknown field ...`
+before any request is made. If Discord itself rejects a payload, its
+validation paths are returned too, e.g.
+`Discord rejected the request (HTTP 400): Invalid Form Body: components[0].spacing: ...`.
+
+### Hermes-style `MEDIA:` tags
+
+Like Hermes, the agent can attach files to any reply by writing
+`MEDIA:/absolute/path/to/file.png` in its answer (or in `discord_send`). The tag
+is stripped, and the files are uploaded after the text as a Components V2
+message: images and videos in one media gallery, everything else as file
+cards, ten per message. Tags that name a missing or blocked file are left in
+the text so nothing disappears silently.
 
 Buttons, selects, modals, media, files, and the documented component limits are
 handled by the plugin. Interaction values are delivered into Gray as
 `gray.discord.input` version-1 user turns. Premium buttons require the
 `premium` capability and an explicitly allowed `premium_skus` entry.
 
-A message document is authored in the Gray protocol, not Discord wire JSON:
+A message document is authored in the Gray protocol:
 
 ```json
 {
-  "surface": "message",
-  "version": 1,
-  "document_id": "status-card",
-  "visibility": "public",
   "components": [
-    {"type": "text", "content": "Build finished"},
-    {"type": "action_row", "children": [
-      {"type": "button", "logical_id": "refresh", "label": "Refresh", "style": "secondary"}
+    {"type": "container", "accent_color": "#57F287", "components": [
+      {"type": "text", "content": "## Build finished\n-# main · 3m 12s"},
+      {"type": "separator"},
+      {"type": "section", "children": ["**42** tests passed"],
+       "accessory": {"type": "thumbnail", "media": "https://example.com/badge.png"}},
+      {"type": "action_row", "children": [
+        {"type": "button", "logical_id": "refresh", "label": "Refresh", "style": "secondary"},
+        {"type": "button", "label": "Logs", "style": "link", "url": "https://example.com/logs"}
+      ]}
     ]}
   ]
 }
@@ -162,10 +193,14 @@ A message document is authored in the Gray protocol, not Discord wire JSON:
 Call it through `discord_send_ui`. For a modal, use the same envelope with
 `"surface": "modal"`, a `title`, and `label` components, then call
 `discord_open_modal` with the interaction ID from the normalized event.
-`discord_file` supports `import`, `metadata`, and `path`; only `path` returns
-a file below the current conversation work directory.
+`discord_file` supports `send`, `import`, `metadata`, and `path`; only `path`
+returns a file below the current conversation work directory.
 
-The compiler emits message types 1–3, 5–14, and 17, plus modal types 3–8,
+The compiler follows Discord's component reference: separator spacing is sent
+as `1`/`2`, media items carry only `url`, File components accept only uploaded
+files, thumbnails appear only as section accessories, all text in one message
+totals at most 4000 characters, and `required` is sent on selects only in
+modals. It emits message types 1–3, 5–14, and 17, plus modal types 3–8,
 18–19, and 21–23. Numeric Discord types, custom IDs, and attachment URLs are
 owned by the compiler. Premium style 6 is represented in the protocol but
 fails closed unless both the capability and SKU allowlist are configured.

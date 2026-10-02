@@ -114,6 +114,8 @@ struct Compiler<'a, 'b> {
     context: &'b mut CompileContext<'a>,
     count: usize,
     logical_ids: HashSet<String>,
+    text_chars: usize,
+    in_modal: bool,
 }
 
 pub fn compile_message(
@@ -121,10 +123,19 @@ pub fn compile_message(
     context: &mut CompileContext<'_>,
 ) -> Result<CompiledMessage, CompileError> {
     validate_document_header(&document.version, &document.document_id, "$.document_id")?;
+    if document.components.is_empty() {
+        return Err(CompileError::new(
+            "empty_document",
+            "$.components",
+            "a message needs at least one component",
+        ));
+    }
     let mut compiler = Compiler {
         context,
         count: 0,
         logical_ids: HashSet::new(),
+        text_chars: 0,
+        in_modal: false,
     };
     let mut components = Vec::with_capacity(document.components.len());
     for (index, node) in document.components.iter().enumerate() {
@@ -164,6 +175,8 @@ pub fn compile_modal(
         context,
         count: 0,
         logical_ids: HashSet::new(),
+        text_chars: 0,
+        in_modal: true,
     };
     let custom_id = compiler.allocate_logical_id(&document.document_id, "modal", "$.custom_id")?;
     let mut components = Vec::with_capacity(document.components.len());
@@ -255,12 +268,16 @@ impl Compiler<'_, '_> {
                 "interactive controls must be nested in an action row",
             )),
             MessageNode::Text(text) => {
-                Ok(json!({"type": 10, "content": bounded_text(&text.content, path)?}))
+                let content = bounded_text(&text.content, path)?;
+                self.spend_text(&content, path)?;
+                Ok(json!({"type": 10, "content": content}))
             }
             MessageNode::Section(section) => self.section(section, path),
-            MessageNode::Thumbnail(thumbnail) => Ok(
-                json!({"type": 11, "media": self.media(&thumbnail.media, &format!("{path}.media"))?, "description": thumbnail.description, "spoiler": thumbnail.spoiler}),
-            ),
+            MessageNode::Thumbnail(_) => Err(CompileError::new(
+                "invalid_placement",
+                path,
+                "a thumbnail is only valid as a section accessory; use a media_gallery for a standalone image",
+            )),
             MessageNode::MediaGallery(gallery) => {
                 if gallery.items.is_empty() || gallery.items.len() > 10 {
                     return Err(CompileError::new(
@@ -271,31 +288,65 @@ impl Compiler<'_, '_> {
                 }
                 let mut items = Vec::with_capacity(gallery.items.len());
                 for (index, item) in gallery.items.iter().enumerate() {
+                    let item_path = format!("{path}.items[{index}]");
+                    let (description, spoiler) =
+                        media_extras(&item.media, &item.description, item.spoiler);
+                    validate_media_description(description.as_deref(), &item_path)?;
                     items.push(json!({
-                        "media": self.media(&item.media, &format!("{path}.items[{index}].media"))?,
-                        "description": item.description,
-                        "spoiler": item.spoiler
+                        "media": self.media(&item.media, &format!("{item_path}.media"))?,
+                        "description": description,
+                        "spoiler": spoiler
                     }));
                 }
                 Ok(json!({"type": 12, "items": items}))
             }
-            MessageNode::File(file) => Ok(json!({
-                "type": 13,
-                "file": {
-                    "url": self.media_url(&file.media, &format!("{path}.media"))?,
-                    "name": file.name
+            MessageNode::File(file) => {
+                if matches!(file.media, MediaSource::Remote { .. }) {
+                    return Err(CompileError::new(
+                        "invalid_media",
+                        format!("{path}.media"),
+                        "Discord file components only accept uploaded files; import it with discord_file and pass its file_id (remote images belong in a media_gallery)",
+                    ));
                 }
-            })),
+                Ok(json!({
+                    "type": 13,
+                    "file": {"url": self.media_url(&file.media, &format!("{path}.media"))?}
+                }))
+            }
             MessageNode::Separator(separator) => Ok(json!({
                 "type": 14,
                 "divider": separator.divider.unwrap_or(true),
-                "spacing": separator.spacing
+                "spacing": match separator.spacing.unwrap_or_default() {
+                    SeparatorSpacing::Small => 1,
+                    SeparatorSpacing::Large => 2,
+                }
             })),
             MessageNode::Container(container) => {
+                if container.accent_color.is_some_and(|color| color > 0xFF_FFFF) {
+                    return Err(CompileError::new(
+                        "invalid_color",
+                        format!("{path}.accent_color"),
+                        "accent_color must be an RGB integer from 0x000000 to 0xFFFFFF",
+                    ));
+                }
+                if container.components.is_empty() {
+                    return Err(CompileError::new(
+                        "invalid_container",
+                        path,
+                        "container must contain at least one component",
+                    ));
+                }
                 let mut children = Vec::with_capacity(container.components.len());
                 for (index, child) in container.components.iter().enumerate() {
-                    children
-                        .push(self.message_node(child, &format!("{path}.components[{index}]"))?);
+                    let child_path = format!("{path}.components[{index}]");
+                    if matches!(child, MessageNode::Container(_)) {
+                        return Err(CompileError::new(
+                            "invalid_placement",
+                            child_path,
+                            "containers cannot be nested",
+                        ));
+                    }
+                    children.push(self.message_node(child, &child_path)?);
                 }
                 Ok(
                     json!({"type": 17, "accent_color": container.accent_color, "spoiler": container.spoiler, "components": children}),
@@ -314,18 +365,26 @@ impl Compiler<'_, '_> {
         }
         let mut children = Vec::with_capacity(section.children.len());
         for (index, child) in section.children.iter().enumerate() {
-            children.push(json!({"type": 10, "content": bounded_text(&child.content, &format!("{path}.children[{index}]"))?}));
+            let child_path = format!("{path}.children[{index}]");
+            let content = bounded_text(&child.content, &child_path)?;
+            self.spend_text(&content, &child_path)?;
+            children.push(json!({"type": 10, "content": content}));
         }
         let accessory = match &section.accessory {
             SectionAccessory::Button(button) => {
                 self.button(button, &format!("{path}.accessory"))?
             }
-            SectionAccessory::Thumbnail(thumbnail) => json!({
-                "type": 11,
-                "media": self.media(&thumbnail.media, &format!("{path}.accessory.media"))?,
-                "description": thumbnail.description,
-                "spoiler": thumbnail.spoiler
-            }),
+            SectionAccessory::Thumbnail(thumbnail) => {
+                let (description, spoiler) =
+                    media_extras(&thumbnail.media, &thumbnail.description, thumbnail.spoiler);
+                validate_media_description(description.as_deref(), &format!("{path}.accessory"))?;
+                json!({
+                    "type": 11,
+                    "media": self.media(&thumbnail.media, &format!("{path}.accessory.media"))?,
+                    "description": description,
+                    "spoiler": spoiler
+                })
+            }
         };
         Ok(json!({"type": 9, "components": children, "accessory": accessory}))
     }
@@ -423,6 +482,7 @@ impl Compiler<'_, '_> {
         }
         validate_values(select.min_values, select.max_values, path)?;
         let custom_id = self.allocate_logical_id(&select.logical_id, "select", path)?;
+        let required = self.in_modal.then_some(select.required);
         let mut options = Vec::with_capacity(select.options.len());
         for (index, option) in select.options.iter().enumerate() {
             validate_option(option, &format!("{path}.options[{index}]"))?;
@@ -435,7 +495,7 @@ impl Compiler<'_, '_> {
             }));
         }
         Ok(
-            json!({"type": type_id, "custom_id": custom_id, "placeholder": select.placeholder, "options": options, "min_values": select.min_values, "max_values": select.max_values, "required": select.required, "disabled": select.disabled}),
+            json!({"type": type_id, "custom_id": custom_id, "placeholder": select.placeholder, "options": options, "min_values": select.min_values, "max_values": select.max_values, "required": required, "disabled": select.disabled}),
         )
     }
 
@@ -469,13 +529,14 @@ impl Compiler<'_, '_> {
             ));
         }
         let custom_id = self.allocate_logical_id(&select.logical_id, kind, path)?;
+        let required = self.in_modal.then_some(select.required);
         let defaults: Vec<Value> = select
             .default_values
             .iter()
             .map(|value| json!({"id": value.id, "type": value.kind}))
             .collect();
         Ok(
-            json!({"type": type_id, "custom_id": custom_id, "placeholder": select.placeholder, "default_values": defaults, "min_values": select.min_values, "max_values": select.max_values, "required": select.required, "disabled": select.disabled, "channel_types": select.channel_types}),
+            json!({"type": type_id, "custom_id": custom_id, "placeholder": select.placeholder, "default_values": defaults, "min_values": select.min_values, "max_values": select.max_values, "required": required, "disabled": select.disabled, "channel_types": select.channel_types}),
         )
     }
 
@@ -634,13 +695,11 @@ impl Compiler<'_, '_> {
 
     fn media(&mut self, media: &MediaSource, path: &str) -> Result<Value, CompileError> {
         match media {
-            MediaSource::Remote {
-                url,
-                description,
-                spoiler,
-            } => {
+            MediaSource::Remote { url, .. } => {
+                // Discord only lets callers set `url` on an unfurled media
+                // item; description/spoiler live on the item that holds it.
                 validate_url(url, &format!("{path}.url"))?;
-                Ok(json!({"url": url, "description": description, "spoiler": spoiler}))
+                Ok(json!({"url": url}))
             }
             MediaSource::File { .. } => Ok(json!({"url": self.media_url(media, path)?})),
         }
@@ -683,6 +742,19 @@ impl Compiler<'_, '_> {
             .map_err(|error| prefix_path(error, path))
     }
 
+    /// Discord caps the combined Text Display content of one message.
+    fn spend_text(&mut self, content: &str, path: &str) -> Result<(), CompileError> {
+        self.text_chars += content.chars().count();
+        if self.text_chars > MAX_TEXT_DISPLAY_CHARS {
+            return Err(CompileError::new(
+                "text_limit",
+                path,
+                "all text in one message must total at most 4000 characters; split it across messages",
+            ));
+        }
+        Ok(())
+    }
+
     fn count_component(&mut self, path: &str) -> Result<(), CompileError> {
         self.count += 1;
         if self.count > MAX_COMPONENTS {
@@ -694,6 +766,37 @@ impl Compiler<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// Item-level description/spoiler, falling back to the ones an author put on
+/// a remote media source.
+fn media_extras(
+    media: &MediaSource,
+    description: &Option<String>,
+    spoiler: bool,
+) -> (Option<String>, bool) {
+    match media {
+        MediaSource::Remote {
+            description: inner,
+            spoiler: inner_spoiler,
+            ..
+        } => (
+            description.clone().or_else(|| inner.clone()),
+            spoiler || *inner_spoiler,
+        ),
+        MediaSource::File { .. } => (description.clone(), spoiler),
+    }
+}
+
+fn validate_media_description(description: Option<&str>, path: &str) -> Result<(), CompileError> {
+    if description.is_some_and(|value| value.chars().count() > 1024) {
+        return Err(CompileError::new(
+            "invalid_text",
+            format!("{path}.description"),
+            "media description must contain at most 1024 characters",
+        ));
+    }
+    Ok(())
 }
 
 fn omit_nulls(value: Value) -> Value {
@@ -1022,14 +1125,19 @@ mod tests {
                         disabled: false,
                     }),
                 }),
-                MessageNode::Thumbnail(Thumbnail {
-                    media: MediaSource::Remote {
-                        url: "https://example.com/image.png".into(),
+                MessageNode::Section(Section {
+                    children: vec![TextDisplay {
+                        content: "With image".into(),
+                    }],
+                    accessory: SectionAccessory::Thumbnail(Thumbnail {
+                        media: MediaSource::Remote {
+                            url: "https://example.com/image.png".into(),
+                            description: None,
+                            spoiler: false,
+                        },
                         description: None,
                         spoiler: false,
-                    },
-                    description: None,
-                    spoiler: false,
+                    }),
                 }),
                 MessageNode::MediaGallery(MediaGallery {
                     items: vec![GalleryItem {
@@ -1093,6 +1201,9 @@ mod tests {
                     collect(item, out);
                 }
             }
+            if let Some(accessory) = value.get("accessory") {
+                collect(accessory, out);
+            }
             if let Some(items) = value.get("items").and_then(Value::as_array) {
                 for item in items {
                     if let Some(media) = item.get("media") {
@@ -1113,6 +1224,11 @@ mod tests {
             );
         }
         assert_eq!(compiled.flags, IS_COMPONENTS_V2);
+        // The wire output must satisfy the independent Discord validator.
+        crate::render::validate_components(&compiled.components).unwrap();
+        let wire = serde_json::to_string(&compiled.components).unwrap();
+        assert!(wire.contains(r#""spacing":1"#), "{wire}");
+        assert!(!wire.contains("required"), "{wire}");
     }
 
     #[test]
@@ -1284,14 +1400,16 @@ mod negative_tests {
             document_id: LogicalId::new("negative-url"),
             visibility: Visibility::Public,
             lifecycle: Lifecycle::Static,
-            components: vec![MessageNode::Thumbnail(Thumbnail {
-                media: MediaSource::Remote {
-                    url: "http://127.0.0.1/image.png".into(),
+            components: vec![MessageNode::MediaGallery(MediaGallery {
+                items: vec![GalleryItem {
+                    media: MediaSource::Remote {
+                        url: "http://127.0.0.1/image.png".into(),
+                        description: None,
+                        spoiler: false,
+                    },
                     description: None,
                     spoiler: false,
-                },
-                description: None,
-                spoiler: false,
+                }],
             })],
         };
         let mut allocator = DeterministicAllocator::default();
