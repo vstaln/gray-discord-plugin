@@ -206,14 +206,15 @@ async fn send_text(params: &Value, config_path: &Path) -> Value {
         .and_then(|a| a.get("content"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (prose, media) = crate::media_tags::extract(content, &session_cwd(params));
-    if prose.trim().is_empty() && media.is_empty() {
+    if content.trim().is_empty() {
         return not_sent("content is empty");
     }
-    let (_, token, channel) = match delivery_target(config_path) {
+    let (config, token, channel) = match delivery_target(config_path) {
         Ok(target) => target,
         Err(error) => return error,
     };
+    let roots = crate::media_tags::roots_from_config(&config);
+    let (prose, media) = crate::media_tags::extract(content, &session_cwd(params), &roots);
     let rest = crate::transport::Rest::production(&token);
     if !prose.trim().is_empty() {
         let send = tokio::time::timeout(
@@ -576,17 +577,18 @@ async fn file_tool(params: &Value, config_path: &Path) -> Value {
         if raw_paths.is_empty() {
             return not_sent("action=send needs `path` or `paths`");
         }
+        let (config, token, channel) = match delivery_target(config_path) {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        let roots = crate::media_tags::roots_from_config(&config);
         let mut paths = Vec::new();
         for raw in &raw_paths {
-            match resolve_local(raw, &cwd) {
+            match resolve_local(raw, &cwd, &roots) {
                 Ok(path) => paths.push(path),
                 Err(error) => return not_sent(error),
             }
         }
-        let (_, token, channel) = match delivery_target(config_path) {
-            Ok(target) => target,
-            Err(error) => return error,
-        };
         let rest = crate::transport::Rest::production(&token);
         let caption = args.get("caption").and_then(Value::as_str);
         return match upload(&rest, channel, &paths, caption).await {
@@ -622,7 +624,8 @@ async fn file_tool(params: &Value, config_path: &Path) -> Value {
             let Some(raw) = raw_paths.first() else {
                 return not_sent("action=import needs `path`");
             };
-            let path = match resolve_local(raw, &cwd) {
+            let roots = crate::media_tags::roots_from_config(&config);
+            let path = match resolve_local(raw, &cwd, &roots) {
                 Ok(path) => path,
                 Err(error) => return not_sent(error),
             };
@@ -705,20 +708,17 @@ async fn file_tool(params: &Value, config_path: &Path) -> Value {
 }
 
 /// Resolve a caller path (absolute, `~/`, or relative to the session cwd)
-/// and refuse credentials, config, and oversized files.
-fn resolve_local(raw: &str, cwd: &Path) -> Result<std::path::PathBuf, String> {
-    let raw = raw.trim().strip_prefix("MEDIA:").unwrap_or(raw.trim());
-    let path = if let Some(rest) = raw.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| "HOME is not set".to_string())?
-            .join(rest)
-    } else if Path::new(raw).is_absolute() {
-        std::path::PathBuf::from(raw)
-    } else {
-        cwd.join(raw)
-    };
-    crate::media_tags::deliverable(&path)
+/// and refuse credentials, config, oversized files, and anything outside
+/// configured `media_roots`.
+fn resolve_local(
+    raw: &str,
+    cwd: &Path,
+    roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("MEDIA:").unwrap_or(raw).trim();
+    let path = crate::media_tags::resolve(raw, cwd).ok_or_else(|| "path is empty".to_string())?;
+    crate::media_tags::deliverable(&path, roots)
 }
 
 /// Coerce and parse an agent document; errors name the path to fix.

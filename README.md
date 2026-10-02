@@ -166,6 +166,16 @@ message: images and videos in one media gallery, everything else as file
 cards, ten per message. Tags that name a missing or blocked file are left in
 the text so nothing disappears silently.
 
+By default any readable file can be sent except credentials and config. To
+lock this down, list the folders files may come from in `config.json`:
+
+```json
+{"media_roots": ["~/gray", "/tmp"]}
+```
+
+With `media_roots` set, `MEDIA:` tags, `discord_send`, and `discord_file`
+refuse anything outside those folders (and the credential rules still apply).
+
 Buttons, selects, modals, media, files, and the documented component limits are
 handled by the plugin. Interaction values are delivered into Gray as
 `gray.discord.input` version-1 user turns. Premium buttons require the

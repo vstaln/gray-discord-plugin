@@ -858,14 +858,16 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
 
     let rest_del = rest.clone();
     let media_root = PathBuf::from(&workdir);
+    let media_roots = crate::media_tags::roots_from_config(&config);
     let deliver = move |part: OutboxPart| {
         let rest = rest_del.clone();
         let media_root = media_root.clone();
+        let media_roots = media_roots.clone();
         Box::pin(async move {
             // Hermes-style `MEDIA:<path>` tags: strip them from the prose and
             // upload the files as a V2 gallery/file message after the text.
             let (prose, media) = if part.document_json.is_none() {
-                crate::media_tags::extract(&part.content, &media_root)
+                crate::media_tags::extract(&part.content, &media_root, &media_roots)
             } else {
                 (part.content.clone(), Vec::new())
             };

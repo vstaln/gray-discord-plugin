@@ -29,9 +29,26 @@ impl Upload {
     }
 }
 
+/// Optional `media_roots` config: when set, files may only come from those
+/// directories. Unset (the default) allows any non-secret file, like Hermes.
+pub fn roots_from_config(config: &Value) -> Vec<PathBuf> {
+    config
+        .get("media_roots")
+        .and_then(Value::as_array)
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|root| resolve(root, Path::new("/")))
+                .filter_map(|root| root.canonicalize().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Split `text` into its prose and the deliverable files its `MEDIA:` tags
 /// name. Relative paths resolve against `cwd`.
-pub fn extract(text: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
+pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBuf>) {
     let mut out = String::with_capacity(text.len());
     let mut paths = Vec::new();
     let mut rest = text;
@@ -46,7 +63,7 @@ pub fn extract(text: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
         let raw = trimmed[..end]
             .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '*', '_', '!', '?']);
         let consumed = body.len() - trimmed.len() + end;
-        match resolve(raw, cwd).and_then(|path| deliverable(&path).ok()) {
+        match resolve(raw, cwd).and_then(|path| deliverable(&path, roots).ok()) {
             Some(path) => {
                 // Drop markdown emphasis or code ticks wrapped around the tag.
                 out.push_str(before.trim_end_matches(['*', '_', '`']));
@@ -66,7 +83,7 @@ pub fn extract(text: &str, cwd: &Path) -> (String, Vec<PathBuf>) {
     (tidy(&out), paths)
 }
 
-fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
+pub fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
     }
@@ -85,8 +102,8 @@ fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
 }
 
 /// A path may be delivered when it is a regular, bounded file that is not a
-/// credential or configuration secret.
-pub fn deliverable(path: &Path) -> Result<PathBuf, String> {
+/// credential or configuration secret, inside `roots` when any are set.
+pub fn deliverable(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     let canonical = path
         .canonicalize()
         .map_err(|_| format!("{} does not exist", path.display()))?;
@@ -99,6 +116,12 @@ pub fn deliverable(path: &Path) -> Result<PathBuf, String> {
     }
     if metadata.len() > MAX_UPLOAD_BYTES {
         return Err(format!("{} is larger than 25 MiB", canonical.display()));
+    }
+    if !roots.is_empty() && !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err(format!(
+            "{} is outside the configured media_roots",
+            canonical.display()
+        ));
     }
     if is_sensitive(&canonical) {
         return Err(format!(
@@ -274,7 +297,7 @@ mod tests {
             "Here you go:\n**MEDIA:{}**\nand MEDIA:/nope/missing.png stays.",
             image.display()
         );
-        let (prose, paths) = extract(&text, dir.path());
+        let (prose, paths) = extract(&text, dir.path(), &[]);
         assert_eq!(paths, vec![image.canonicalize().unwrap()]);
         assert!(!prose.contains("chart.png"), "{prose}");
         assert!(prose.contains("MEDIA:/nope/missing.png"), "{prose}");
@@ -285,7 +308,7 @@ mod tests {
     fn relative_paths_resolve_against_the_workdir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("report.pdf"), b"%PDF").unwrap();
-        let (prose, paths) = extract("Report: MEDIA:report.pdf.", dir.path());
+        let (prose, paths) = extract("Report: MEDIA:report.pdf.", dir.path(), &[]);
         assert_eq!(paths.len(), 1);
         assert_eq!(prose, "Report:");
     }
@@ -306,6 +329,7 @@ mod tests {
         let (_, paths) = extract(
             "MEDIA:gray-discord/conversations/abc/work/out.png",
             dir.path(),
+            &[],
         );
         assert_eq!(paths.len(), 1, "conversation work output is deliverable");
         for name in [
@@ -314,7 +338,7 @@ mod tests {
             "server.pem",
             "gray-discord/notes.md",
         ] {
-            let (_, paths) = extract(&format!("MEDIA:{name}"), dir.path());
+            let (_, paths) = extract(&format!("MEDIA:{name}"), dir.path(), &[]);
             assert!(paths.is_empty(), "{name} must not be delivered");
         }
     }
@@ -337,6 +361,21 @@ mod tests {
         crate::render::validate_components(&components).unwrap();
         assert_eq!(components[1]["type"], 12);
         assert_eq!(components[2]["file"]["url"], "attachment://b.pdf");
+    }
+
+    #[test]
+    fn media_roots_restrict_sources_when_configured() {
+        let allowed = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(allowed.path().join("in.png"), b"x").unwrap();
+        std::fs::write(other.path().join("out.png"), b"x").unwrap();
+        let config = json!({"media_roots": [allowed.path().to_string_lossy()]});
+        let roots = roots_from_config(&config);
+        assert_eq!(roots.len(), 1);
+        assert!(deliverable(&allowed.path().join("in.png"), &roots).is_ok());
+        let error = deliverable(&other.path().join("out.png"), &roots).unwrap_err();
+        assert!(error.contains("media_roots"), "{error}");
+        assert!(deliverable(&other.path().join("out.png"), &[]).is_ok());
     }
 
     #[test]
