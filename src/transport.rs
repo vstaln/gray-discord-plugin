@@ -92,6 +92,9 @@ impl std::fmt::Display for TransportError {
                 f.write_str("Discord refused the request; check channel permissions")
             }
             Self::RateLimited(_) => f.write_str("Discord rate limit hit; backing off"),
+            Self::Http(status @ (400 | 413), detail) => {
+                write!(f, "Discord rejected the request (HTTP {status}): {detail}")
+            }
             Self::Http(status, _) => write!(f, "Discord HTTP {status}"),
             Self::Net(_) => f.write_str("Discord request failed; check connectivity"),
             Self::Invalid(msg) => f.write_str(msg),
@@ -224,6 +227,16 @@ impl Rest {
                 .ok()
                 .and_then(|v| v.get("retry_after").and_then(Value::as_f64));
             return Err(TransportError::RateLimited(header_retry.or(body_retry)));
+        }
+        if code == 400 || code == 413 {
+            // Discord's validation body names the offending field paths
+            // (it describes our own payload, never credentials); keep it so
+            // the author can fix the document instead of guessing.
+            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            return Err(TransportError::Http(
+                code,
+                discord_error_detail(code, &body),
+            ));
         }
         let _ = resp.bytes().await;
         Err(TransportError::Http(code, "request failed".into()))
@@ -918,9 +931,17 @@ impl Rest {
         owner_id: &str,
         method: &str,
     ) -> Result<Value, TransportError> {
+        let mut payload = payload.clone();
+        payload["attachments"] = Value::Array(
+            files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| json!({"id": index, "filename": file.name}))
+                .collect(),
+        );
         let mut form = Form::new().text(
             "payload_json",
-            serde_json::to_string(payload)
+            serde_json::to_string(&payload)
                 .map_err(|_| TransportError::Invalid("compiled payload is invalid".into()))?,
         );
         for (index, file) in files.iter().enumerate() {
@@ -968,6 +989,61 @@ impl Rest {
             .post(&format!("/channels/{channel}/messages"), &body)
             .await?;
         v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+    }
+
+    /// Send a V2 message that uploads local files, referenced from the
+    /// component tree as `attachment://<filename>`.
+    pub async fn send_v2_uploads(
+        &self,
+        channel: u64,
+        components: &[Value],
+        uploads: &[crate::media_tags::Upload],
+        nonce: Option<&str>,
+    ) -> Result<MessageId, TransportError> {
+        crate::render::validate_components(components).map_err(TransportError::Invalid)?;
+        let mut body = json!({
+            "flags": crate::render::IS_COMPONENTS_V2,
+            "components": components,
+            "allowed_mentions": {"parse": []},
+            "attachments": uploads
+                .iter()
+                .enumerate()
+                .map(|(index, upload)| json!({"id": index, "filename": upload.name}))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(nonce) = nonce {
+            body["nonce"] = json!(nonce);
+        }
+        let mut form = Form::new().text(
+            "payload_json",
+            serde_json::to_string(&body)
+                .map_err(|_| TransportError::Invalid("upload payload is invalid".into()))?,
+        );
+        for (index, upload) in uploads.iter().enumerate() {
+            let part = reqwest::multipart::Part::bytes(upload.bytes.clone())
+                .file_name(upload.name.clone())
+                .mime_str(&upload.media_type)
+                .map_err(|_| TransportError::Invalid("upload media type is invalid".into()))?;
+            form = form.part(format!("files[{index}]"), part);
+        }
+        let path = format!("/channels/{channel}/messages");
+        let route = format!("POST {path}");
+        self.wait_for_rate_limit(&route).await;
+        let response = self
+            .client
+            .post(format!("{}{}", self.base, path))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| TransportError::Net(trim_net_error(error)))?;
+        self.observe_rate_limit(&route, response.headers());
+        let status = response.status();
+        let value = self.classify(status, response).await?;
+        value
+            .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| TransportError::Http(200, "bad response".into()))
@@ -1431,6 +1507,55 @@ fn apply_overwrites(
             *perms |= value(overwrite, "allow");
         }
     }
+}
+
+/// Flatten Discord's nested `errors` object into `path: message` lines.
+pub fn discord_error_detail(code: u16, body: &Value) -> String {
+    if code == 413 {
+        return "the upload is larger than this server allows".to_string();
+    }
+    fn walk(value: &Value, path: &str, out: &mut Vec<String>) {
+        let Some(map) = value.as_object() else {
+            return;
+        };
+        if let Some(errors) = map.get("_errors").and_then(Value::as_array) {
+            for error in errors {
+                if let Some(message) = error.get("message").and_then(Value::as_str) {
+                    out.push(format!("{path}: {message}"));
+                }
+            }
+        }
+        for (key, child) in map {
+            if key == "_errors" {
+                continue;
+            }
+            let next = if key.chars().all(|c| c.is_ascii_digit()) {
+                format!("{path}[{key}]")
+            } else if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            walk(child, &next, out);
+        }
+    }
+    let mut lines = Vec::new();
+    if let Some(errors) = body.get("errors") {
+        walk(errors, "", &mut lines);
+    }
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("request rejected");
+    let mut detail = if lines.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}: {}", lines.join("; "))
+    };
+    if detail.chars().count() > 900 {
+        detail = detail.chars().take(900).collect::<String>() + "…";
+    }
+    detail
 }
 
 /// Trim reqwest error display to a category (may contain URLs, never tokens —

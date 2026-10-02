@@ -857,59 +857,97 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let mut shard = Shard::new(ShardId::ONE, token.clone(), intents);
 
     let rest_del = rest.clone();
+    let media_root = PathBuf::from(&workdir);
+    let media_roots = crate::media_tags::roots_from_config(&config);
     let deliver = move |part: OutboxPart| {
         let rest = rest_del.clone();
+        let media_root = media_root.clone();
+        let media_roots = media_roots.clone();
         Box::pin(async move {
-            let text = crate::text::sanitize(&part.content);
-            let v2 = part.render.as_deref() == Some("v2");
-            if let Some(document_json) = part.document_json.as_deref() {
-                let Ok(document) = serde_json::from_str::<Value>(document_json) else {
-                    return Err("stored component document is invalid".to_string());
-                };
-                if document
-                    .get("components")
-                    .and_then(Value::as_array)
-                    .is_none()
-                {
-                    return Err("stored component document has no components".to_string());
-                }
-                if let Some(ref token) = part.interaction_token {
-                    let app_id = part.app_id.as_deref().unwrap_or("");
-                    return rest
-                        .edit_original_stored_document(app_id, token, &document)
-                        .await
-                        .map_err(|error| error.to_string());
+            // Hermes-style `MEDIA:<path>` tags: strip them from the prose and
+            // upload the files as a V2 gallery/file message after the text.
+            let (prose, media) = if part.document_json.is_none() {
+                crate::media_tags::extract(&part.content, &media_root, &media_roots)
+            } else {
+                (part.content.clone(), Vec::new())
+            };
+            if !media.is_empty() {
+                let text = crate::text::sanitize(&prose);
+                let mut first = None;
+                if !text.trim().is_empty() {
+                    let mut text_part = part.clone();
+                    text_part.content = prose.clone();
+                    first = Some(deliver_text(&rest, text_part).await?);
                 }
                 let ch: u64 = part
                     .channel
                     .parse()
                     .map_err(|_| "Invalid channel ID".to_string())?;
-                return rest
-                    .send_stored_document(ch, &document, None)
-                    .await
-                    .map_err(|error| error.to_string());
+                let uploads = crate::media_tags::load(&media);
+                for (index, batch) in uploads
+                    .chunks(crate::media_tags::MAX_UPLOADS_PER_MESSAGE)
+                    .enumerate()
+                {
+                    let components = crate::media_tags::components(batch, None);
+                    let nonce = crate::runner::hex_sha256(
+                        format!("{}:{}:media:{index}", part.id, part.part).as_bytes(),
+                    )[..24]
+                        .to_string();
+                    let id = rest
+                        .send_v2_uploads(ch, &components, batch, Some(&nonce))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    first.get_or_insert(id);
+                }
+                return first.ok_or_else(|| "Delivery returned no message ID".to_string());
+            }
+            deliver_text(&rest, part).await
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+    };
+
+    async fn deliver_text(rest: &Rest, part: OutboxPart) -> Result<String, String> {
+        let text = crate::text::sanitize(&part.content);
+        let v2 = part.render.as_deref() == Some("v2");
+        if let Some(document_json) = part.document_json.as_deref() {
+            let Ok(document) = serde_json::from_str::<Value>(document_json) else {
+                return Err("stored component document is invalid".to_string());
+            };
+            if document
+                .get("components")
+                .and_then(Value::as_array)
+                .is_none()
+            {
+                return Err("stored component document has no components".to_string());
             }
             if let Some(ref token) = part.interaction_token {
                 let app_id = part.app_id.as_deref().unwrap_or("");
-                if v2 {
-                    if part.part == 0 {
-                        let components =
-                            crate::render::text_message(&text).map_err(|e| e.to_string())?;
-                        rest.edit_original_v2(app_id, token, &components, true)
-                            .await
-                            .map_err(|e| e.to_string())
-                    } else {
-                        let ids = rest
-                            .followup_v2(app_id, token, &text)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        ids.into_iter()
-                            .next()
-                            .ok_or_else(|| "Delivery returned no message ID".to_string())
-                    }
+                return rest
+                    .edit_original_stored_document(app_id, token, &document)
+                    .await
+                    .map_err(|error| error.to_string());
+            }
+            let ch: u64 = part
+                .channel
+                .parse()
+                .map_err(|_| "Invalid channel ID".to_string())?;
+            return rest
+                .send_stored_document(ch, &document, None)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        if let Some(ref token) = part.interaction_token {
+            let app_id = part.app_id.as_deref().unwrap_or("");
+            if v2 {
+                if part.part == 0 {
+                    let components =
+                        crate::render::text_message(&text).map_err(|e| e.to_string())?;
+                    rest.edit_original_v2(app_id, token, &components, true)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     let ids = rest
-                        .followup(app_id, token, &text)
+                        .followup_v2(app_id, token, &text)
                         .await
                         .map_err(|e| e.to_string())?;
                     ids.into_iter()
@@ -917,26 +955,33 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         .ok_or_else(|| "Delivery returned no message ID".to_string())
                 }
             } else {
-                let ch: u64 = part
-                    .channel
-                    .parse()
-                    .map_err(|_| "Invalid channel ID".to_string())?;
-                let nonce =
-                    crate::runner::hex_sha256(format!("{}:{}", part.id, part.part).as_bytes())
-                        [..24]
-                        .to_string();
-                if v2 {
-                    rest.send_text_v2(ch, &text, Some(&nonce))
-                        .await
-                        .map_err(|e| e.to_string())
-                } else {
-                    rest.send(ch, &text, Some(&nonce))
-                        .await
-                        .map_err(|e| e.to_string())
-                }
+                let ids = rest
+                    .followup(app_id, token, &text)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ids.into_iter()
+                    .next()
+                    .ok_or_else(|| "Delivery returned no message ID".to_string())
             }
-        })
-    };
+        } else {
+            let ch: u64 = part
+                .channel
+                .parse()
+                .map_err(|_| "Invalid channel ID".to_string())?;
+            let nonce = crate::runner::hex_sha256(format!("{}:{}", part.id, part.part).as_bytes())
+                [..24]
+                .to_string();
+            if v2 {
+                rest.send_text_v2(ch, &text, Some(&nonce))
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                rest.send(ch, &text, Some(&nonce))
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
 
     // One narration sink per daemon: the runner pushes gray's progress
     // rows, the Runtime drains them into the channel's status bubble.
