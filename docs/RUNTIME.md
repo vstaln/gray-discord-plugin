@@ -71,7 +71,11 @@ blindly retried. Shared plugins can also have their own side effects.
 
 ### Restart and shutdown notices
 
-Ported from Hermes' `gateway_restart_notification`. On SIGTERM or Ctrl-C, while
+Ported from Hermes' `gateway_restart_notification`, owned by gray core:
+`gray gateway lifecycle boot|stop --dir <config dir>` decides how the last run
+ended and words every notice, so Telegram or Slack adapters get the same
+behaviour; this plugin only posts the text. Against a gray that predates the
+subcommand it falls back to a local copy that uses the same files. On SIGTERM or Ctrl-C, while
 the connection is still up, every chat with a running turn is told the task is
 about to be interrupted, and the home channel gets a short "restarting" or
 "shutting down" line (one message per chat, bounded to 4 seconds).

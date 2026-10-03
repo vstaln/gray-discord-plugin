@@ -3,6 +3,12 @@
 //! short, and the home channel hears when the gateway is back, including
 //! after a crash, kill, or reboot that gave it no chance to say goodbye.
 //!
+//! gray core owns this, platform-agnostic: `gray gateway lifecycle
+//! boot|stop --dir <config dir>` decides how the last run ended and hands
+//! back the wording; this adapter only posts it ([`boot_via`],
+//! [`stop_via`]). The local copy below is the fallback for a gray that
+//! predates the subcommand, and reads and writes the same files.
+//!
 //! State is two files next to the config:
 //! - `lifecycle.json`: `running` while the daemon is up, `stopped` after a
 //!   clean exit. Still `running` at the next boot means the last run died.
@@ -127,21 +133,91 @@ pub fn home_notice(restart: bool) -> &'static str {
     }
 }
 
+/// What a clean exit should say, as core worded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Goodbye {
+    pub restart: bool,
+    /// For each chat with a running turn.
+    pub active: String,
+    /// For the home channel when nothing ran there.
+    pub home: String,
+}
+
+/// Ask gray core (`gray gateway lifecycle ...`); `None` when this gray has
+/// no such subcommand or does not answer in time.
+async fn core(gray_bin: &Path, args: &[&str], dir: &Path) -> Option<Value> {
+    let mut cmd = tokio::process::Command::new(gray_bin);
+    cmd.args(["gateway", "lifecycle"])
+        .args(args)
+        .arg("--dir")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(3), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&out.stdout)
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// Boot: record this run and return the home-channel notice, if any.
+pub async fn boot_via(gray_bin: &Path, dir: &Path, interrupted: usize) -> Option<String> {
+    let count = interrupted.to_string();
+    match core(gray_bin, &["boot", "--interrupted", &count], dir).await {
+        Some(answer) => answer
+            .get("notice")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        None => startup_notice(boot(dir), interrupted),
+    }
+}
+
+/// Clean exit: record it and return what chats should hear.
+pub async fn stop_via(gray_bin: &Path, dir: &Path) -> Goodbye {
+    if let Some(answer) = core(gray_bin, &["stop"], dir).await {
+        let text = |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_string);
+        if let (Some(active), Some(home)) = (text("active_notice"), text("home_notice")) {
+            return Goodbye {
+                restart: answer.get("restart").and_then(Value::as_bool) == Some(true),
+                active,
+                home,
+            };
+        }
+    }
+    let restart = restart_requested(dir);
+    mark_stopped(dir, restart);
+    Goodbye {
+        restart,
+        active: active_notice(restart).to_string(),
+        home: home_notice(restart).to_string(),
+    }
+}
+
 /// Who hears about a shutdown: every chat with a running turn, then the
 /// home channel unless it was already told. One message per chat.
-pub fn shutdown_targets(running: &[String], home: &str, restart: bool) -> Vec<(u64, &'static str)> {
+pub fn shutdown_targets<'a>(
+    running: &[String],
+    home: &str,
+    goodbye: &'a Goodbye,
+) -> Vec<(u64, &'a str)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for channel in running {
         if let Ok(ch) = channel.parse::<u64>() {
             if seen.insert(ch) {
-                out.push((ch, active_notice(restart)));
+                out.push((ch, goodbye.active.as_str()));
             }
         }
     }
     if let Ok(ch) = home.parse::<u64>() {
         if seen.insert(ch) {
-            out.push((ch, home_notice(restart)));
+            out.push((ch, goodbye.home.as_str()));
         }
     }
     out
@@ -178,14 +254,47 @@ mod tests {
 
     #[test]
     fn each_chat_hears_once_and_home_gets_the_short_notice() {
+        let bye = Goodbye {
+            restart: true,
+            active: "active".into(),
+            home: "home".into(),
+        };
         let running = vec!["11".to_string(), "11".to_string(), "22".to_string()];
-        let targets = shutdown_targets(&running, "22", true);
+        let targets = shutdown_targets(&running, "22", &bye);
+        assert_eq!(targets, vec![(11, "active"), (22, "active")]);
+        assert_eq!(shutdown_targets(&[], "33", &bye), vec![(33, "home")]);
+    }
+
+    #[tokio::test]
+    async fn an_older_gray_falls_back_to_the_local_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `false` exits 1, like a gray without the lifecycle subcommand.
+        let bin = Path::new("/bin/false");
+        assert_eq!(boot_via(bin, tmp.path(), 0).await, None);
+        assert_eq!(stop_via(bin, tmp.path()).await.active, active_notice(false));
+        assert!(boot_via(bin, tmp.path(), 0)
+            .await
+            .unwrap()
+            .starts_with("Gateway online"));
+    }
+
+    #[tokio::test]
+    async fn core_answers_win() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("gray");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncase \"$3\" in\n boot) echo '{\"notice\":\"from core\"}';;\n stop) echo '{\"restart\":true,\"active_notice\":\"a\",\"home_notice\":\"h\"}';;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            targets,
-            vec![(11, active_notice(true)), (22, active_notice(true))]
+            boot_via(&bin, tmp.path(), 1).await.as_deref(),
+            Some("from core")
         );
-        let targets = shutdown_targets(&[], "33", false);
-        assert_eq!(targets, vec![(33, home_notice(false))]);
+        let bye = stop_via(&bin, tmp.path()).await;
+        assert!(bye.restart && bye.active == "a" && bye.home == "h");
     }
 
     #[test]

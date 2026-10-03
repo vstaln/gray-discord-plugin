@@ -1163,10 +1163,17 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let store = open_store(config_path)?;
     // How the last run ended, read before recovery marks its turns failed.
     let notices = crate::lifecycle::enabled(&config);
-    let previous = crate::lifecycle::boot(parent);
+    let gray_bin = PathBuf::from(
+        config
+            .get("gray_bin")
+            .and_then(Value::as_str)
+            .unwrap_or("gray"),
+    );
     let interrupted = store.running_channels().map(|c| c.len()).unwrap_or(0);
-    let mut startup_notice =
-        crate::lifecycle::startup_notice(previous, interrupted).filter(|_| notices);
+    // gray core decides how the last run ended and words the notice.
+    let mut startup_notice = crate::lifecycle::boot_via(&gray_bin, parent, interrupted)
+        .await
+        .filter(|_| notices);
     let home_channel = config
         .get("channel_id")
         .and_then(Value::as_str)
@@ -1459,11 +1466,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 return Err("cron task stopped".to_string());
             }
             _ = &mut sigterm_recv => {
-                announce_shutdown(&rest, &store, &home_channel, parent, notices).await;
+                announce_shutdown(&rest, &store, &home_channel, parent, &gray_bin, notices).await;
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
-                announce_shutdown(&rest, &store, &home_channel, parent, notices).await;
+                announce_shutdown(&rest, &store, &home_channel, parent, &gray_bin, notices).await;
                 break;
             }
             event = shard.next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE | EventTypeFlags::READY) => {
@@ -1863,25 +1870,33 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
 /// still up, tell every chat with a running turn (and the home channel)
 /// that the gateway is going away, then record the clean exit. Bounded so
 /// a slow Discord never outlasts the supervisor's stop timeout.
-async fn announce_shutdown(rest: &Rest, store: &Store, home: &str, dir: &Path, notices: bool) {
-    let restart = crate::lifecycle::restart_requested(dir);
-    if notices {
-        let running = store.running_channels().unwrap_or_default();
-        let sends = async {
-            for (ch, text) in crate::lifecycle::shutdown_targets(&running, home, restart) {
-                if let Err(e) = rest.send(ch, text, None).await {
-                    eprintln!("[discord] shutdown notice failed: {e}");
-                }
-            }
-        };
-        if tokio::time::timeout(std::time::Duration::from_secs(4), sends)
-            .await
-            .is_err()
-        {
-            eprintln!("[discord] shutdown notices timed out");
-        }
+async fn announce_shutdown(
+    rest: &Rest,
+    store: &Store,
+    home: &str,
+    dir: &Path,
+    gray_bin: &Path,
+    notices: bool,
+) {
+    // Records the clean exit either way; core words the notices.
+    let goodbye = crate::lifecycle::stop_via(gray_bin, dir).await;
+    if !notices {
+        return;
     }
-    crate::lifecycle::mark_stopped(dir, restart);
+    let running = store.running_channels().unwrap_or_default();
+    let sends = async {
+        for (ch, text) in crate::lifecycle::shutdown_targets(&running, home, &goodbye) {
+            if let Err(e) = rest.send(ch, text, None).await {
+                eprintln!("[discord] shutdown notice failed: {e}");
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(4), sends)
+        .await
+        .is_err()
+    {
+        eprintln!("[discord] shutdown notices timed out");
+    }
 }
 
 #[cfg(test)]
