@@ -1003,20 +1003,77 @@ impl Rest {
         uploads: &[crate::media_tags::Upload],
         nonce: Option<&str>,
     ) -> Result<MessageId, TransportError> {
-        crate::render::validate_components(components).map_err(TransportError::Invalid)?;
         let mut body = json!({
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
             "allowed_mentions": {"parse": []},
-            "attachments": uploads
-                .iter()
-                .enumerate()
-                .map(|(index, upload)| json!({"id": index, "filename": upload.name}))
-                .collect::<Vec<_>>(),
         });
         if let Some(nonce) = nonce {
             body["nonce"] = json!(nonce);
         }
+        let value = self
+            .multipart_v2(
+                reqwest::Method::POST,
+                &format!("/channels/{channel}/messages"),
+                body,
+                uploads,
+            )
+            .await?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+    }
+
+    /// Edit a V2 message and attach local files to it in the same request
+    /// (a finished turn card gaining the answer's images). The attachment
+    /// list is replaced by `uploads`.
+    pub async fn edit_v2_uploads(
+        &self,
+        channel: u64,
+        message: &str,
+        components: &[Value],
+        uploads: &[crate::media_tags::Upload],
+    ) -> Result<(), TransportError> {
+        let body = json!({
+            "flags": crate::render::IS_COMPONENTS_V2,
+            "components": components,
+            "allowed_mentions": {"parse": []},
+            "content": Value::Null,
+            "embeds": [],
+            "sticker_ids": [],
+        });
+        self.multipart_v2(
+            reqwest::Method::PATCH,
+            &format!("/channels/{channel}/messages/{message}"),
+            body,
+            uploads,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// One multipart V2 request: `payload_json` plus `files[n]`, with the
+    /// `attachments` list naming each upload by index.
+    async fn multipart_v2(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        mut body: Value,
+        uploads: &[crate::media_tags::Upload],
+    ) -> Result<Value, TransportError> {
+        let components = body
+            .get("components")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        crate::render::validate_components(&components).map_err(TransportError::Invalid)?;
+        body["attachments"] = uploads
+            .iter()
+            .enumerate()
+            .map(|(index, upload)| json!({"id": index, "filename": upload.name}))
+            .collect();
         let mut form = Form::new().text(
             "payload_json",
             serde_json::to_string(&body)
@@ -1029,24 +1086,18 @@ impl Rest {
                 .map_err(|_| TransportError::Invalid("upload media type is invalid".into()))?;
             form = form.part(format!("files[{index}]"), part);
         }
-        let path = format!("/channels/{channel}/messages");
-        let route = format!("POST {path}");
+        let route = format!("{method} {path}");
         self.wait_for_rate_limit(&route).await;
         let response = self
             .client
-            .post(format!("{}{}", self.base, path))
+            .request(method, format!("{}{}", self.base, path))
             .multipart(form)
             .send()
             .await
             .map_err(|error| TransportError::Net(trim_net_error(error)))?;
         self.observe_rate_limit(&route, response.headers());
         let status = response.status();
-        let value = self.classify(status, response).await?;
-        value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+        self.classify(status, response).await
     }
 
     /// Send model text as one or more bounded V2 Text Display messages.
@@ -1079,9 +1130,23 @@ impl Rest {
     /// Edit a live V2 message. Legacy fields are explicitly cleared because
     /// Discord preserves message flags across edits.
     pub async fn edit_message_v2(&self, channel: u64, message: &str, components: &[Value]) -> bool {
-        if crate::render::validate_components(components).is_err() {
-            return false;
+        match self.edit_v2(channel, message, components).await {
+            Ok(()) => true,
+            Err(TransportError::Http(404, _)) | Err(TransportError::Invalid(_)) => false,
+            Err(_) => true,
         }
+    }
+
+    /// [`Self::edit_message_v2`] with the failure kept: a streamed reply must
+    /// tell a deleted message (stop editing it) from a transient error (try
+    /// again next frame), and must never count a refused edit as delivered.
+    pub async fn edit_v2(
+        &self,
+        channel: u64,
+        message: &str,
+        components: &[Value],
+    ) -> Result<(), TransportError> {
+        crate::render::validate_components(components).map_err(TransportError::Invalid)?;
         let body = json!({
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
@@ -1090,14 +1155,26 @@ impl Rest {
             "embeds": [],
             "sticker_ids": [],
         });
-        match self
-            .patch(&format!("/channels/{channel}/messages/{message}"), &body)
+        self.patch(&format!("/channels/{channel}/messages/{message}"), &body)
             .await
-        {
-            Ok(_) => true,
-            Err(TransportError::Http(404, _)) => false,
-            Err(_) => true,
-        }
+            .map(|_| ())
+    }
+
+    /// Delete one of our own messages: a streamed preview the final answer
+    /// could not land in, so the durable resend does not post it twice.
+    pub async fn delete_message(&self, channel: u64, message: &str) -> Result<(), TransportError> {
+        let path = format!("/channels/{channel}/messages/{message}");
+        let route = format!("DELETE {path}");
+        self.wait_for_rate_limit(&route).await;
+        let resp = self
+            .client
+            .delete(format!("{}{}", self.base, path))
+            .send()
+            .await
+            .map_err(|e| TransportError::Net(trim_net_error(e)))?;
+        self.observe_rate_limit(&route, resp.headers());
+        let status = resp.status();
+        self.classify(status, resp).await.map(|_| ())
     }
 
     /// Respond to an application command/component with a V2 message.

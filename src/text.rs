@@ -23,7 +23,7 @@ pub fn split_message(s: &str, limit: usize) -> Result<Vec<String>, String> {
 }
 
 /// Longest prefix of `s` (on a char boundary) within `limit` UTF-16 units.
-fn prefix_within_limit(s: &str, limit: usize) -> &str {
+pub fn prefix_within_limit(s: &str, limit: usize) -> &str {
     if utf16_len(s) <= limit {
         return s;
     }

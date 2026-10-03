@@ -12,6 +12,11 @@
 //! **never the tool's output**. A chat surface is a status feed, not a
 //! transcript; echoing results dumps file contents, memory snapshots and
 //! credentials into the channel.
+//!
+//! The sink also carries gray's streamed `text` rows, in order with the tool
+//! rows, so [`crate::stream`] can lay the turn out as Hermes does. Text rows
+//! stay out of the bounded history: they would crowd the tool rows the
+//! optional end-of-turn card is built from.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -32,16 +37,12 @@ const MAX_CARD_ROWS: usize = 5;
 /// stays well under.
 const MAX_CARD_CHARS: usize = 3600;
 
-/// Lines kept in the bubble: the current one plus two before it, so a
-/// pause reads as a sequence rather than a single blinking line.
-const KEEP_LINES: usize = 3;
-
 /// Hermes' suggested cap for a tool preview line
 /// (`display.tool_preview_length: 80`).
 const MAX_PREVIEW_CHARS: usize = 80;
 
 /// Seconds between edits of the same bubble (Discord rate-limits edits).
-const MIN_EDIT_GAP: f64 = 1.0;
+pub const MIN_EDIT_GAP: f64 = 1.0;
 
 #[derive(Default)]
 struct ScopeState {
@@ -74,6 +75,16 @@ pub fn enabled(config: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// The end-of-turn tally card (`⋯ 12.4s · ran 3 commands`). Off by default:
+/// Hermes posts none, and the progress bubbles already stay in the channel
+/// as the turn's record. `"activity_card": true` brings it back.
+pub fn card_enabled(config: &Value) -> bool {
+    config
+        .get("activity_card")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Start a fresh history for one conversation. The daemon may have a stale
 /// entry after a crash or a cancelled turn; never let it bleed into the next
 /// turn's card.
@@ -104,6 +115,9 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
         scope.pending.pop_front();
     }
     scope.pending.push_back(row.clone());
+    if row.get("phase").and_then(Value::as_str) == Some("text") {
+        return;
+    }
     if scope.history.len() >= MAX_HISTORY {
         scope.history.pop_front();
     }
@@ -159,21 +173,6 @@ pub fn drain_for(s: &Sink, scope: &str) -> Vec<Value> {
         .get_mut(scope)
         .map(|scope| scope.pending.drain(..).collect())
         .unwrap_or_default()
-}
-
-/// Clone the pending rows without consuming them. The gateway peeks before
-/// the edit rate-limit gate: draining first drops rows the gate then
-/// refuses, which sticks the bubble (bare "Running" with the command never
-/// following) until the turn ends.
-pub fn peek_for(s: &Sink, scope: &str) -> Vec<Value> {
-    match s.lock() {
-        Ok(state) => state
-            .scopes
-            .get(scope)
-            .map(|scope| scope.pending.iter().cloned().collect())
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Remove a completed turn and return its full bounded history. Removing the
@@ -236,18 +235,50 @@ fn is_quiet_row(tool: &str, detail: &str) -> bool {
     false
 }
 
-/// The tool's icon plus its short name. Shell work reads the way gray's own
-/// transcript labels it — "Running" while live, "Ran" once done — never
-/// "terminal".
-fn label(tool: &str) -> String {
+/// The tool's name as a line starts with it, plain text (no icons). Shell
+/// work reads the way gray's own transcript labels it — "Running" while
+/// live, "Ran" once done — never "terminal". Any other tool goes by its
+/// display `name` (see [`name_of`]).
+fn label(tool: &str, name: &str) -> String {
     match tool {
-        "bash" | "shell" => "💻 Running".to_string(),
-        "read" | "cat" => "📖 read".to_string(),
-        "write" | "create" | "str_replace" => "✍️ write".to_string(),
-        "edit" | "apply_patch" => "✍️ edit".to_string(),
-        "" => "🔧 working".to_string(),
-        other => format!("🔧 {other}"),
+        "bash" | "shell" => "Running".to_string(),
+        "read" | "cat" => "Read".to_string(),
+        "write" | "create" | "str_replace" => "Write".to_string(),
+        "edit" | "apply_patch" => "Edit".to_string(),
+        "" => "Working".to_string(),
+        _ => name.to_string(),
     }
+}
+
+/// What to call a row's tool: gray's `label` (the plugin's manifest label,
+/// or the wire name humanized), else the same humanizing done here for a
+/// gray that sends no label. `discord_send` reads "Discord Send".
+fn name_of(row: &Value) -> String {
+    row.get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| humanize(row.get("tool").and_then(Value::as_str).unwrap_or("")))
+}
+
+/// gray's `humanize_tool_name`: `web_search` → `Web Search`; a single token
+/// (`bash`, `custom`) is already displayable and stays as it is.
+pub fn humanize(name: &str) -> String {
+    if !name.contains(['_', '-']) {
+        return name.to_string();
+    }
+    name.split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One line for one row, or `None` when the row adds nothing a reader
@@ -257,35 +288,46 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
     let phase = row.get("phase").and_then(Value::as_str).unwrap_or("");
     let tool = row.get("tool").and_then(Value::as_str).unwrap_or("");
     let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
+    let name = name_of(row);
     match phase {
         // The call has begun but has not reported its arguments yet. The
         // matching `tool_ran` overwrites this line rather than stacking a
         // second one for the same call.
-        "tool_started" => Some(label(tool)),
-        "tool_ran" => Some(ran_line(tool, detail, elapsed)),
+        "tool_started" => Some(label(tool, &name)),
+        "tool_ran" => Some(ran_line(tool, &name, detail, elapsed)),
         "tool_finished" if row.get("error").and_then(Value::as_bool) == Some(true) => Some(
-            format!("❌ {} failed", if tool.is_empty() { "tool" } else { tool }),
+            format!("{} failed", if tool.is_empty() { "Tool" } else { &name }),
         ),
-        "provider_retry" if !detail.is_empty() => Some(format!("⚠️ {}", one_line(detail))),
-        "compacted" => Some("🗜 context compacted".to_string()),
+        "provider_retry" if !detail.is_empty() => {
+            Some(format!("Provider retry: {}", one_line(detail)))
+        }
+        "compacted" => Some("Context compacted".to_string()),
         _ => None,
     }
 }
 
-fn ran_line(tool: &str, detail: &str, elapsed: Option<u64>) -> String {
-    shell_line(tool, detail, elapsed, false)
+/// A call reads "Running" while it runs and "Ran" once it has returned —
+/// the feed stays in the channel after the turn, so it must read as done.
+fn ran_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> String {
+    shell_line(tool, name, detail, elapsed, elapsed.is_some())
+}
+
+/// Whether `row` puts a line in the feed. A row that does not (a quiet
+/// finish, a phase marker) never opens a new tool bubble on its own.
+pub fn narrates(row: &Value) -> bool {
+    line(row, None).is_some()
 }
 
 /// Receipt version of [`ran_line`]: the turn is over, so shell work reads as
 /// completed — "Ran", the way gray's own transcript labels it.
-fn card_line(tool: &str, detail: &str, elapsed: Option<u64>) -> String {
-    shell_line(tool, detail, elapsed, true)
+fn card_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> String {
+    shell_line(tool, name, detail, elapsed, true)
 }
 
-fn shell_line(tool: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
+fn shell_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
     let mut out = match tool {
-        "bash" | "shell" if done => "💻 Ran".to_string(),
-        _ => label(tool),
+        "bash" | "shell" if done => "Ran".to_string(),
+        _ => label(tool, name),
     };
     // A shell command earns cleaning (no redirections, no `;`-chain essay);
     // a file tool's detail is already a clean path.
@@ -384,11 +426,14 @@ struct BubbleLine {
     /// instead of adding a second line for the same call.
     start: bool,
     tool: String,
+    /// The call it narrates, so parallel calls each find their placeholder.
+    call_id: String,
     quiet: bool,
 }
 
-/// Render a drained batch into the bubble body: the last `KEEP_LINES`
-/// distinct lines, oldest first. `None` when nothing is worth showing.
+/// Render one tool bubble's rows into its body: every distinct line, oldest
+/// first (Hermes' accumulating progress bubble). `None` when nothing is
+/// worth showing.
 pub fn render(rows: &[Value]) -> Option<String> {
     let by_call = elapsed_by_call(rows);
     let mut lines: Vec<BubbleLine> = Vec::new();
@@ -404,6 +449,25 @@ pub fn render(rows: &[Value]) -> Option<String> {
         let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
         let quiet = is_quiet_row(&tool, detail);
         let start = row.get("phase").and_then(Value::as_str) == Some("tool_started");
+        let call_id = row
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // Parallel calls start together and report later: each `tool_ran`
+        // replaces its own call's placeholder, wherever it sits.
+        if !start && !call_id.is_empty() {
+            if let Some(placeholder) = lines
+                .iter_mut()
+                .rev()
+                .find(|line| line.start && line.call_id == call_id)
+            {
+                placeholder.text = text;
+                placeholder.start = false;
+                placeholder.quiet = quiet;
+                continue;
+            }
+        }
         match lines.last_mut() {
             // One call, one line: its `tool_ran` overwrites the placeholder.
             Some(last) if !start && last.start && last.tool == tool => {
@@ -417,6 +481,7 @@ pub fn render(rows: &[Value]) -> Option<String> {
                 text,
                 start,
                 tool,
+                call_id,
                 quiet,
             }),
         }
@@ -436,14 +501,14 @@ pub fn render(rows: &[Value]) -> Option<String> {
     if shown.is_empty() {
         return None;
     }
-    let skip = shown.len().saturating_sub(KEEP_LINES);
-    Some(shown[skip..].join("\n"))
+    Some(shown.join("\n"))
 }
 
 #[derive(Default)]
 struct CardEntry {
     call_id: String,
     tool: String,
+    name: String,
     detail: String,
     elapsed: Option<u64>,
     failed: bool,
@@ -473,6 +538,7 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
             "tool_ran" => entries.push(CardEntry {
                 call_id,
                 tool,
+                name: name_of(row),
                 detail: row
                     .get("detail")
                     .and_then(Value::as_str)
@@ -494,6 +560,7 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
                     entries.push(CardEntry {
                         call_id,
                         tool,
+                        name: name_of(row),
                         failed,
                         ..CardEntry::default()
                     });
@@ -502,11 +569,11 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
             "provider_retry" => {
                 if let Some(detail) = row.get("detail").and_then(Value::as_str) {
                     if !detail.trim().is_empty() {
-                        notices.push(format!("⚠️ {}", one_line(detail)));
+                        notices.push(format!("Provider retry: {}", one_line(detail)));
                     }
                 }
             }
-            "compacted" => notices.push("🗜 context compacted".to_string()),
+            "compacted" => notices.push("Context compacted".to_string()),
             _ => {}
         }
     }
@@ -522,7 +589,12 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
         .collect();
     for entry in actions.iter().take(MAX_CARD_ROWS) {
         out.push('\n');
-        out.push_str(&card_line(&entry.tool, &entry.detail, entry.elapsed));
+        out.push_str(&card_line(
+            &entry.tool,
+            &entry.name,
+            &entry.detail,
+            entry.elapsed,
+        ));
         if entry.failed {
             out.push_str("\n  ↳ failed");
         }
@@ -548,12 +620,36 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
 /// Hermes' post-turn accounting line: `⋯ 12.4s · edited 2 files · read 4
 /// files · ran 3 commands`. Counted from the same rows, so it is free.
 fn tally(entries: &[CardEntry], turn_ms: Option<u64>) -> String {
+    let parts = counts(entries.iter().map(|entry| entry.tool.as_str()));
+    if parts.is_empty() {
+        return String::new();
+    }
+    let head = match turn_ms {
+        Some(ms) => format!("⋯ {}", secs(ms)),
+        None => "⋯".to_string(),
+    };
+    format!("{head} · {}", parts.join(" · "))
+}
+
+/// The same accounting for a live footer: `ran 2 commands · edited 1 file`,
+/// one count per call that reported its arguments. Empty for a turn that
+/// has not touched a tool.
+pub fn summary(rows: &[Value]) -> String {
+    counts(
+        rows.iter()
+            .filter(|row| row.get("phase").and_then(Value::as_str) == Some("tool_ran"))
+            .map(|row| row.get("tool").and_then(Value::as_str).unwrap_or("")),
+    )
+    .join(" · ")
+}
+
+fn counts<'a>(tools: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut ran = 0usize;
     let mut read = 0usize;
     let mut edited = 0usize;
     let mut other = 0usize;
-    for entry in entries {
-        match entry.tool.as_str() {
+    for tool in tools {
+        match tool {
             "bash" | "shell" => ran += 1,
             "read" | "cat" | "find" | "grep" | "glob" | "ls" => read += 1,
             "write" | "create" | "str_replace" | "edit" | "apply_patch" => edited += 1,
@@ -574,14 +670,7 @@ fn tally(entries: &[CardEntry], turn_ms: Option<u64>) -> String {
     if other > 0 {
         parts.push(format!("called {other} tool{}", plural(other)));
     }
-    if parts.is_empty() {
-        return String::new();
-    }
-    let head = match turn_ms {
-        Some(ms) => format!("⋯ {}", secs(ms)),
-        None => "⋯".to_string(),
-    };
-    format!("{head} · {}", parts.join(" · "))
+    parts
 }
 
 fn plural(n: usize) -> &'static str {
@@ -590,14 +679,4 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
-}
-
-/// True when `text` is worth an edit: it changed, and the gap since the
-/// last edit has passed. Content equality is the real gate — Discord
-/// rejects a no-op edit, and a quiet turn should send nothing at all.
-pub fn should_publish(text: &str, last: Option<&str>, now: f64, last_at: f64) -> bool {
-    if Some(text) == last {
-        return false;
-    }
-    last_at < 0.0 || now - last_at >= MIN_EDIT_GAP
 }

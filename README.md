@@ -279,41 +279,132 @@ the check happens in the adapter before any typing call, so `false` stops
 the whole path (the REST poke and the host hook) rather than one loop of it.
 Reload by restarting the service (`gray discord restart`).
 
-## Activity narration
+## Live replies and activity narration
 
-While the agent works, one live status message per turn shows what it is
-doing, overwritten in place as the turn proceeds. At the end of the turn,
-Discord also keeps a separate bounded tool-activity card, so activity does
-not disappear when the next turn starts. Both show actions only — one line
-per meaningful call, never tool output. Shell introspection (`ls`, `cat`,
-…) stays unnarrated, and shell work reads the way gray's own transcript
-labels it (`Running` live, `Ran` on the receipt):
+Each turn is one live Components V2 card, edited in place while the agent
+works:
 
 ````markdown
-💻 Running `gray view /tmp/shot.png`
-
-⋯ 0.9s · ran 2 commands
-💻 Ran `gray view /tmp/shot.png` (0.3s)
+┃ Let me check what's running on the box.
+┃ -# Ran `gray ps` (0.3s)
+┃ **Done / idle:** claude-sub plugin agent: done. PR #173 is ▉
+┃ ───────────────────────────────────────────────
+┃ -# Working · started 20 seconds ago · ran 1 command    [Stop]
 ````
 
-The rows come from gray core's `--json` progress stream (phase + tool +
-detail), so every chat surface can render the same data; only the
-presentation is Discord-specific. Safe tool activity is shown by default.
-Raw model reasoning is never sent to Discord: the bridge always runs gray
-with `GRAY_SHOW_REASONING=0`, even when activity is enabled. Secrets are
-redacted and everything is capped before it leaves gray, but secret-free
-paths stay verbatim so narration names the actual file. The card keeps at
-most 5 actions plus a tally and never includes reasoning.
+- The card is posted as soon as there is something to show. The answer then
+  streams into it about once a second with a ` ▉` cursor.
+- Prose and tool lines keep their order: each run of prose, then the tool
+  lines it led to (small grey subtext), then the next prose. A group of
+  more than 6 tool lines folds to a count plus its latest 2 lines; the full
+  list sits in a spoiler box below the card (tap to show).
+- Everything is plain text: no emojis in tool lines, the footer or buttons.
+- The footer's clock is a Discord timestamp (`<t:…:R>`): every client keeps
+  "Working · started 20 seconds ago" current on its own, so a quiet turn costs no
+  edits. It also tallies the turn (`ran 3 commands · edited 1 file`).
+- **Stop** (danger button) stops the turn, like `/stop`. The pressed card
+  flips to "Stopping…" in the same interaction response, then settles.
+  Any admitted user in the channel can press it once.
+- The accent bar tracks the turn: blurple while working, green when done
+  (`Done in 7.2s · ran 1 command`), red on failure, grey when stopped
+  (`Stopped after 12s · actions may already have happened`). A failed or
+  stopped card is the turn's notice, so nothing extra is posted.
+- Files the answer names with `MEDIA:` tags land **inside** the finished
+  card: images and videos in a Media Gallery, anything else as File cards
+  (up to 10; more go out as a separate post).
+- The finished card offers **Retry** (run the same message again as a
+  new turn) and **New chat** (same as `/new`). Only the latest card in a
+  conversation keeps them; starting the next turn removes them from the
+  previous one. Buttons expire after a day.
+- A long turn continues in further cards (Discord allows 40 components and
+  4000 characters per message), cut at a newline, with code fences closed
+  and reopened at the cut, up to 8 cards. Only the last card has the footer.
 
-Off in `config.json`:
+The final edit is the authoritative answer, recorded in the durable outbox
+as delivered, so a restart never posts it twice. If the answer cannot land
+in place (a refused post, a deleted card), the preview is retracted and the
+answer is posted durably instead. Slash command turns answer through their
+interaction; their card shows tool lines and Stop only.
+
+The agent itself can author any Components V2 surface (all message and
+modal component types: containers, sections, galleries, files, buttons, every
+select, modals with text inputs, file uploads, radio groups and checkboxes)
+through its `discord_send_ui` and `discord_open_modal` tools.
+
+Streaming needs a gray core that emits `text` rows (`GRAY_STREAM_TEXT=1`,
+set by the bridge). With an older gray the bridge falls back to posting the
+whole answer at the end. Off in `config.json`:
+
+```json
+{"stream_replies": false}
+```
+
+Tool lines show actions only: one line per meaningful call, never tool
+output. Shell introspection (`ls`, `cat`, …) stays unnarrated, and shell
+work reads the way gray's own transcript labels it (`Running` while it
+runs, `Ran` with its duration once it returns). The card stays in the
+channel as the turn's record.
+
+The rows come from gray core's `--json` progress stream (phase + tool +
+detail, plus the streamed prose), so every chat surface can render the same
+data; only the presentation is Discord-specific. Raw model reasoning is
+never sent to Discord: the bridge always runs gray with
+`GRAY_SHOW_REASONING=0`. Secrets are redacted before anything leaves gray
+(streamed prose holds back the word still being typed, so a key is never
+shown half written), but secret-free paths stay verbatim so narration names
+the actual file.
+
+Tool lines off (the reply still streams into its card):
 
 ```json
 {"activity_indicator": false}
 ```
 
-Absent means on. Turning it off stops both the live status bubble and the
-persistent tool card; it never enables raw reasoning. Reload by restarting the service
-(`gray discord restart`).
+The old end-of-turn tally card (`⋯ 0.9s · ran 2 commands` plus up to 5
+actions) is opt-in with `{"activity_card": true}`. Reload any of these by
+restarting the service (`gray discord restart`).
+
+## Questions from the agent
+
+The bridge has no question tool of its own, and neither does gray. Questions
+come from a questions plugin, such as
+[gray-questions](https://github.com/vstaln/gray-questions)
+(`request_user_input`, shown as "Request User Input"). Without one, nothing
+ever asks. With one, its questions reach Discord: the bridge runs gray with
+`GRAY_JSON_ASK=1`, gray hands each `host/ask` over as an `ask` row on the
+`--json` wire, and the bridge posts a question card in the turn's channel
+and writes the answers back on gray's stdin.
+
+Give the bridge's turns the plugin with `gray discord share`, then restart:
+
+```sh
+gray discord share --plugin-argv '["/path/to/gray-questions"]'
+```
+
+````markdown
+┃ -# Question from gray
+┃ **Branch** · Which branch should I deploy?
+┃ -# **main**: production
+┃ [main] [staging] [Other…]
+┃ ───────────────────────────────────────
+┃ -# Waiting for your answer · expires in 4 minutes · or reply in this channel
+````
+
+- 1-3 questions per card. Up to 4 options show as buttons; more, or a
+  multiple choice, show as a select menu. "Other…" (or "Answer…" when there
+  are no options) opens a form with a text box.
+- A plain message in the channel answers every open question in your own
+  words, instead of starting a new turn.
+- The card is redrawn in place as you answer: each question shows its
+  answer, the accent turns green and the controls go away.
+- With no answer in about 4 minutes the card closes ("No answer in time")
+  and the plugin gets no answer for it, the same as any headless run.
+  Stopping the turn closes the card too.
+- Answers go back by question id, `{"<id>": ["<label>"]}`; typed answers
+  start with `user_note: `, the convention gray-questions already reads.
+
+Anyone admitted to the bot in that channel may answer. Plain text
+throughout, no emojis.
 
 ## Sessions and new conversations
 

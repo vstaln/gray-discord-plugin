@@ -107,7 +107,7 @@ fn decode_request_body(headers: &HashMap<String, String>, body: &[u8]) -> serde_
         return serde_json::Value::Null;
     };
     let marker = format!("--{boundary}").into_bytes();
-    for part in body.split(|byte| byte == &marker[0]) {
+    for part in split_on(body, &marker) {
         if part.is_empty() || part.starts_with(b"--") {
             continue;
         }
@@ -127,6 +127,25 @@ fn decode_request_body(headers: &HashMap<String, String>, body: &[u8]) -> serde_
         }
     }
     serde_json::Value::Null
+}
+
+/// Split `body` on every occurrence of the multipart boundary `marker`
+/// (the whole byte sequence: a payload may well contain `-`).
+fn split_on<'a>(body: &'a [u8], marker: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at + marker.len() <= body.len() {
+        if &body[at..at + marker.len()] == marker {
+            parts.push(&body[start..at]);
+            at += marker.len();
+            start = at;
+        } else {
+            at += 1;
+        }
+    }
+    parts.push(&body[start..]);
+    parts
 }
 
 // flags 262144 = 1<<18 APP_FLAG_MESSAGE_CONTENT so doctor intent checks pass.
@@ -188,9 +207,12 @@ impl Stub {
                             .await;
                         } else if path == "/api/v10/guilds/77/members/123" {
                             respond(&mut stream, 200, r#"{"roles":["78"]}"#).await;
-                        } else if method == "PATCH"
-                            && (path == "/api/v10/channels/42/messages/1000"
-                                || path == "/api/v10/channels/42/messages/1001")
+                        } else if (method == "PATCH" || method == "DELETE")
+                            && path
+                                .strip_prefix("/api/v10/channels/42/messages/")
+                                .is_some_and(|id| {
+                                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+                                })
                         {
                             let body = decode_request_body(&headers, &body);
                             let n = {

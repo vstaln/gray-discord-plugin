@@ -10,9 +10,14 @@ service so the two protocol versions match.
 The runner consumes NDJSON, not terminal output or session-file text searches.
 Progress contains safe phase/tool labels, redacted one-line details, and a
 bounded redacted output for completed tools (plus an internal call ID for
-pairing parallel results). Discord drains rows per conversation, keeps a live
-status bubble, and posts a separate bounded tool-activity card at turn end.
-Raw reasoning is suppressed before it reaches the bridge. The terminal result includes
+pairing parallel results). With `GRAY_STREAM_TEXT=1` the stream also carries
+the assistant's prose as `text` rows: per segment (a run of prose between tool
+calls), append-only `delta` lines plus a provisional `tail`, closed by a
+`done` row. Discord drains rows per conversation into one live Components V2
+card per turn: prose and tool lines in order, a status footer with a Stop
+button, an accent that tracks the outcome. The final edit becomes the durable
+answer (see README, "Live replies"). Raw reasoning is suppressed before it reaches the bridge. The
+terminal result includes
 `session_id`,
 `turn_id`, final redacted assistant text, and provider accounting. Errors are
 sanitized and retain a nonzero exit status. Malformed output is rejected.

@@ -321,3 +321,81 @@ async fn no_override_means_no_model_flag() {
     let argv = std::fs::read_to_string(&out).unwrap();
     assert!(!argv.lines().any(|l| l == "--model"), "argv was:\n{argv}");
 }
+
+/// A plugin's question arrives as an `ask` row; the handler's answers go
+/// back on gray's stdin, and the turn carries on to its result.
+#[tokio::test]
+async fn an_ask_row_is_answered_on_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let got = root.join("answer.txt");
+    let exe = root.join("asking-gray");
+    let script = format!(
+        r#"#!/bin/sh
+[ "$GRAY_JSON_ASK" = "1" ] || exit 3
+echo '{{"protocol":1,"turn_id":"t","type":"progress","phase":"ask","ask_id":7,"questions":[{{"id":"branch","question":"Which?","options":[{{"label":"main"}}]}}]}}'
+read -r line
+printf '%s\n' "$line" > "{got}"
+echo '{{"protocol":1,"turn_id":"t","type":"result","session_id":"11111111-1111-1111-1111-111111111111","text":"deployed"}}'
+"#,
+        got = got.display(),
+    );
+    write_exe(&exe, &script);
+    let config = base_config(&exe, &home);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress_seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let handler_seen = seen.clone();
+    let ask: gray_discord::runner::AskFn = std::sync::Arc::new(move |questions, _over| {
+        handler_seen.lock().unwrap().push(questions);
+        Box::pin(async { serde_json::json!({"branch": ["main"]}) })
+    });
+    let counter = progress_seen.clone();
+    let opts = RunOpts {
+        ask: Some(ask),
+        progress: Some(Box::new(move |_row: &serde_json::Value| {
+            *counter.lock().unwrap() += 1;
+        })),
+        ..default_opts()
+    };
+    let out = run_gray(&config, &root.join("plugin.json"), "chat:ask", "go", opts)
+        .await
+        .unwrap();
+    assert!(out.contains("deployed"), "{out}");
+    let line: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&got).unwrap().trim()).unwrap();
+    assert_eq!(
+        line,
+        serde_json::json!({"ask_id": 7, "answers": {"branch": ["main"]}})
+    );
+    assert_eq!(seen.lock().unwrap()[0][0]["id"], "branch");
+    assert_eq!(
+        *progress_seen.lock().unwrap(),
+        0,
+        "an ask row is not narration"
+    );
+}
+
+/// Without a handler, gray is not told to ask: a questions plugin's asks
+/// resolve empty, as in any headless run.
+#[tokio::test]
+async fn without_a_handler_gray_is_not_asked_to_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let exe = root.join("plain-gray");
+    write_exe(
+        &exe,
+        "#!/bin/sh\n[ -z \"$GRAY_JSON_ASK\" ] || exit 3\necho '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"ok\"}'\n",
+    );
+    let config = base_config(&exe, &home);
+    run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:plain",
+        "go",
+        default_opts(),
+    )
+    .await
+    .unwrap();
+}

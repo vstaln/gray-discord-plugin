@@ -136,7 +136,31 @@ CREATE INDEX IF NOT EXISTS ui_component_states_document_idx
     ON ui_component_states(document_id, expires_at);
 CREATE INDEX IF NOT EXISTS ui_component_events_document_idx
     ON ui_component_events(document_id, created_at);
+CREATE TABLE IF NOT EXISTS asks (
+    ask_id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    message_id TEXT,
+    questions_json TEXT NOT NULL,
+    answers_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'open',
+    created REAL NOT NULL,
+    expires REAL NOT NULL
+);
 ";
+
+/// One question card (a plugin's `host/ask`): what was asked, what has been
+/// answered so far (question id -> answers), and whether it is still open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskRow {
+    pub ask_id: String,
+    pub channel: String,
+    pub message_id: Option<String>,
+    pub questions: Value,
+    pub answers: Value,
+    /// `open`, `answered`, `expired` or `cancelled`.
+    pub state: String,
+    pub expires: f64,
+}
 
 fn connect(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
@@ -430,6 +454,52 @@ impl Store {
         })
     }
 
+    /// Complete a turn whose answer already streamed into Discord. The
+    /// landed messages are recorded as delivered parts (body and message
+    /// id), so recovery never posts them again. `media` is a media-only part
+    /// (`MEDIA:` lines) the delivery worker still has to upload; without it
+    /// the turn is `sent` at once.
+    pub fn complete_streamed(
+        &self,
+        id: &str,
+        receipt: &Value,
+        parts: &[(String, String)],
+        media: Option<&str>,
+    ) -> Result<(), String> {
+        if parts.is_empty() && media.is_none() {
+            return Err("A streamed answer needs a delivered part or media".to_string());
+        }
+        let receipt_text =
+            serde_json::to_string(receipt).map_err(|_| "cannot encode receipt".to_string())?;
+        let state = if media.is_some() { "delivery" } else { "sent" };
+        with_conn(&self.path, |db| {
+            let n = db
+                .execute(
+                    "UPDATE inbox SET state=?1,receipt=?2 WHERE id=?3 AND state='running'",
+                    params![state, receipt_text, id],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            if n == 0 {
+                return Err("Item is not running".to_string());
+            }
+            for (part, (content, message_id)) in parts.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO outbox(id,part,content,render,message_id) VALUES(?1,?2,?3,'v2',?4)",
+                    params![id, part as i64, content, message_id],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            if let Some(media) = media {
+                db.execute(
+                    "INSERT INTO outbox(id,part,content,render) VALUES(?1,?2,?3,'v2')",
+                    params![id, parts.len() as i64, media],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            Ok(())
+        })
+    }
+
     /// Complete a turn with a precompiled V2 document. The document is kept
     /// as JSON in the durable row so delivery can resume after a restart;
     /// callers must run it through the compiler before calling this method.
@@ -470,6 +540,17 @@ impl Store {
     }
 
     pub fn fail(&self, id: &str, code: &str) -> Result<(), String> {
+        self.fail_with(id, code, None)
+    }
+
+    /// [`Self::fail`] for a turn whose live card already shows the failure
+    /// (message `shown`): the notice is recorded as delivered there instead
+    /// of being posted a second time.
+    pub fn fail_shown(&self, id: &str, code: &str, shown: &str) -> Result<(), String> {
+        self.fail_with(id, code, Some(shown))
+    }
+
+    fn fail_with(&self, id: &str, code: &str, shown: Option<&str>) -> Result<(), String> {
         let code = match code {
             "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,
             _ => "agent_failed",
@@ -483,8 +564,8 @@ impl Store {
             )
             .map_err(|_| "cannot fail".to_string())?;
             db.execute(
-                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,0,?2,'v2',NULL,NULL)",
-                params![id, notice],
+                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'v2',NULL,NULL,?3)",
+                params![id, notice, shown],
             )
             .map_err(|_| "cannot fail".to_string())?;
             Ok(())
@@ -690,9 +771,11 @@ impl Store {
             let Some((stored_kind, stored_user, stored_channel, resource, expires)) = row else {
                 return Ok(None);
             };
+            // `*` binds a token to its channel alone: any admitted user
+            // there may press it (a turn's Stop button).
             let valid = expires >= now
                 && stored_kind == kind
-                && stored_user == user_id
+                && (stored_user == user_id || stored_user == "*")
                 && stored_channel == channel_id;
             if valid {
                 db.execute(
@@ -1032,6 +1115,151 @@ pub(crate) fn enqueue_in_tx(db: &Connection, request: EnqueueRequest<'_>) -> Res
     )
     .map_err(|_| "cannot enqueue".to_string())?;
     Ok(true)
+}
+
+fn row_ask(r: &rusqlite::Row) -> Result<AskRow, rusqlite::Error> {
+    let questions: String = r.get("questions_json")?;
+    let answers: String = r.get("answers_json")?;
+    Ok(AskRow {
+        ask_id: r.get("ask_id")?,
+        channel: r.get("channel")?,
+        message_id: r.get("message_id")?,
+        questions: serde_json::from_str(&questions).unwrap_or(Value::Null),
+        answers: serde_json::from_str(&answers).unwrap_or_else(|_| serde_json::json!({})),
+        state: r.get("state")?,
+        expires: r.get("expires")?,
+    })
+}
+
+const ASK_COLUMNS: &str =
+    "ask_id,channel,message_id,questions_json,answers_json,state,created,expires";
+
+impl Store {
+    /// Open a question card. `questions` is the validated list it asks.
+    pub fn ask_create(
+        &self,
+        ask_id: &str,
+        channel: &str,
+        questions: &Value,
+        expires: f64,
+    ) -> Result<(), String> {
+        let encoded = serde_json::to_string(questions).map_err(|_| "cannot encode ask")?;
+        with_conn(&self.path, |db| {
+            db.execute(
+                "INSERT INTO asks(ask_id,channel,questions_json,created,expires) VALUES(?1,?2,?3,?4,?5)",
+                params![ask_id, channel, encoded, now_secs(), expires],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store ask".to_string())
+        })
+    }
+
+    pub fn ask_set_message(&self, ask_id: &str, message_id: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "UPDATE asks SET message_id=?1 WHERE ask_id=?2",
+                params![message_id, ask_id],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot update ask".to_string())
+        })
+    }
+
+    pub fn ask_get(&self, ask_id: &str) -> Result<Option<AskRow>, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                &format!("SELECT {ASK_COLUMNS} FROM asks WHERE ask_id=?1"),
+                params![ask_id],
+                row_ask,
+            )
+            .optional_str()
+        })
+    }
+
+    /// The newest open, unexpired question card in `channel`.
+    pub fn ask_open_in(&self, channel: &str, now: f64) -> Result<Option<AskRow>, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                &format!(
+                    "SELECT {ASK_COLUMNS} FROM asks WHERE channel=?1 AND state='open' AND expires>?2
+                     ORDER BY created DESC LIMIT 1"
+                ),
+                params![channel, now],
+                row_ask,
+            )
+            .optional_str()
+        })
+    }
+
+    /// Record `answers` for question `question_id` of an open card. The
+    /// first answer to a question wins; once every question has one the
+    /// card is `answered`. `None` when the card is closed, expired, or the
+    /// question was already answered.
+    pub fn ask_answer(
+        &self,
+        ask_id: &str,
+        question_id: &str,
+        answers: &[String],
+        now: f64,
+    ) -> Result<Option<AskRow>, String> {
+        with_conn(&self.path, |db| {
+            let Some(mut row) = db
+                .query_row(
+                    &format!("SELECT {ASK_COLUMNS} FROM asks WHERE ask_id=?1"),
+                    params![ask_id],
+                    row_ask,
+                )
+                .optional_str()?
+            else {
+                return Ok(None);
+            };
+            let known = row.questions.as_array().is_some_and(|qs| {
+                qs.iter()
+                    .any(|q| q.get("id").and_then(Value::as_str) == Some(question_id))
+            });
+            if row.state != "open"
+                || row.expires <= now
+                || !known
+                || row.answers.get(question_id).is_some()
+            {
+                return Ok(None);
+            }
+            row.answers[question_id] = serde_json::json!(answers);
+            let total = row.questions.as_array().map_or(0, Vec::len);
+            let answered = row.answers.as_object().map_or(0, |a| a.len());
+            if answered >= total {
+                row.state = "answered".to_string();
+            }
+            db.execute(
+                "UPDATE asks SET answers_json=?1,state=?2 WHERE ask_id=?3",
+                params![row.answers.to_string(), row.state, ask_id],
+            )
+            .map_err(|_| "cannot record answer".to_string())?;
+            Ok(Some(row))
+        })
+    }
+
+    /// Close an open card as `expired` or `cancelled`. `None` when it had
+    /// already closed (answered in the meantime, say).
+    pub fn ask_close(&self, ask_id: &str, state: &str) -> Result<Option<AskRow>, String> {
+        with_conn(&self.path, |db| {
+            let n = db
+                .execute(
+                    "UPDATE asks SET state=?1 WHERE ask_id=?2 AND state='open'",
+                    params![state, ask_id],
+                )
+                .map_err(|_| "cannot close ask".to_string())?;
+            if n == 0 {
+                return Ok(None);
+            }
+            db.query_row(
+                &format!("SELECT {ASK_COLUMNS} FROM asks WHERE ask_id=?1"),
+                params![ask_id],
+                row_ask,
+            )
+            .optional_str()
+        })
+    }
 }
 
 trait OptionalStr<T> {

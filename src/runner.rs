@@ -56,6 +56,26 @@ impl std::error::Error for RunError {}
 /// without a second protocol.
 pub type ProgressFn<'a> = Box<dyn FnMut(&Value) + Send + 'a>;
 
+/// Answers a question a plugin asked through gray's `host/ask` (an `ask`
+/// row on the `--json` wire): takes the row's `questions` and a flag that
+/// turns true once the turn is over, resolves to answers by question id
+/// (`{"<id>": ["<label>"]}`, empty when nobody answered).
+pub type AskFn = std::sync::Arc<
+    dyn Fn(
+            Value,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Where `ask` rows go: the handler, and gray's stdin for the answers.
+struct AskWire {
+    handler: AskFn,
+    stdin: std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+    turn_over: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Per-turn options. `timeout_secs` defaults to `timeout_seconds` from config
 /// (600 when absent); `progress` phases never fail the turn; `receipt` gets
 /// the terminal row merged in, like the Python's `receipt.update(final)`.
@@ -68,6 +88,11 @@ pub struct RunOpts<'a> {
     /// Per-turn model override (`/model set`). Appended as `--model` only
     /// when present, so a channel that never picks one is unaffected.
     pub model: Option<String>,
+    /// Show plugin questions (`host/ask`) to the person. Set, gray runs with
+    /// `GRAY_JSON_ASK=1` and a piped stdin; unset, questions resolve empty
+    /// as in any headless run. Inert unless a questions plugin is loaded:
+    /// gray itself never asks.
+    pub ask: Option<AskFn>,
 }
 
 /// Progress callback without a captured borrow: plain function pointer plus
@@ -393,7 +418,17 @@ pub async fn run_gray_input(
     // Tool narration is safe to show; raw model reasoning is not. Keep the
     // wire quiet even when the activity bubble is enabled, matching Hermes.
     cmd.env("GRAY_SHOW_REASONING", "0");
+    // Hermes-style live replies: gray streams the prose as `text` rows and
+    // the gateway edits the reply in place. A gray without the flag just
+    // ignores it, and the answer is posted whole at the end as before.
+    if crate::stream::enabled(config) {
+        cmd.env("GRAY_STREAM_TEXT", "1");
+    }
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
+    if opts.ask.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.env("GRAY_JSON_ASK", "1");
+    }
     let mut child = cmd
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
@@ -403,6 +438,23 @@ pub async fn run_gray_input(
         .stdout
         .take()
         .ok_or_else(|| RunError::Spawn("no stdout".to_string()))?;
+    let turn_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asks = match (opts.ask.take(), child.stdin.take()) {
+        (Some(handler), Some(stdin)) => Some(AskWire {
+            handler,
+            stdin: std::sync::Arc::new(tokio::sync::Mutex::new(stdin)),
+            turn_over: turn_over.clone(),
+        }),
+        _ => None,
+    };
+    // Whatever way the turn ends, an open question card closes with it.
+    struct TurnOver(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for TurnOver {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _turn_over = TurnOver(turn_over);
     // Move progress into an owned callback struct so the consume future
     // captures locals — never `opts` itself (receipt is only touched after
     // the await, like the Python's post-turn `receipt.update(final)`).
@@ -423,6 +475,7 @@ pub async fn run_gray_input(
             &generation,
             &mut state,
             Some(&mut progress_cb),
+            asks.as_ref(),
         )
         .await
     };
@@ -568,6 +621,7 @@ async fn consume_ndjson(
     generation: &str,
     state: &mut Value,
     mut progress: Option<&mut ProgressCb<'_>>,
+    asks: Option<&AskWire>,
 ) -> Result<Consume, RunError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stdout).lines();
@@ -635,6 +689,11 @@ async fn consume_ndjson(
             Some("result") | Some("error") => {
                 terminal = Some(row);
             }
+            Some("progress") if row.get("phase").and_then(Value::as_str) == Some("ask") => {
+                if let Some(asks) = asks {
+                    answer_ask(asks, &row);
+                }
+            }
             Some("progress") => {
                 if let Some(cb) = progress.as_deref_mut() {
                     (cb.call)(&mut cb.ctx, &row);
@@ -649,6 +708,29 @@ async fn consume_ndjson(
         terminal,
         protocol_ok,
     })
+}
+
+/// Answer one `ask` row on its own task, so gray's output keeps flowing
+/// while the person thinks: the handler's answers go back to gray's stdin
+/// as `{"ask_id":N,"answers":{...}}`.
+fn answer_ask(asks: &AskWire, row: &Value) {
+    let Some(ask_id) = row.get("ask_id").and_then(Value::as_u64) else {
+        return;
+    };
+    let questions = row.get("questions").cloned().unwrap_or(Value::Null);
+    let pending = (asks.handler)(questions, asks.turn_over.clone());
+    let stdin = asks.stdin.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let answers = pending.await;
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"ask_id": ask_id, "answers": answers})
+        );
+        let mut stdin = stdin.lock().await;
+        let _ = stdin.write_all(line.as_bytes()).await;
+        let _ = stdin.flush().await;
+    });
 }
 
 fn uuid_valid(s: &str) -> bool {

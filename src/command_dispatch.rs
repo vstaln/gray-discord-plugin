@@ -540,6 +540,188 @@ async fn update_original_or_answer(ctx: &Ctx<'_>, embed: &Value) {
     }
 }
 
+/// The live card's Stop button: `turn:stop:<opaque-token>`. Any admitted
+/// user in the turn's channel may press it once. The press flags the turn
+/// and answers with the pressed card flipped to "stopping…" at once
+/// (UPDATE_MESSAGE); the worker settles it properly on its next frame.
+/// `message` is the pressed message's component tree, as Discord sent it.
+pub async fn stop_button(ctx: &Ctx<'_>, custom_id: &str, message: Option<&Value>) {
+    let token = custom_id.strip_prefix("turn:stop:").unwrap_or("");
+    let stopped =
+        match ctx
+            .store
+            .component_state_take(token, ctx.user_id, ctx.channel_id, "turn_stop")
+        {
+            Ok(Some(turn)) => ctx.store.cancel(&turn).is_ok(),
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("[discord] stop state failed: {e}");
+                false
+            }
+        };
+    if !stopped {
+        return expired(ctx, "Stop", "That turn already finished.").await;
+    }
+    let flipped = message.and_then(|components| crate::stream::stopping(components, custom_id));
+    let updated = match flipped {
+        Some(components) => ctx
+            .rest
+            .interaction_update_v2(ctx.int_id, ctx.int_token, &components)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if !updated {
+        if let Err(e) = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await {
+            eprintln!("[discord] stop acknowledgement failed: {e}");
+        }
+    }
+}
+
+/// A settled card's Retry button: `turn:retry:<opaque-token>`. Queues the
+/// same prompt again as a new turn in the same conversation; its card
+/// appears below, so the press itself changes nothing on screen.
+pub async fn retry_button(ctx: &Ctx<'_>, custom_id: &str) {
+    let token = custom_id.strip_prefix("turn:retry:").unwrap_or("");
+    let turn =
+        match ctx
+            .store
+            .component_state_take(token, ctx.user_id, ctx.channel_id, "turn_retry")
+        {
+            Ok(Some(turn)) => turn,
+            Ok(None) => return expired(ctx, "Retry", "That turn can no longer be retried.").await,
+            Err(e) => {
+                eprintln!("[discord] retry state failed: {e}");
+                return expired(ctx, "Retry", "That turn can no longer be retried.").await;
+            }
+        };
+    let capacity = ctx
+        .config
+        .get("queue_capacity")
+        .and_then(Value::as_u64)
+        .unwrap_or(1000);
+    let queued = match ctx.store.get(&turn) {
+        Ok(Some(item)) if item.input_json.is_none() => ctx
+            .store
+            .enqueue(
+                &format!("{}-retry-{}", item.id, &crate::durable::uuid_hex()[..8]),
+                &item.channel,
+                &item.prompt,
+                Some(&item.conversation),
+                capacity,
+            )
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !queued {
+        return expired(ctx, "Retry", "That turn could not be queued again.").await;
+    }
+    if let Err(e) = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await {
+        eprintln!("[discord] retry acknowledgement failed: {e}");
+    }
+}
+
+/// A settled card's New chat button: `turn:new:<opaque-token>`. Same as
+/// `/new`, for the conversation the card belongs to.
+pub async fn new_chat_button(ctx: &Ctx<'_>, custom_id: &str) {
+    let token = custom_id.strip_prefix("turn:new:").unwrap_or("");
+    let conversation =
+        match ctx
+            .store
+            .component_state_take(token, ctx.user_id, ctx.channel_id, "turn_new")
+        {
+            Ok(Some(conversation)) => conversation,
+            _ => return expired(ctx, "New chat", "That button has expired; use /new.").await,
+        };
+    let _ = ctx.store.cancel_pending_conversation(&conversation);
+    let home = ctx
+        .config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("conversations")
+        .join(crate::runner::hex_sha256(conversation.as_bytes()));
+    ensure_private_dir(&home);
+    let text = match crate::session::reset_home(&home, crate::durable::now_secs()) {
+        Ok(()) => "New chat started. Your next message starts fresh.".to_string(),
+        Err(e) => e,
+    };
+    answer(ctx, &commands::embed("New chat", text, &[]), &[], false).await;
+}
+
+/// A press on a question card (a plugin's `host/ask`): an option button, the
+/// select menu, "Other…" (opens the text box), or the submitted text box
+/// (`typed`). The answer is recorded and the card redrawn in the same
+/// response; the asking sidecar picks it up from the store.
+pub async fn ask_press(ctx: &Ctx<'_>, custom_id: &str, values: &[String], typed: Option<&str>) {
+    use crate::ask::Choice;
+    let closed = "This question is closed.";
+    let Some(press) = crate::ask::parse_press(custom_id) else {
+        return expired(ctx, "Question", closed).await;
+    };
+    let row = match ctx.store.ask_get(&press.ask_id) {
+        Ok(Some(row)) if row.channel == ctx.channel_id && row.state == "open" => row,
+        _ => return expired(ctx, "Question", closed).await,
+    };
+    let questions: Vec<crate::ask::Question> =
+        serde_json::from_value(row.questions.clone()).unwrap_or_default();
+    let Some(question) = questions.get(press.question) else {
+        return expired(ctx, "Question", closed).await;
+    };
+    if press.choice == Choice::Other {
+        match crate::ask::note_modal(&row, press.question) {
+            Some(modal) => {
+                if let Err(e) = ctx
+                    .rest
+                    .interaction_callback(
+                        ctx.int_id,
+                        ctx.int_token,
+                        &json!({"type": 9, "data": modal}),
+                    )
+                    .await
+                {
+                    eprintln!("[discord] ask modal failed: {e}");
+                }
+            }
+            None => expired(ctx, "Question", closed).await,
+        }
+        return;
+    }
+    let answers = match press.choice {
+        Choice::Note => typed
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| vec![crate::ask::note(text)]),
+        _ => crate::ask::answers_for(question, &press.choice, values),
+    };
+    let Some(answers) = answers else {
+        return expired(ctx, "Question", "That answer was empty.").await;
+    };
+    match ctx.store.ask_answer(
+        &row.ask_id,
+        &question.id,
+        &answers,
+        crate::durable::now_secs(),
+    ) {
+        Ok(Some(updated)) => {
+            let card = crate::ask::render(&updated);
+            if ctx
+                .rest
+                .interaction_update_v2(ctx.int_id, ctx.int_token, &card)
+                .await
+                .is_err()
+            {
+                let _ = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await;
+            }
+        }
+        _ => expired(ctx, "Question", "That question was already answered.").await,
+    }
+}
+
+/// The private "that button no longer works" reply.
+async fn expired(ctx: &Ctx<'_>, title: &str, text: &str) {
+    answer(ctx, &commands::embed(title, text, &[]), &[], false).await;
+}
+
 /// A pressed button: `cron:remove:<opaque-token>`. The token is
 /// consumed atomically and is valid only for the original user/channel.
 pub async fn button(ctx: &Ctx<'_>, custom_id: &str) {
