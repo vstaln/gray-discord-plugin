@@ -1,5 +1,7 @@
-//! Live replies, Hermes-style: gray's streamed `text` rows -> one Discord
-//! message edited in place, then settled as the durable answer.
+//! Live replies, Hermes-style: gray's streamed rows -> a new Discord message
+//! per step of the turn (prose, then its tool lines, then the next prose),
+//! each edited in place while it is live, the last settled as the durable
+//! answer.
 
 mod common;
 
@@ -38,7 +40,8 @@ fn tool(phase: &str, id: &str, detail: &str) -> Value {
 type Script = Vec<Vec<Value>>;
 
 /// A runtime against the loopback Discord stub whose runner replays
-/// `script` and then answers `answer`.
+/// `script` and then answers `answer`. The third value is how long the
+/// runner itself took, start to answer.
 macro_rules! scripted {
     ($config:expr, $stub:expr, $script:expr, $answer:expr) => {{
         let tmp = tempfile::tempdir().unwrap();
@@ -51,13 +54,17 @@ macro_rules! scripted {
         let answer: String = $answer.to_string();
         let runner_sink = sink.clone();
         let runner_clock = clock.clone();
+        let took: Arc<Mutex<Option<std::time::Duration>>> = Arc::default();
+        let runner_took = took.clone();
         let runner = move |_c: &Value, _p: &std::path::Path, conv: &str, _i: &RunInput| {
             let sink = runner_sink.clone();
             let clock = runner_clock.clone();
             let script = script.clone();
             let answer = answer.clone();
             let conv = conv.to_string();
+            let took = runner_took.clone();
             Box::pin(async move {
+                let started = std::time::Instant::now();
                 for step in script.iter() {
                     for row in step {
                         activity::push_for(&sink, &conv, row.clone());
@@ -65,6 +72,7 @@ macro_rules! scripted {
                     *clock.lock().unwrap() += 5.0;
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 }
+                *took.lock().unwrap() = Some(started.elapsed());
                 Ok::<String, RunError>(answer)
             })
         };
@@ -76,29 +84,38 @@ macro_rules! scripted {
             .with_activity(sink)
             .with_clock(Arc::new(move || *t.lock().unwrap()))
             .with_rest(Rest::new(&$stub.base, "TESTTOKEN"));
-        (rt, store)
+        (rt, store, took)
     }};
 }
 
-/// One card request the stub saw.
+/// One message request the stub saw.
 #[derive(Debug, Clone, PartialEq)]
 struct Frame {
     method: String,
-    path: String,
-    /// The card's Text Displays above the separator, joined by newlines.
+    /// The message a PATCH targets (empty for a POST).
+    target: String,
+    /// The message's Text Displays, joined by newlines (not the chip).
     body: String,
-    footer: String,
-    accent: u64,
+    /// The status chip's line, when this message carries it.
+    status: Option<String>,
+    accent: Option<u64>,
     stop: Option<String>,
-    /// Action-row buttons below the footer: (label, custom_id).
+    /// The chip's action-row buttons: (label, custom_id).
     buttons: Vec<(String, String)>,
-    /// Gallery and File components inside the card.
+    /// Gallery and File components in the message.
     media: Vec<Value>,
     /// The upload list a multipart request carried.
     attachments: Vec<String>,
 }
 
-/// Card posts and edits the stub saw, in order.
+/// The status chip is the accented, non-spoiler Container at the end.
+fn chip_of(components: &[Value]) -> Option<&Value> {
+    components
+        .last()
+        .filter(|last| last["type"] == 17 && last["spoiler"] != json!(true))
+}
+
+/// Message posts and edits the stub saw, in order.
 fn traffic(stub: &common::Stub) -> Vec<Frame> {
     stub.sent
         .lock()
@@ -107,48 +124,52 @@ fn traffic(stub: &common::Stub) -> Vec<Frame> {
         .filter(|sent| sent.path.starts_with("/api/v10/channels/42/messages"))
         .filter(|sent| sent.method != "DELETE")
         .map(|sent| {
-            let card = &sent.body["components"][0];
-            assert_eq!(card["type"], 17, "every turn message is a V2 Container");
-            let children = card["components"].as_array().unwrap();
-            let separator = children
-                .iter()
-                .position(|child| child["type"] == 14)
-                .expect("a card ends with a separator and footer");
-            let footer = &children[separator + 1];
-            let (footer_text, stop) = match footer["type"].as_u64() {
-                Some(9) => (
-                    component_text(&footer["components"]),
-                    footer["accessory"]["custom_id"]
-                        .as_str()
-                        .map(str::to_string),
-                ),
-                _ => (component_text(footer), None),
+            let components = sent.body["components"].as_array().cloned().unwrap();
+            let chip = chip_of(&components).cloned();
+            let (status, stop, buttons) = match &chip {
+                Some(chip) => {
+                    let children = chip["components"].as_array().unwrap();
+                    let first = &children[0];
+                    let (line, stop) = match first["type"].as_u64() {
+                        Some(9) => (
+                            component_text(&first["components"]),
+                            first["accessory"]["custom_id"].as_str().map(str::to_string),
+                        ),
+                        _ => (component_text(first), None),
+                    };
+                    let buttons = children[1..]
+                        .iter()
+                        .filter(|child| child["type"] == 1)
+                        .flat_map(|row| row["components"].as_array().cloned().unwrap_or_default())
+                        .map(|button| {
+                            (
+                                button["label"].as_str().unwrap_or("").to_string(),
+                                button["custom_id"].as_str().unwrap_or("").to_string(),
+                            )
+                        })
+                        .collect();
+                    (Some(line), stop, buttons)
+                }
+                None => (None, None, Vec::new()),
             };
-            let buttons = children[separator + 2..]
-                .iter()
-                .filter(|child| child["type"] == 1)
-                .flat_map(|row| row["components"].as_array().cloned().unwrap_or_default())
-                .map(|button| {
-                    (
-                        button["label"].as_str().unwrap_or("").to_string(),
-                        button["custom_id"].as_str().unwrap_or("").to_string(),
-                    )
-                })
-                .collect();
             Frame {
                 method: sent.method.clone(),
-                path: sent.path.clone(),
-                body: children[..separator]
+                target: sent
+                    .path
+                    .strip_prefix("/api/v10/channels/42/messages/")
+                    .unwrap_or("")
+                    .to_string(),
+                body: components
                     .iter()
                     .filter(|child| child["type"] == 10)
                     .map(component_text)
                     .collect::<Vec<_>>()
                     .join("\n"),
-                footer: footer_text,
-                accent: card["accent_color"].as_u64().unwrap_or(0),
+                status,
+                accent: chip.as_ref().and_then(|chip| chip["accent_color"].as_u64()),
                 stop,
                 buttons,
-                media: children[..separator]
+                media: components
                     .iter()
                     .filter(|child| child["type"] == 12 || child["type"] == 13)
                     .cloned()
@@ -165,6 +186,10 @@ fn traffic(stub: &common::Stub) -> Vec<Frame> {
             }
         })
         .collect()
+}
+
+fn posts(log: &[Frame]) -> Vec<&Frame> {
+    log.iter().filter(|frame| frame.method == "POST").collect()
 }
 
 /// The interaction callbacks the stub saw, as (type, body).
@@ -201,23 +226,18 @@ macro_rules! press {
     }};
 }
 
-const WORKING: u64 = 0x99AAB5;
+const WORKING: u64 = 0x5865F2;
 const DONE: u64 = 0x57F287;
-const STOPPED: u64 = 0x4E5058;
+const STOPPED: u64 = 0x80848E;
 
 #[tokio::test]
-async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
+async fn a_reply_streams_into_its_own_message_and_lands_as_the_answer() {
     let stub = common::Stub::start().await;
     let script = vec![
         vec![text(0, "", "Hello", false)],
         vec![text(0, "Hello there,\n", "how", false)],
     ];
-    let (rt, store) = scripted!(
-        json!({"answer_in_card": true}),
-        stub,
-        script,
-        "Hello there,\nhow are you?"
-    );
+    let (rt, store, _) = scripted!(json!({}), stub, script, "Hello there,\nhow are you?");
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
@@ -225,46 +245,54 @@ async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
     assert_eq!(log[0].method, "POST");
     assert_eq!(log[0].body, "Hello ▉", "{log:?}");
     assert_eq!(
-        log[0].footer, "-# Working · started <t:0:R>",
+        log[0].status.as_deref(),
+        Some("-# Working · started <t:0:R>"),
         "a live Discord timestamp, not a ticking edit"
     );
-    assert_eq!(log[0].accent, WORKING);
+    assert_eq!(log[0].accent, Some(WORKING));
     assert!(
         log[0]
             .stop
             .as_deref()
             .is_some_and(|id| id.starts_with("turn:stop:")),
-        "a live card offers Stop: {log:?}"
+        "a live turn offers Stop: {log:?}"
     );
     assert!(
         log.iter()
             .any(|frame| frame.method == "PATCH" && frame.body == "Hello there,\nhow ▉"),
-        "the preview grows in place: {log:?}"
+        "the prose grows in place: {log:?}"
     );
     let last = log.last().unwrap();
     assert_eq!(last.method, "PATCH");
     assert_eq!(last.body, "Hello there,\nhow are you?", "cursor gone");
-    assert!(last.footer.starts_with("-# Done in "), "{last:?}");
-    assert_eq!(last.accent, DONE);
+    assert!(
+        last.status.as_deref().unwrap().starts_with("-# Done in "),
+        "{last:?}"
+    );
+    assert_eq!(last.accent, Some(DONE));
     assert_eq!(last.stop, None, "Stop goes away once the turn is over");
     let labels: Vec<&str> = last
         .buttons
         .iter()
         .map(|(label, _)| label.as_str())
         .collect();
+    assert_eq!(labels, vec!["Retry", "New chat"], "the settled actions");
     assert_eq!(
-        labels,
-        vec!["Retry", "New chat"],
-        "the settled card's actions"
-    );
-    assert_eq!(
-        log.iter().filter(|frame| frame.method == "POST").count(),
+        posts(&log).len(),
         1,
-        "one message for the whole turn: {log:?}"
+        "one run of prose, one message: {log:?}"
     );
     let sent = stub.sent.lock().unwrap().clone();
     assert_eq!(sent[0].body["flags"], json!(32768), "Components V2");
     assert!(sent[0].body.get("embeds").is_none());
+    let edit = sent.iter().find(|sent| sent.method == "PATCH").unwrap();
+    assert_eq!(edit.body["flags"], json!(32768));
+    for legacy in ["content", "embeds", "sticker_ids"] {
+        assert!(
+            edit.body.get(legacy).is_none(),
+            "an edit is shaped like the post: {legacy}"
+        );
+    }
 
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
     assert!(
@@ -274,41 +302,56 @@ async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
 }
 
 #[tokio::test]
-async fn prose_and_tool_lines_alternate_inside_the_card() {
+async fn each_step_of_the_turn_is_a_new_message() {
     let stub = common::Stub::start().await;
     let script = vec![
-        vec![
-            text(0, "Let me check.", "", true),
-            tool("tool_ran", "a", "cargo test"),
-        ],
+        vec![text(0, "Let me check.", "", false)],
+        vec![text(0, "", "", true), tool("tool_ran", "a", "cargo test")],
         vec![tool("tool_finished", "a", ""), text(1, "", "All", false)],
     ];
-    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "All green.");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "All green.");
     store.enqueue("m1", "42", "run it", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
     let log = traffic(&stub);
+    let posted: Vec<&str> = posts(&log)
+        .iter()
+        .map(|frame| frame.body.as_str())
+        .collect();
     assert_eq!(
-        log.iter().filter(|frame| frame.method == "POST").count(),
-        1,
-        "{log:?}"
+        posted,
+        vec!["Let me check. ▉", "-# Running `cargo test`", "All ▉"],
+        "prose, its tool lines, then the next prose, each a new message: {log:?}"
     );
+    // The chip rides the newest message: the older ones lose it.
+    let ids: Vec<String> = (0..3).map(|n| format!("{}", 1000 + n)).collect();
+    let first_settled = log
+        .iter()
+        .filter(|frame| frame.method == "PATCH")
+        .find(|frame| frame.body == "Let me check.")
+        .expect("the first prose closes: {log:?}");
+    assert_eq!(first_settled.status, None, "{log:?}");
+    assert!(ids.contains(&first_settled.target), "{log:?}");
+    let tools = log
+        .iter()
+        .rev()
+        .find(|frame| frame.body.starts_with("-# Ran `cargo test` ("))
+        .expect("the tool line gets its duration");
+    assert_eq!(tools.status, None, "{tools:?}");
     let last = log.last().unwrap();
+    assert_eq!(last.body, "All green.");
     assert!(
-        last.body
-            .starts_with("Let me check.\n-# Ran `cargo test` ("),
-        "{last:?}"
-    );
-    assert!(last.body.ends_with(")\nAll green."), "{last:?}");
-    assert!(
-        last.footer.ends_with(" · ran 1 command"),
-        "the footer tallies the turn: {last:?}"
+        last.status
+            .as_deref()
+            .unwrap()
+            .ends_with(" · ran 1 command"),
+        "the chip tallies the turn: {last:?}"
     );
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
 }
 
 #[tokio::test]
-async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
+async fn the_stop_button_flips_the_message_at_once_and_the_turn_stops() {
     let stub = common::Stub::start().await;
     let script = vec![
         vec![text(0, "", "Working on", false)],
@@ -317,7 +360,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
         vec![],
         vec![],
     ];
-    let (rt, store) = scripted!(json!({}), stub, script, "never");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "never");
     store.enqueue("m1", "42", "long job", None, 1000).unwrap();
     let press = async {
         let (stop, pressed) = loop {
@@ -329,13 +372,12 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
                 .find(|sent| sent.method == "POST" && sent.path.ends_with("/messages"))
                 .map(|sent| sent.body["components"].clone());
             if let Some(components) = first {
-                let stop = components[0]["components"]
-                    .as_array()
+                let chip = chip_of(components.as_array().unwrap()).unwrap().clone();
+                let stop = chip["components"][0]["accessory"]["custom_id"]
+                    .as_str()
                     .unwrap()
-                    .iter()
-                    .find_map(|child| child.pointer("/accessory/custom_id").cloned())
-                    .unwrap();
-                break (stop.as_str().unwrap().to_string(), components);
+                    .to_string();
+                break (stop, components);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
@@ -347,7 +389,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
     let callback = callbacks(&stub).into_iter().next().expect("acknowledged");
     assert_eq!(
         callback["type"], 7,
-        "the pressed card updates in the same response"
+        "the pressed message updates in the same response"
     );
     let flipped = callback["data"]["components"].to_string();
     assert!(flipped.contains("Stopping…"), "{flipped}");
@@ -355,21 +397,20 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
         !flipped.contains("turn:stop:"),
         "the button is gone at once"
     );
-    assert_eq!(
-        callback["data"]["components"][0]["accent_color"],
-        json!(STOPPED)
-    );
+    let flipped_chip = chip_of(callback["data"]["components"].as_array().unwrap()).unwrap();
+    assert_eq!(flipped_chip["accent_color"], json!(STOPPED));
 
     let last = traffic(&stub).last().cloned().unwrap();
-    assert_eq!(last.accent, STOPPED);
+    assert_eq!(last.accent, Some(STOPPED));
     assert_eq!(last.body, "Working on", "cursor gone");
-    assert!(last.footer.starts_with("-# Stopped after "), "{last:?}");
-    assert!(last.footer.ends_with("actions may already have happened"));
+    let status = last.status.unwrap();
+    assert!(status.starts_with("-# Stopped after "), "{status}");
+    assert!(status.ends_with("actions may already have happened"));
     let item = store.get("m1").unwrap().unwrap();
     assert_eq!(item.error.as_deref(), Some("cancelled"));
     assert!(
         store.next_delivery(f64::MAX).unwrap().is_none(),
-        "the card is the notice; nothing else is posted"
+        "the chip is the notice; nothing else is posted"
     );
 }
 
@@ -377,7 +418,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
 async fn retry_queues_the_same_prompt_again() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "Hi there");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "Hi there");
     store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     let (_, retry) = traffic(&stub).last().unwrap().buttons[0].clone();
@@ -387,7 +428,7 @@ async fn retry_queues_the_same_prompt_again() {
     assert_eq!(
         callbacks(&stub)[0]["type"],
         6,
-        "the new card is the feedback"
+        "the new turn is the feedback"
     );
     let again = store.claim().unwrap().expect("a new turn is queued");
     assert_eq!(again.prompt, "say hi");
@@ -402,10 +443,10 @@ async fn retry_queues_the_same_prompt_again() {
 }
 
 #[tokio::test]
-async fn new_chat_resets_the_conversation_the_card_belongs_to() {
+async fn new_chat_resets_the_conversation_the_turn_belongs_to() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "Hi there");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "Hi there");
     store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     let (label, new_chat) = traffic(&stub).last().unwrap().buttons[1].clone();
@@ -421,10 +462,10 @@ async fn new_chat_resets_the_conversation_the_card_belongs_to() {
 }
 
 #[tokio::test]
-async fn the_next_turn_retires_the_previous_cards_buttons() {
+async fn the_next_turn_retires_the_previous_buttons() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "One", false)]];
-    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "One");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "One");
     store.enqueue("m1", "42", "first", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     store.enqueue("m2", "42", "second", None, 1000).unwrap();
@@ -434,32 +475,37 @@ async fn the_next_turn_retires_the_previous_cards_buttons() {
     let retired = log
         .iter()
         .find(|frame| frame.method == "PATCH" && frame.buttons.is_empty() && frame.body == "One")
-        .expect("the first card is edited once more");
-    assert_eq!(retired.accent, DONE, "only the buttons go");
+        .expect("the first turn's last message is edited once more");
+    assert_eq!(retired.accent, Some(DONE), "only the buttons go");
     let newest = log.last().unwrap();
-    assert_eq!(newest.buttons.len(), 2, "the latest card keeps its actions");
+    assert_eq!(newest.buttons.len(), 2, "the latest turn keeps its actions");
 }
 
 #[tokio::test]
-async fn a_gray_without_text_rows_still_gets_one_durable_post() {
+async fn a_gray_without_text_rows_posts_the_answer_below_its_tool_lines() {
     let stub = common::Stub::start().await;
     let script = vec![vec![tool("tool_ran", "a", "cargo test")]];
-    let (rt, store) = scripted!(json!({}), stub, script, "answer");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "answer");
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
-    let last = traffic(&stub).last().cloned().unwrap();
-    assert_eq!(last.accent, DONE, "the tool card still settles");
-    assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
-    let part = store.next_delivery(f64::MAX).unwrap().unwrap();
-    assert_eq!(part.content, "answer");
+    let log = traffic(&stub);
+    let posted: Vec<&str> = posts(&log)
+        .iter()
+        .map(|frame| frame.body.as_str())
+        .collect();
+    assert_eq!(posted, vec!["-# Running `cargo test`", "answer"], "{log:?}");
+    let last = log.last().unwrap();
+    assert_eq!(last.accent, Some(DONE), "the chip moved to the answer");
+    assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
+    assert!(store.next_delivery(f64::MAX).unwrap().is_none());
 }
 
 #[tokio::test]
 async fn streaming_off_ignores_prose_rows() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "draft", false)]];
-    let (rt, store) = scripted!(json!({"stream_replies": false}), stub, script, "answer");
+    let (rt, store, _) = scripted!(json!({"stream_replies": false}), stub, script, "answer");
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
@@ -472,7 +518,7 @@ async fn streaming_off_ignores_prose_rows() {
 async fn a_slash_turn_answers_through_its_interaction_not_the_stream() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "draft", false)]];
-    let (rt, store) = scripted!(json!({}), stub, script, "answer");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "answer");
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     store.set_interaction("m1", "token", "999").unwrap();
     assert!(rt.generate_one().await.unwrap());
@@ -482,7 +528,7 @@ async fn a_slash_turn_answers_through_its_interaction_not_the_stream() {
 }
 
 #[tokio::test]
-async fn the_answers_files_land_inside_the_card() {
+async fn the_answers_files_land_inside_its_message() {
     let stub = common::Stub::start().await;
     let files = tempfile::tempdir().unwrap();
     let chart = files.path().join("chart.png");
@@ -495,8 +541,8 @@ async fn the_answers_files_land_inside_the_card() {
         report.display()
     );
     let script = vec![vec![text(0, "Here it is:\n", "", false)]];
-    let config = json!({"answer_in_card": true, "workdir": files.path().to_str().unwrap()});
-    let (rt, store) = scripted!(config, stub, script, answer);
+    let config = json!({"workdir": files.path().to_str().unwrap()});
+    let (rt, store, _) = scripted!(config, stub, script, answer);
     store.enqueue("m1", "42", "chart", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
@@ -521,29 +567,26 @@ async fn the_answers_files_land_inside_the_card() {
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
     assert!(
         store.next_delivery(f64::MAX).unwrap().is_none(),
-        "nothing waits in the outbox: the files are in the card"
+        "nothing waits in the outbox: the files are in the message"
     );
 }
 
 #[tokio::test]
-async fn a_refused_card_falls_back_to_one_durable_post() {
+async fn a_forbidden_channel_falls_back_to_one_durable_post() {
     let stub = common::Stub::start().await;
     *stub.fail_send.lock().unwrap() = true;
     let script = vec![
         vec![text(0, "", "Hello", false)],
         vec![text(0, "Hello there\n", "", false)],
     ];
-    let (rt, store) = scripted!(json!({}), stub, script, "Hello there");
+    let (rt, store, _) = scripted!(json!({}), stub, script, "Hello there");
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
-    let posts = traffic(&stub)
-        .into_iter()
-        .filter(|frame| frame.method == "POST")
-        .count();
-    assert!(
-        (1..=3).contains(&posts),
-        "a refused card is reposted a few times, then given up: {posts}"
+    assert_eq!(
+        posts(&traffic(&stub)).len(),
+        1,
+        "a forbidden channel is not retried every frame"
     );
     assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
@@ -554,27 +597,80 @@ async fn a_refused_card_falls_back_to_one_durable_post() {
 }
 
 #[tokio::test]
-async fn by_default_the_answer_posts_as_its_own_plain_message() {
+async fn refused_edits_never_freeze_the_turn() {
+    // The bug this guards: one refused edit used to give the whole turn up,
+    // so the channel showed its first frame until the answer came, minutes
+    // later, as a separate post.
     let stub = common::Stub::start().await;
+    *stub.edit_status.lock().unwrap() = Some(400);
     let script = vec![
-        vec![tool("tool_ran", "c1", "ls")],
-        vec![tool("tool_finished", "c1", "ls")],
-        vec![text(1, "All green.\n", "", true)],
+        vec![text(0, "", "Checking", false)],
+        vec![
+            text(0, "Checking the build.", "", true),
+            tool("tool_ran", "a", "cargo build"),
+        ],
+        vec![tool("tool_finished", "a", ""), text(1, "", "Built", false)],
     ];
-    let (rt, store) = scripted!(json!({}), stub, script, "All green.");
-    store.enqueue("m1", "42", "hi", None, 1000).unwrap();
+    let (rt, store, _) = scripted!(json!({}), stub, script, "Built fine.");
+    store.enqueue("m1", "42", "build", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
-    // The card keeps the narration, not the answer.
-    let last_card = traffic(&stub)
-        .into_iter()
-        .rev()
-        .find(|frame| frame.path.contains("/channels/42/messages"))
-        .unwrap();
-    let shown = &last_card.body;
-    assert!(!shown.contains("All green."), "{shown}");
-    // The answer is a plain-content post a push notification can preview.
+    let log = traffic(&stub);
+    let posted: Vec<&str> = posts(&log)
+        .iter()
+        .map(|frame| frame.body.as_str())
+        .collect();
+    assert_eq!(
+        &posted[..3],
+        &["Checking ▉", "-# Running `cargo build`", "Built ▉"],
+        "every step still lands as its own message: {log:?}"
+    );
+    assert!(
+        log.iter().filter(|frame| frame.method == "PATCH").count() >= 2,
+        "edits keep being tried: {log:?}"
+    );
+    let deleted: Vec<String> = stub
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sent| sent.method == "DELETE")
+        .map(|sent| sent.path.clone())
+        .collect();
+    let answer = &log.last().unwrap().target;
+    assert_eq!(
+        deleted,
+        vec![format!("/api/v10/channels/42/messages/{answer}")],
+        "only the unfinished answer preview is retracted: {log:?}"
+    );
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
-    assert_eq!(part.content, "All green.");
-    assert_eq!(part.render.as_deref(), Some("text"));
+    assert_eq!(
+        part.content, "Built fine.",
+        "and the answer is still delivered"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_discord_never_holds_up_the_agent() {
+    // Every edit takes 1.5s. The agent's own steps (3 x 400ms) must not
+    // wait on them: gray's output is read beside the requests, not between.
+    let stub = common::Stub::start().await;
+    *stub.edit_delay_ms.lock().unwrap() = 1500;
+    let script = vec![
+        vec![text(0, "", "One", false)],
+        vec![text(0, "One two\n", "", false)],
+        vec![text(0, "One two\nthree\n", "", false)],
+    ];
+    let (rt, store, took) = scripted!(json!({}), stub, script, "One two\nthree");
+    store.enqueue("m1", "42", "count", None, 1000).unwrap();
+    assert!(rt.generate_one().await.unwrap());
+
+    let took = took.lock().unwrap().expect("the runner finished");
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "the agent waited on Discord: {took:?}"
+    );
+    let last = traffic(&stub).last().cloned().unwrap();
+    assert_eq!(last.body, "One two\nthree");
+    assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
 }
