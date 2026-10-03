@@ -289,31 +289,46 @@ works:
 ┃ -# 💻 Ran `gray ps` (0.3s)
 ┃ **Done / idle:** claude-sub plugin agent: done. PR #173 is ▉
 ┃ ───────────────────────────────────────────────
-┃ -# ⏳ working · 20s · ran 1 command          [⏹️ Stop]
+┃ -# ⏳ started 20 seconds ago · ran 1 command    [⏹️ Stop]
 ````
 
 - The card is posted as soon as there is something to show. The answer then
   streams into it about once a second with a ` ▉` cursor.
 - Prose and tool lines keep their order: each run of prose, then the tool
-  lines it led to (small grey subtext), then the next prose.
-- The footer shows status, time and a tally. Its clock moves in 10-second
-  steps, so an idle turn costs one edit per step.
-- **Stop** (danger button) stops the turn, like `/stop`. Any admitted user
-  in the channel can press it once.
+  lines it led to (small grey subtext), then the next prose. A group of
+  more than 6 tool lines folds to a count plus its latest 2 lines; the full
+  list sits in a spoiler box below the card (tap to show).
+- The footer's clock is a Discord timestamp (`<t:…:R>`): every client keeps
+  "started 20 seconds ago" current on its own, so a quiet turn costs no
+  edits. It also tallies the turn (`ran 3 commands · edited 1 file`).
+- **Stop** (danger button) stops the turn, like `/stop`. The pressed card
+  flips to "⏹️ stopping…" in the same interaction response, then settles.
+  Any admitted user in the channel can press it once.
 - The accent bar tracks the turn: blurple while working, green when done
   (`✅ done in 7.2s · ran 1 command`), red on failure, grey when stopped
   (`⏹️ stopped after 12s · actions may already have happened`). A failed or
   stopped card is the turn's notice, so nothing extra is posted.
+- Files the answer names with `MEDIA:` tags land **inside** the finished
+  card: images and videos in a Media Gallery, anything else as File cards
+  (up to 10; more go out as a separate post).
+- The finished card offers **🔁 Retry** (run the same message again as a
+  new turn) and **🆕 New chat** (same as `/new`). Only the latest card in a
+  conversation keeps them; starting the next turn removes them from the
+  previous one. Buttons expire after a day.
 - A long turn continues in further cards (Discord allows 40 components and
   4000 characters per message), cut at a newline, with code fences closed
   and reopened at the cut, up to 8 cards. Only the last card has the footer.
 
 The final edit is the authoritative answer, recorded in the durable outbox
-as delivered, so a restart never posts it twice. `MEDIA:` tags are hidden
-from the preview and their files are uploaded after the card. If the answer
-cannot land in place (a refused post, a deleted card), the preview is
-retracted and the answer is posted durably instead. Slash command turns
-answer through their interaction; their card shows tool lines only.
+as delivered, so a restart never posts it twice. If the answer cannot land
+in place (a refused post, a deleted card), the preview is retracted and the
+answer is posted durably instead. Slash command turns answer through their
+interaction; their card shows tool lines and Stop only.
+
+The agent itself can author any Components V2 surface (all message and
+modal component types: containers, sections, galleries, files, buttons, every
+select, modals with text inputs, file uploads, radio groups and checkboxes)
+through its `discord_send_ui` and `discord_open_modal` tools.
 
 Streaming needs a gray core that emits `text` rows (`GRAY_STREAM_TEXT=1`,
 set by the bridge). With an older gray the bridge falls back to posting the

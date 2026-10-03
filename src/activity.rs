@@ -391,6 +391,8 @@ struct BubbleLine {
     /// instead of adding a second line for the same call.
     start: bool,
     tool: String,
+    /// The call it narrates, so parallel calls each find their placeholder.
+    call_id: String,
     quiet: bool,
 }
 
@@ -412,6 +414,25 @@ pub fn render(rows: &[Value]) -> Option<String> {
         let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
         let quiet = is_quiet_row(&tool, detail);
         let start = row.get("phase").and_then(Value::as_str) == Some("tool_started");
+        let call_id = row
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // Parallel calls start together and report later: each `tool_ran`
+        // replaces its own call's placeholder, wherever it sits.
+        if !start && !call_id.is_empty() {
+            if let Some(placeholder) = lines
+                .iter_mut()
+                .rev()
+                .find(|line| line.start && line.call_id == call_id)
+            {
+                placeholder.text = text;
+                placeholder.start = false;
+                placeholder.quiet = quiet;
+                continue;
+            }
+        }
         match lines.last_mut() {
             // One call, one line: its `tool_ran` overwrites the placeholder.
             Some(last) if !start && last.start && last.tool == tool => {
@@ -425,6 +446,7 @@ pub fn render(rows: &[Value]) -> Option<String> {
                 text,
                 start,
                 tool,
+                call_id,
                 quiet,
             }),
         }

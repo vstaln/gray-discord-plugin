@@ -1003,20 +1003,77 @@ impl Rest {
         uploads: &[crate::media_tags::Upload],
         nonce: Option<&str>,
     ) -> Result<MessageId, TransportError> {
-        crate::render::validate_components(components).map_err(TransportError::Invalid)?;
         let mut body = json!({
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
             "allowed_mentions": {"parse": []},
-            "attachments": uploads
-                .iter()
-                .enumerate()
-                .map(|(index, upload)| json!({"id": index, "filename": upload.name}))
-                .collect::<Vec<_>>(),
         });
         if let Some(nonce) = nonce {
             body["nonce"] = json!(nonce);
         }
+        let value = self
+            .multipart_v2(
+                reqwest::Method::POST,
+                &format!("/channels/{channel}/messages"),
+                body,
+                uploads,
+            )
+            .await?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+    }
+
+    /// Edit a V2 message and attach local files to it in the same request
+    /// (a finished turn card gaining the answer's images). The attachment
+    /// list is replaced by `uploads`.
+    pub async fn edit_v2_uploads(
+        &self,
+        channel: u64,
+        message: &str,
+        components: &[Value],
+        uploads: &[crate::media_tags::Upload],
+    ) -> Result<(), TransportError> {
+        let body = json!({
+            "flags": crate::render::IS_COMPONENTS_V2,
+            "components": components,
+            "allowed_mentions": {"parse": []},
+            "content": Value::Null,
+            "embeds": [],
+            "sticker_ids": [],
+        });
+        self.multipart_v2(
+            reqwest::Method::PATCH,
+            &format!("/channels/{channel}/messages/{message}"),
+            body,
+            uploads,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// One multipart V2 request: `payload_json` plus `files[n]`, with the
+    /// `attachments` list naming each upload by index.
+    async fn multipart_v2(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        mut body: Value,
+        uploads: &[crate::media_tags::Upload],
+    ) -> Result<Value, TransportError> {
+        let components = body
+            .get("components")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        crate::render::validate_components(&components).map_err(TransportError::Invalid)?;
+        body["attachments"] = uploads
+            .iter()
+            .enumerate()
+            .map(|(index, upload)| json!({"id": index, "filename": upload.name}))
+            .collect();
         let mut form = Form::new().text(
             "payload_json",
             serde_json::to_string(&body)
@@ -1029,24 +1086,18 @@ impl Rest {
                 .map_err(|_| TransportError::Invalid("upload media type is invalid".into()))?;
             form = form.part(format!("files[{index}]"), part);
         }
-        let path = format!("/channels/{channel}/messages");
-        let route = format!("POST {path}");
+        let route = format!("{method} {path}");
         self.wait_for_rate_limit(&route).await;
         let response = self
             .client
-            .post(format!("{}{}", self.base, path))
+            .request(method, format!("{}{}", self.base, path))
             .multipart(form)
             .send()
             .await
             .map_err(|error| TransportError::Net(trim_net_error(error)))?;
         self.observe_rate_limit(&route, response.headers());
         let status = response.status();
-        let value = self.classify(status, response).await?;
-        value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+        self.classify(status, response).await
     }
 
     /// Send model text as one or more bounded V2 Text Display messages.

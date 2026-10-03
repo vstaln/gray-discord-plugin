@@ -10,14 +10,22 @@
 //! ┃ -# 💻 Ran `gray ps` (0.3s)                        ← tool lines (subtext)
 //! ┃ **Done / idle:** … ▉                             ← streaming prose
 //! ┃ ───────────────────────────────────────────────  ← Separator
-//! ┃ -# ⏳ working · 20s · ran 1 command     [⏹️ Stop] ← Section + Button
+//! ┃ -# ⏳ started 20 seconds ago · ran 1 command [⏹️ Stop] ← Section + Button
 //! ```
 //!
 //! Prose and tool lines keep Hermes' order: each run of prose, then the tool
 //! lines it led to, then the next prose. The accent bar tracks the turn's
 //! status: blurple while working, green when done, red on failure, grey when
-//! stopped. A long turn continues in further cards (Discord caps one message
-//! at 40 components and 4000 characters); only the last carries the footer.
+//! stopped. The footer's clock is a Discord timestamp (`<t:…:R>`) that every
+//! client keeps current on its own, so a quiet turn costs no edits.
+//!
+//! Once the turn settles the card gains what a finished turn needs: files
+//! the answer named (`MEDIA:`) as a Media Gallery and File cards inside it,
+//! and Retry / New chat buttons. A run of more than a handful of tool lines
+//! folds to a one-line count plus its latest lines, with the full list in a
+//! spoiler container below (tap to reveal). A long turn continues in further
+//! cards (Discord caps one message at 40 components and 4000 characters);
+//! only the last carries the footer.
 //!
 //! [`Timeline`] is the pure model. The gateway feeds it rows, asks it which
 //! sends, edits and deletes are due ([`Timeline::plan`]), and reports back
@@ -30,17 +38,22 @@ pub const CURSOR: &str = " ▉";
 /// Body text per card, in UTF-16 units. Discord allows 4000 across a V2
 /// message; the rest is the footer's.
 pub const CARD_TEXT: usize = 3600;
-/// Text Displays per card: with the container, separator and footer this
-/// stays well under Discord's 40 components.
-const MAX_PIECES: usize = 30;
+/// Text Displays per card. With the container, media, separator, footer,
+/// buttons and tool log this stays under Discord's 40 components.
+const MAX_PIECES: usize = 18;
 /// A card with less room than this starts a fresh one rather than holding a
 /// sliver of the next piece.
 const MIN_ROOM: usize = 300;
 /// Hermes' `MAX_SPLIT_MESSAGES`: a runaway turn never floods the channel.
 pub const MAX_CARDS: usize = 8;
-/// The footer's elapsed time moves in steps this long (seconds), so an idle
-/// turn costs one edit per step instead of one per second.
-const CLOCK_STEP: f64 = 10.0;
+/// A tool group longer than this folds into the tool log.
+const FOLD_LINES: usize = 6;
+/// Lines a folded group still shows, so the live action stays visible.
+const KEEP_LIVE: usize = 2;
+/// The tool log's share of a card's text.
+const LOG_CHARS: usize = 900;
+/// Discord's attachment cap per message.
+pub const MAX_MEDIA: usize = 10;
 
 const WORKING: u32 = 0x5865F2;
 const DONE: u32 = 0x57F287;
@@ -99,6 +112,17 @@ pub struct Card {
     /// The card's body as plain markdown (no footer): what the durable
     /// outbox records for it, and what the activity hook reports.
     pub text: String,
+    /// Uploads this card references as `attachment://<name>`; a send or
+    /// edit must carry them.
+    pub files: Vec<String>,
+}
+
+/// A file the finished answer named, shown inside the card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Media {
+    pub name: String,
+    /// Images and videos go to the gallery; anything else is a File card.
+    pub visual: bool,
 }
 
 impl Card {
@@ -137,6 +161,10 @@ pub struct Timeline {
     status: Option<(Status, f64)>,
     /// `custom_id` of the footer's Stop button while the turn runs.
     stop: Option<String>,
+    /// `custom_id`s of the settled card's Retry and New chat buttons.
+    retry: Option<String>,
+    new_chat: Option<String>,
+    media: Vec<Media>,
 }
 
 impl Timeline {
@@ -152,6 +180,18 @@ impl Timeline {
     pub fn with_stop(mut self, custom_id: String) -> Self {
         self.stop = Some(custom_id);
         self
+    }
+
+    /// Offer Retry and New chat buttons once the turn has settled.
+    pub fn with_actions(mut self, retry: Option<String>, new_chat: Option<String>) -> Self {
+        self.retry = retry;
+        self.new_chat = new_chat;
+        self
+    }
+
+    /// Show the answer's files inside the card (at most [`MAX_MEDIA`]).
+    pub fn attach(&mut self, media: Vec<Media>) {
+        self.media = media.into_iter().take(MAX_MEDIA).collect();
     }
 
     /// Fold one progress row into the layout.
@@ -247,18 +287,40 @@ impl Timeline {
 
     /// The cards this turn should show at `now`.
     pub fn render(&self, now: f64) -> Vec<Card> {
+        self.render_with(now, true)
+    }
+
+    fn render_with(&self, now: f64, buttons: bool) -> Vec<Card> {
         let (status, now) = self.status.clone().unwrap_or((Status::Working, now));
         let live = status == Status::Working;
         let mut pieces: Vec<String> = Vec::new();
         let mut tool_rows: Vec<Value> = Vec::new();
+        let mut log: Vec<String> = Vec::new();
         for block in &self.blocks {
             match block {
                 Block::Tools { rows } => {
                     tool_rows.extend(rows.iter().cloned());
                     if let Some(feed) = crate::activity::render(rows) {
                         let feed = crate::text::sanitize(&feed);
+                        let lines: Vec<&str> = feed.lines().collect();
+                        let shown: Vec<String> = if lines.len() > FOLD_LINES {
+                            log.extend(lines.iter().map(|line| line.to_string()));
+                            let mut shown = vec![format!(
+                                "🔧 {} tool calls · the full list is in the tool log below",
+                                lines.len()
+                            )];
+                            shown.extend(
+                                lines[lines.len() - KEEP_LIVE..]
+                                    .iter()
+                                    .map(|line| line.to_string()),
+                            );
+                            shown
+                        } else {
+                            lines.iter().map(|line| line.to_string()).collect()
+                        };
                         pieces.push(
-                            feed.lines()
+                            shown
+                                .iter()
                                 .map(|line| format!("-# {line}"))
                                 .collect::<Vec<_>>()
                                 .join("\n"),
@@ -299,8 +361,11 @@ impl Timeline {
             Status::Stopped => STOPPED,
         };
         let footer = self.footer(&status, &crate::activity::summary(&tool_rows), now);
-        let bodies = pack(&pieces);
+        let tool_log = tool_log(&log);
+        let log_size = tool_log.as_ref().map_or(0, |(_, size)| *size);
+        let bodies = pack(&pieces, CARD_TEXT.saturating_sub(log_size));
         let last = bodies.len() - 1;
+        let settled = status != Status::Working;
         bodies
             .into_iter()
             .enumerate()
@@ -309,33 +374,78 @@ impl Timeline {
                     .iter()
                     .map(|piece| json!({"type": 10, "content": piece}))
                     .collect();
+                let mut files = Vec::new();
+                let mut extra = Vec::new();
                 if index == last {
+                    children.extend(self.media_components());
+                    files = self.media.iter().map(|media| media.name.clone()).collect();
                     children.push(json!({"type": 14, "divider": true, "spacing": 1}));
                     children.push(footer.clone());
+                    if buttons && settled {
+                        children.extend(self.action_row());
+                    }
+                    extra.extend(tool_log.clone().map(|(container, _)| container));
                 }
+                let mut components = vec![json!({
+                    "type": 17,
+                    "accent_color": accent,
+                    "components": children,
+                })];
+                components.extend(extra);
                 Card {
-                    components: vec![json!({
-                        "type": 17,
-                        "accent_color": accent,
-                        "components": children,
-                    })],
+                    components,
                     text: body.join("\n"),
+                    files,
                 }
             })
             .collect()
     }
 
+    /// The answer's files: images and videos in one gallery, the rest as
+    /// File cards, all referencing uploads that travel with the edit.
+    fn media_components(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        let visuals: Vec<Value> = self
+            .media
+            .iter()
+            .filter(|media| media.visual)
+            .map(|media| json!({"media": {"url": format!("attachment://{}", media.name)}}))
+            .collect();
+        if !visuals.is_empty() {
+            out.push(json!({"type": 12, "items": visuals}));
+        }
+        for media in self.media.iter().filter(|media| !media.visual) {
+            out.push(json!({"type": 13, "file": {"url": format!("attachment://{}", media.name)}}));
+        }
+        out
+    }
+
+    fn action_row(&self) -> Option<Value> {
+        let mut buttons = Vec::new();
+        if let Some(custom_id) = &self.retry {
+            buttons.push(json!({
+                "type": 2, "style": 2, "label": "Retry",
+                "emoji": {"name": "🔁"}, "custom_id": custom_id,
+            }));
+        }
+        if let Some(custom_id) = &self.new_chat {
+            buttons.push(json!({
+                "type": 2, "style": 2, "label": "New chat",
+                "emoji": {"name": "🆕"}, "custom_id": custom_id,
+            }));
+        }
+        (!buttons.is_empty()).then(|| json!({"type": 1, "components": buttons}))
+    }
+
     fn footer(&self, status: &Status, summary: &str, now: f64) -> Value {
         let elapsed = (now - self.started).max(0.0);
         let mut line = match status {
-            Status::Working if elapsed >= CLOCK_STEP => {
-                let stepped = (elapsed / CLOCK_STEP).floor() * CLOCK_STEP;
-                format!("⏳ working · {}", duration(stepped, false))
-            }
-            Status::Working => "⏳ working".to_string(),
-            Status::Done => format!("✅ done in {}", duration(elapsed, true)),
-            Status::Failed(reason) => format!("❌ {reason} after {}", duration(elapsed, true)),
-            Status::Stopped => format!("⏹️ stopped after {}", duration(elapsed, true)),
+            // A Discord timestamp: "started 20 seconds ago", kept current by
+            // every client with no edits from us.
+            Status::Working => format!("⏳ started <t:{}:R>", self.started.max(0.0) as i64),
+            Status::Done => format!("✅ done in {}", duration(elapsed)),
+            Status::Failed(reason) => format!("❌ {reason} after {}", duration(elapsed)),
+            Status::Stopped => format!("⏹️ stopped after {}", duration(elapsed)),
         };
         if !summary.is_empty() {
             line.push_str(" · ");
@@ -469,6 +579,22 @@ impl Timeline {
         self.settled(now)?.last().map(|(_, id)| id.clone())
     }
 
+    /// The settled last card without its Retry / New chat buttons, for
+    /// when the next turn starts: only the latest turn offers them. `None`
+    /// when there is nothing to retire, or the card carries uploads (an
+    /// edit would have to resend them).
+    pub fn retired(&self) -> Option<(String, Vec<Value>)> {
+        self.status.as_ref()?;
+        if (self.retry.is_none() && self.new_chat.is_none()) || !self.media.is_empty() {
+            return None;
+        }
+        self.settled(0.0)?;
+        let cards = self.render_with(0.0, false);
+        let last = cards.last()?;
+        let posted = self.cards.get(cards.len() - 1)?;
+        Some((posted.id.clone(), last.components.clone()))
+    }
+
     /// Every card on screen, for retracting a preview whose answer did not
     /// land before the durable resend.
     pub fn posted_ids(&self) -> Vec<String> {
@@ -476,17 +602,99 @@ impl Timeline {
     }
 }
 
-/// `4.1s`, `1m 12s`; `round` keeps tenths under a minute.
-fn duration(secs: f64, round: bool) -> String {
+/// `4.1s`, `1m 12s`.
+fn duration(secs: f64) -> String {
     if secs < 60.0 {
-        return if round {
-            format!("{secs:.1}s")
-        } else {
-            format!("{}s", secs as u64)
-        };
+        return format!("{secs:.1}s");
     }
     let whole = secs as u64;
     format!("{}m {:02}s", whole / 60, whole % 60)
+}
+
+/// The spoiler container holding every line of the folded tool groups, and
+/// its text size. Bounded: the newest lines win, older ones become a count.
+fn tool_log(lines: &[String]) -> Option<(Value, usize)> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut size = 0usize;
+    for line in lines.iter().rev() {
+        let entry = format!("-# {line}");
+        let cost = crate::text::utf16_len(&entry) + 1;
+        if size + cost > LOG_CHARS - 40 {
+            break;
+        }
+        size += cost;
+        kept.push(entry);
+    }
+    kept.reverse();
+    let dropped = lines.len() - kept.len();
+    if dropped > 0 {
+        kept.insert(0, format!("-# … +{dropped} earlier"));
+    }
+    let head = format!("-# 🔧 tool log · {} calls", lines.len());
+    let body = kept.join("\n");
+    let size = crate::text::utf16_len(&head) + crate::text::utf16_len(&body);
+    Some((
+        json!({
+            "type": 17,
+            "spoiler": true,
+            "components": [
+                {"type": 10, "content": head},
+                {"type": 10, "content": body},
+            ],
+        }),
+        size,
+    ))
+}
+
+/// The pressed card, flipped to "stopping…" for the interaction's own
+/// UPDATE_MESSAGE response: grey accent, the Stop section replaced by a
+/// line. The worker settles the card properly on its next frame. `None`
+/// when the button is not on this card.
+pub fn stopping(components: &Value, pressed: &str) -> Option<Vec<Value>> {
+    let mut out = components.as_array()?.clone();
+    let mut found = false;
+    for top in &mut out {
+        strip_nulls(top);
+        if top.get("type").and_then(Value::as_u64) != Some(17)
+            || top.get("spoiler").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        top["accent_color"] = json!(STOPPED);
+        let Some(children) = top.get_mut("components").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for child in children.iter_mut() {
+            let is_stop = child.get("type").and_then(Value::as_u64) == Some(9)
+                && child
+                    .pointer("/accessory/custom_id")
+                    .and_then(Value::as_str)
+                    == Some(pressed);
+            if is_stop {
+                *child = json!({"type": 10, "content": "-# ⏹️ stopping…"});
+                found = true;
+            }
+        }
+    }
+    found.then_some(out)
+}
+
+/// Discord (and twilight) echo optional fields as `null`; the validator
+/// reads a present key as set, so drop them before sending a tree back.
+fn strip_nulls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, field| !field.is_null());
+            for field in map.values_mut() {
+                strip_nulls(field);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
 }
 
 /// Fill cards in order. A piece that does not fit is cut to fill the room
@@ -494,13 +702,13 @@ fn duration(secs: f64, round: bool) -> String {
 /// moves between cards as the turn grows: a cut lands on the last newline
 /// that keeps at least half the room, and a code fence open at the cut is
 /// closed there and reopened in the next card.
-pub fn pack(pieces: &[String]) -> Vec<Vec<String>> {
+pub fn pack(pieces: &[String], budget: usize) -> Vec<Vec<String>> {
     let mut cards: Vec<Vec<String>> = vec![Vec::new()];
     let mut used = 0usize;
     for piece in pieces {
         let mut rest = piece.clone();
         while !rest.is_empty() {
-            let room = CARD_TEXT.saturating_sub(used);
+            let room = budget.saturating_sub(used);
             let size = crate::text::utf16_len(&rest);
             let full = cards.last().map_or(0, Vec::len) >= MAX_PIECES;
             if full || (size > room && room < MIN_ROOM) {
@@ -655,16 +863,44 @@ mod tests {
             cards[0].text,
             "Let me check.\n-# 💻 Running `cargo test`\nAll ▉"
         );
-        assert_eq!(footer(&cards[0]), "-# ⏳ working · ran 1 command");
+        assert_eq!(footer(&cards[0]), "-# ⏳ started <t:0:R> · ran 1 command");
     }
 
     #[test]
-    fn the_footer_clock_moves_in_steps() {
-        let mut t = Timeline::new(true, 100.0);
+    fn the_live_clock_never_costs_an_edit() {
+        let mut t = Timeline::new(true, 1_700_000_000.0);
         t.absorb(&text(0, "", "Hi", false));
-        assert_eq!(footer(&t.render(105.0)[0]), "-# ⏳ working");
-        assert_eq!(footer(&t.render(127.0)[0]), "-# ⏳ working · 20s");
-        assert_eq!(footer(&t.render(195.0)[0]), "-# ⏳ working · 1m 30s");
+        land(&mut t, 1_700_000_000.0, false);
+        assert_eq!(
+            footer(&t.render(1_700_000_000.0)[0]),
+            "-# ⏳ started <t:1700000000:R>",
+            "Discord keeps the relative time current itself"
+        );
+        assert!(
+            t.plan(1_700_000_600.0, 1.0, false).is_empty(),
+            "ten idle minutes, no edits"
+        );
+    }
+
+    #[test]
+    fn a_long_tool_group_folds_into_a_spoiler_log() {
+        let mut t = Timeline::new(true, 0.0);
+        for i in 0..9 {
+            t.absorb(&ran(&format!("c{i}"), &format!("step {i}")));
+        }
+        let card = &t.render(0.0)[0];
+        crate::render::validate_components(&card.components).unwrap();
+        assert_eq!(
+            card.text,
+            "-# 🔧 9 tool calls · the full list is in the tool log below\n\
+             -# 💻 Running `step 7`\n-# 💻 Running `step 8`"
+        );
+        let log = &card.components[1];
+        assert_eq!(log["type"], 17);
+        assert_eq!(log["spoiler"], true, "tap to reveal");
+        let lines = log["components"][1]["content"].as_str().unwrap();
+        assert!(lines.starts_with("-# 💻 Running `step 0`"), "{lines}");
+        assert_eq!(lines.lines().count(), 9);
     }
 
     #[test]
@@ -690,6 +926,83 @@ mod tests {
                 "m0".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn a_settled_card_offers_retry_and_new_chat_and_retires_them_later() {
+        let mut t = Timeline::new(true, 0.0)
+            .with_stop("turn:stop:s".into())
+            .with_actions(Some("turn:retry:r".into()), Some("turn:new:n".into()));
+        t.absorb(&text(0, "", "Hi", false));
+        land(&mut t, 0.0, false);
+        let live = t.render(0.0);
+        assert!(!live[0].components[0].to_string().contains("turn:retry"));
+        t.adopt("Hi there");
+        t.settle(Status::Done, 2.0);
+        land(&mut t, 2.0, true);
+        let done = t.render(2.0);
+        crate::render::validate_components(&done[0].components).unwrap();
+        let children = container(&done[0])["components"].as_array().unwrap();
+        let row = children.last().unwrap();
+        assert_eq!(row["type"], 1, "an action row closes the settled card");
+        assert_eq!(row["components"][0]["custom_id"], "turn:retry:r");
+        assert_eq!(row["components"][1]["custom_id"], "turn:new:n");
+        assert_eq!(row["components"][1]["label"], "New chat");
+
+        let (id, components) = t.retired().unwrap();
+        assert_eq!(id, "m0");
+        let flat = serde_json::to_string(&components).unwrap();
+        assert!(!flat.contains("turn:retry") && !flat.contains("turn:new"));
+        assert!(flat.contains("done in 2.0s"), "only the buttons go");
+    }
+
+    #[test]
+    fn the_answer_files_sit_inside_the_settled_card() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "Here", false));
+        land(&mut t, 0.0, false);
+        t.adopt("Here it is:");
+        t.attach(vec![
+            Media {
+                name: "chart.png".into(),
+                visual: true,
+            },
+            Media {
+                name: "report.pdf".into(),
+                visual: false,
+            },
+        ]);
+        t.settle(Status::Done, 1.0);
+        let ops = land(&mut t, 1.0, true);
+        let [Op::Edit { body, .. }] = &ops[..] else {
+            panic!("{ops:?}")
+        };
+        crate::render::validate_components(&body.components).unwrap();
+        assert_eq!(body.files, vec!["chart.png", "report.pdf"]);
+        let children = container(body)["components"].as_array().unwrap();
+        assert_eq!(children[1]["type"], 12, "gallery after the prose");
+        assert_eq!(
+            children[1]["items"][0]["media"]["url"],
+            "attachment://chart.png"
+        );
+        assert_eq!(children[2]["type"], 13, "then the file card");
+        assert!(t.landed(1.0).is_some());
+        assert!(t.retired().is_none(), "a card with uploads is left as is");
+    }
+
+    #[test]
+    fn stop_flips_the_pressed_card_at_once() {
+        let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:s".into());
+        t.absorb(&text(0, "", "Working", false));
+        let mut echoed = json!(t.render(0.0)[0].components);
+        // Discord echoes optional fields back as null.
+        echoed[0]["components"][0]["id"] = Value::Null;
+        let flipped = stopping(&echoed, "turn:stop:s").unwrap();
+        crate::render::validate_components(&flipped).unwrap();
+        assert_eq!(flipped[0]["accent_color"], json!(STOPPED));
+        let text = flipped[0].to_string();
+        assert!(text.contains("stopping…") && !text.contains("turn:stop:s"));
+        assert!(stopping(&echoed, "turn:stop:other").is_none());
     }
 
     #[test]
@@ -745,7 +1058,7 @@ mod tests {
             body.push('\n');
         }
         body.push_str("```\nafter");
-        let cards = pack(&["-# 💻 Ran `ls`".to_string(), body]);
+        let cards = pack(&["-# 💻 Ran `ls`".to_string(), body], CARD_TEXT);
         assert_eq!(cards.len(), 2, "{cards:?}");
         assert_eq!(cards[0][0], "-# 💻 Ran `ls`", "earlier content stays put");
         assert!(cards[0][1].ends_with("\n```"), "the cut closes its fence");
@@ -770,12 +1083,12 @@ mod tests {
             first.iter().all(|c| c["type"] == 10),
             "no footer: {first:?}"
         );
-        assert!(footer(&cards[1]).starts_with("-# ⏳"));
+        assert!(footer(&cards[1]).starts_with("-# ⏳ started"));
     }
 
     #[test]
     fn a_runaway_turn_is_capped() {
-        let cards = pack(&["word ".repeat(20_000)]);
+        let cards = pack(&["word ".repeat(20_000)], CARD_TEXT);
         assert_eq!(cards.len(), MAX_CARDS);
         assert_eq!(cards.last().unwrap().last().unwrap(), "-# … (truncated)");
     }

@@ -53,6 +53,22 @@ fn a_start_line_is_replaced_by_its_own_ran_line() {
 }
 
 #[test]
+fn parallel_calls_each_replace_their_own_placeholder() {
+    let mut batch: Vec<serde_json::Value> = ["a", "b", "c"]
+        .iter()
+        .map(|id| json!({"phase": "tool_started", "call_id": id, "tool": "bash"}))
+        .collect();
+    for (id, command) in [("a", "uptime"), ("b", "date -u"), ("c", "nproc")] {
+        batch.push(json!({"phase": "tool_ran", "call_id": id, "tool": "bash", "detail": command}));
+    }
+    assert_eq!(
+        activity::render(&batch).as_deref(),
+        Some("💻 Running `uptime`\n💻 Running `date -u`\n💻 Running `nproc`"),
+        "three calls, three lines, no stale placeholders"
+    );
+}
+
+#[test]
 fn a_line_carries_the_duration_once_the_call_returns() {
     let ran = rows(json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "ls"}));
     assert_eq!(activity::render(&ran).as_deref(), Some("💻 Running `ls`"));

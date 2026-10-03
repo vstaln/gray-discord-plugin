@@ -196,6 +196,20 @@ pub struct Settled {
     pub landed: Option<crate::stream::Landed>,
     /// The card whose footer shows how the turn ended, when it is on screen.
     pub status_card: Option<String>,
+    /// How many of the offered uploads the landed card shows; the rest still
+    /// need delivering.
+    pub media_shown: usize,
+}
+
+/// A settled card's message id and its components without the buttons.
+type RetiredCard = (String, Vec<Value>);
+
+/// The `custom_id`s of a turn card's buttons, minted per turn.
+#[derive(Debug, Clone, Default)]
+pub struct TurnButtons {
+    pub stop: Option<String>,
+    pub retry: Option<String>,
+    pub new_chat: Option<String>,
 }
 
 /// Discord (or the renderer) refused the request outright: retrying the
@@ -228,6 +242,9 @@ pub struct Runtime<R, D> {
     timelines: std::sync::Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, crate::stream::Timeline>>,
     >,
+    /// The last settled card per channel/conversation, as it should look
+    /// once the next turn starts (its Retry / New chat buttons gone).
+    retired: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, RetiredCard>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -250,6 +267,7 @@ impl<R, D> Runtime<R, D> {
             timelines: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            retired: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -380,30 +398,37 @@ impl<R, D> Runtime<R, D> {
             channel,
             conversation,
             crate::stream::enabled(&self.config),
-            None,
+            TurnButtons::default(),
         )
         .await
     }
 
-    /// `stop` is the footer's Stop button `custom_id`, when one was minted.
+    /// `buttons` are the card's Stop, Retry and New chat `custom_id`s, when
+    /// they were minted. Only the latest turn offers Retry / New chat: the
+    /// previous card in this conversation loses them now.
     pub async fn begin_turn(
         &self,
         channel: &str,
         conversation: &str,
         text: bool,
-        stop: Option<String>,
+        buttons: TurnButtons,
     ) {
         if let Some(ref sink) = self.activity {
             crate::activity::begin(sink, conversation);
         }
-        let mut timeline = crate::stream::Timeline::new(text, self.now_secs());
-        if let Some(stop) = stop {
+        let key = activity_key(channel, conversation);
+        let previous = self.retired.lock().await.remove(&key);
+        if let (Some((id, components)), Some(rest), Ok(ch)) =
+            (previous, self.rest.as_ref(), channel.parse::<u64>())
+        {
+            let _ = rest.edit_v2(ch, &id, &components).await;
+        }
+        let mut timeline = crate::stream::Timeline::new(text, self.now_secs())
+            .with_actions(buttons.retry, buttons.new_chat);
+        if let Some(stop) = buttons.stop {
             timeline = timeline.with_stop(stop);
         }
-        self.timelines
-            .lock()
-            .await
-            .insert(activity_key(channel, conversation), timeline);
+        self.timelines.lock().await.insert(key, timeline);
     }
 
     /// `force` settles the turn as done: every pending edit goes out
@@ -418,41 +443,66 @@ impl<R, D> Runtime<R, D> {
     /// let a fast turn drain or finalize another turn's terminal output.
     pub async fn report_activity_for(&self, channel: &str, conversation: &str, force: bool) {
         if force {
-            self.finish_turn(channel, conversation, None, crate::stream::Status::Done)
-                .await;
+            self.finish_turn(
+                channel,
+                conversation,
+                None,
+                &[],
+                crate::stream::Status::Done,
+            )
+            .await;
         } else {
             self.absorb_rows(channel, conversation).await;
-            self.publish_timeline(channel, conversation, false).await;
+            self.publish_timeline(channel, conversation, false, &[])
+                .await;
         }
     }
 
     /// Settle the turn's card with `status`. With `answer` (prose, `MEDIA:`
     /// tags already taken out) the streamed reply becomes that answer in
-    /// place; `landed` says where it landed, or is `None` when the caller
+    /// place, with `uploads` (the files those tags named) shown inside the
+    /// card; `landed` says where it landed, or is `None` when the caller
     /// must post it durably.
     pub async fn finish_turn(
         &self,
         channel: &str,
         conversation: &str,
         answer: Option<&str>,
+        uploads: &[crate::media_tags::Upload],
         status: crate::stream::Status,
     ) -> Settled {
         self.absorb_rows(channel, conversation).await;
         let key = activity_key(channel, conversation);
         let now = self.now_secs();
+        let shown = uploads.len().min(crate::stream::MAX_MEDIA);
         let adopted = {
             let mut timelines = self.timelines.lock().await;
             match timelines.get_mut(&key) {
                 Some(timeline) => {
                     let adopted = answer.is_some_and(|answer| timeline.adopt(answer));
+                    if adopted {
+                        timeline.attach(
+                            uploads[..shown]
+                                .iter()
+                                .map(|upload| crate::stream::Media {
+                                    name: upload.name.clone(),
+                                    visual: upload.is_visual(),
+                                })
+                                .collect(),
+                        );
+                    }
                     timeline.settle(status, now);
                     adopted
                 }
                 None => false,
             }
         };
-        self.publish_timeline(channel, conversation, true).await;
+        self.publish_timeline(channel, conversation, true, uploads)
+            .await;
         let timeline = self.timelines.lock().await.remove(&key);
+        if let Some(retired) = timeline.as_ref().and_then(crate::stream::Timeline::retired) {
+            self.retired.lock().await.insert(key.clone(), retired);
+        }
         if let Some(ref sink) = self.activity {
             let history = crate::activity::finish(sink, conversation);
             if crate::activity::enabled(&self.config) && crate::activity::card_enabled(&self.config)
@@ -468,11 +518,15 @@ impl<R, D> Runtime<R, D> {
         let mut settled = Settled {
             landed: None,
             status_card: timeline.status_card(now),
+            media_shown: 0,
         };
         if !adopted {
             return settled;
         }
         settled.landed = timeline.landed(now);
+        if settled.landed.is_some() {
+            settled.media_shown = shown;
+        }
         if settled.landed.is_none() {
             // The answer did not fully land. Retract its preview so the
             // durable resend does not leave the same words on screen twice.
@@ -508,8 +562,22 @@ impl<R, D> Runtime<R, D> {
         }
     }
 
-    /// Send whatever the timeline says is due, in order.
-    async fn publish_timeline(&self, channel: &str, conversation: &str, finishing: bool) {
+    /// Send whatever the timeline says is due, in order. A card that shows
+    /// files carries the matching `uploads` with its request.
+    async fn publish_timeline(
+        &self,
+        channel: &str,
+        conversation: &str,
+        finishing: bool,
+        uploads: &[crate::media_tags::Upload],
+    ) {
+        let files_for = |body: &crate::stream::Card| -> Vec<crate::media_tags::Upload> {
+            body.files
+                .iter()
+                .filter_map(|name| uploads.iter().find(|upload| &upload.name == name))
+                .cloned()
+                .collect()
+        };
         let Ok(ch) = channel.parse::<u64>() else {
             return;
         };
@@ -522,8 +590,15 @@ impl<R, D> Runtime<R, D> {
         for op in ops {
             match op {
                 crate::stream::Op::Post { card, body } => {
+                    let files = files_for(&body);
                     let sent = match self.rest {
-                        Some(ref rest) => rest.send_v2(ch, &body.components, None).await,
+                        Some(ref rest) if files.is_empty() => {
+                            rest.send_v2(ch, &body.components, None).await
+                        }
+                        Some(ref rest) => {
+                            rest.send_v2_uploads(ch, &body.components, &files, None)
+                                .await
+                        }
                         // No REST (tests, dry runs): still narrate via the hook.
                         None => Ok(format!("hook-{card}")),
                     };
@@ -549,8 +624,15 @@ impl<R, D> Runtime<R, D> {
                     }
                 }
                 crate::stream::Op::Edit { card, id, body } => {
+                    let files = files_for(&body);
                     let outcome = match self.rest {
-                        Some(ref rest) => rest.edit_v2(ch, &id, &body.components).await,
+                        Some(ref rest) if files.is_empty() => {
+                            rest.edit_v2(ch, &id, &body.components).await
+                        }
+                        Some(ref rest) => {
+                            rest.edit_v2_uploads(ch, &id, &body.components, &files)
+                                .await
+                        }
                         None => Ok(()),
                     };
                     let mut timelines = self.timelines.lock().await;
@@ -667,12 +749,26 @@ where
             .and_then(Value::as_u64)
             .unwrap_or(600)
             .saturating_add(120);
-        let stop = self
-            .store
-            .component_state_create("turn_stop", "*", &item.channel, &item.id, ttl)
-            .ok()
-            .map(|token| format!("turn:stop:{token}"));
-        self.begin_turn(&item.channel, &item.conversation, stream_text, stop)
+        let mint = |kind: &str, resource: &str, ttl: u64| {
+            self.store
+                .component_state_create(&format!("turn_{kind}"), "*", &item.channel, resource, ttl)
+                .ok()
+                .map(|token| format!("turn:{kind}:{token}"))
+        };
+        // Retry and New chat outlive the turn by a day. A slash command's
+        // card is not the answer, and a component event cannot be replayed
+        // as text, so those get Stop only.
+        let ordinary = item.interaction_token.is_none();
+        let buttons = TurnButtons {
+            stop: mint("stop", &item.id, ttl),
+            retry: (ordinary && item.input_json.is_none())
+                .then(|| mint("retry", &item.id, 86_400))
+                .flatten(),
+            new_chat: ordinary
+                .then(|| mint("new", &item.conversation, 86_400))
+                .flatten(),
+        };
+        self.begin_turn(&item.channel, &item.conversation, stream_text, buttons)
             .await;
         // Bind this conversation's cron jobs to this channel. The chat id
         // is the live session when we have one (so a cron reply continues
@@ -712,6 +808,7 @@ where
                                     &item.channel,
                                     &item.conversation,
                                     None,
+                                    &[],
                                     crate::stream::Status::Stopped,
                                 )
                                 .await;
@@ -726,8 +823,8 @@ where
         };
 
         // Settle the turn. A streamed reply becomes the answer in place
-        // (Hermes' final edit); `MEDIA:` files still go out through the
-        // durable outbox after it.
+        // (Hermes' final edit), with the files its `MEDIA:` tags named shown
+        // inside the card; any the card cannot hold go through the outbox.
         let (prose, media) = match &result {
             Some(Ok(answer)) if stream_text => {
                 let (prose, media) =
@@ -744,21 +841,29 @@ where
             Some(Err(RunError::Timeout)) => crate::stream::Status::Failed("timed out".to_string()),
             Some(Err(_)) => crate::stream::Status::Failed("failed".to_string()),
         };
+        let loaded = crate::media_tags::load_pairs(&media);
+        let uploads: Vec<crate::media_tags::Upload> =
+            loaded.iter().map(|(_, upload)| upload.clone()).collect();
         let settled = self
-            .finish_turn(&item.channel, &item.conversation, prose.as_deref(), status)
+            .finish_turn(
+                &item.channel,
+                &item.conversation,
+                prose.as_deref(),
+                &uploads,
+                status,
+            )
             .await;
         match result {
             Some(Ok(answer)) => {
                 let receipt = serde_json::json!({});
+                let leftover: Vec<String> = loaded
+                    .iter()
+                    .skip(settled.media_shown)
+                    .map(|(path, _)| format!("MEDIA:{}", path.display()))
+                    .collect();
                 match settled.landed {
-                    Some(landed) if !landed.parts.is_empty() || !media.is_empty() => {
-                        let media = (!media.is_empty()).then(|| {
-                            media
-                                .iter()
-                                .map(|path| format!("MEDIA:{}", path.display()))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        });
+                    Some(landed) if !landed.parts.is_empty() || !leftover.is_empty() => {
+                        let media = (!leftover.is_empty()).then(|| leftover.join("\n"));
                         self.store.complete_streamed(
                             &item.id,
                             &receipt,
@@ -1451,11 +1556,25 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             )
                         );
                         let is_autocomplete = interaction.kind == InteractionType::ApplicationCommandAutocomplete;
-                        // The live card's Stop button is plugin-owned, not a
-                        // typed agent component: handle it before that router.
+                        // The turn card's Stop / Retry / New chat buttons are
+                        // plugin-owned, not typed agent components: handle
+                        // them before that router.
                         if let Some(twilight_model::application::interaction::InteractionData::MessageComponent(component)) = &interaction.data {
-                            if component.custom_id.starts_with("turn:stop:") {
-                                crate::command_dispatch::stop_button(&ctx, &component.custom_id).await;
+                            let id = component.custom_id.as_str();
+                            if id.starts_with("turn:stop:") {
+                                let pressed = interaction
+                                    .message
+                                    .as_ref()
+                                    .and_then(|message| serde_json::to_value(&message.components).ok());
+                                crate::command_dispatch::stop_button(&ctx, id, pressed.as_ref()).await;
+                                continue;
+                            }
+                            if id.starts_with("turn:retry:") {
+                                crate::command_dispatch::retry_button(&ctx, id).await;
+                                continue;
+                            }
+                            if id.starts_with("turn:new:") {
+                                crate::command_dispatch::new_chat_button(&ctx, id).await;
                                 continue;
                             }
                         }

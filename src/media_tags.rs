@@ -225,6 +225,15 @@ fn is_sensitive(path: &Path) -> bool {
 
 /// Read deliverable files into uploads with unique, Discord-safe names.
 pub fn load(paths: &[PathBuf]) -> Vec<Upload> {
+    load_pairs(paths)
+        .into_iter()
+        .map(|(_, upload)| upload)
+        .collect()
+}
+
+/// [`load`], keeping which path each upload came from (unreadable paths are
+/// skipped), so a caller can tell which files still need delivering.
+pub fn load_pairs(paths: &[PathBuf]) -> Vec<(PathBuf, Upload)> {
     let mut used: Vec<String> = Vec::new();
     let mut uploads = Vec::new();
     for path in paths {
@@ -248,11 +257,14 @@ pub fn load(paths: &[PathBuf]) -> Vec<Upload> {
             name = format!("{stem}-{index}{ext}");
         }
         used.push(name.clone());
-        uploads.push(Upload {
-            media_type: crate::component_media::infer_media_type(&name).to_string(),
-            name,
-            bytes,
-        });
+        uploads.push((
+            path.clone(),
+            Upload {
+                media_type: crate::component_media::infer_media_type(&name).to_string(),
+                name,
+                bytes,
+            },
+        ));
     }
     uploads
 }
