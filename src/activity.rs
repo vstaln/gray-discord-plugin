@@ -12,6 +12,11 @@
 //! **never the tool's output**. A chat surface is a status feed, not a
 //! transcript; echoing results dumps file contents, memory snapshots and
 //! credentials into the channel.
+//!
+//! The sink also carries gray's streamed `text` rows, in order with the tool
+//! rows, so [`crate::stream`] can lay the turn out as Hermes does. Text rows
+//! stay out of the bounded history: they would crowd the tool rows the
+//! optional end-of-turn card is built from.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -32,16 +37,12 @@ const MAX_CARD_ROWS: usize = 5;
 /// stays well under.
 const MAX_CARD_CHARS: usize = 3600;
 
-/// Lines kept in the bubble: the current one plus two before it, so a
-/// pause reads as a sequence rather than a single blinking line.
-const KEEP_LINES: usize = 3;
-
 /// Hermes' suggested cap for a tool preview line
 /// (`display.tool_preview_length: 80`).
 const MAX_PREVIEW_CHARS: usize = 80;
 
 /// Seconds between edits of the same bubble (Discord rate-limits edits).
-const MIN_EDIT_GAP: f64 = 1.0;
+pub const MIN_EDIT_GAP: f64 = 1.0;
 
 #[derive(Default)]
 struct ScopeState {
@@ -74,6 +75,16 @@ pub fn enabled(config: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// The end-of-turn tally card (`⋯ 12.4s · ran 3 commands`). Off by default:
+/// Hermes posts none, and the progress bubbles already stay in the channel
+/// as the turn's record. `"activity_card": true` brings it back.
+pub fn card_enabled(config: &Value) -> bool {
+    config
+        .get("activity_card")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Start a fresh history for one conversation. The daemon may have a stale
 /// entry after a crash or a cancelled turn; never let it bleed into the next
 /// turn's card.
@@ -104,6 +115,9 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
         scope.pending.pop_front();
     }
     scope.pending.push_back(row.clone());
+    if row.get("phase").and_then(Value::as_str) == Some("text") {
+        return;
+    }
     if scope.history.len() >= MAX_HISTORY {
         scope.history.pop_front();
     }
@@ -159,21 +173,6 @@ pub fn drain_for(s: &Sink, scope: &str) -> Vec<Value> {
         .get_mut(scope)
         .map(|scope| scope.pending.drain(..).collect())
         .unwrap_or_default()
-}
-
-/// Clone the pending rows without consuming them. The gateway peeks before
-/// the edit rate-limit gate: draining first drops rows the gate then
-/// refuses, which sticks the bubble (bare "Running" with the command never
-/// following) until the turn ends.
-pub fn peek_for(s: &Sink, scope: &str) -> Vec<Value> {
-    match s.lock() {
-        Ok(state) => state
-            .scopes
-            .get(scope)
-            .map(|scope| scope.pending.iter().cloned().collect())
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Remove a completed turn and return its full bounded history. Removing the
@@ -272,8 +271,16 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
     }
 }
 
+/// A call reads "Running" while it runs and "Ran" once it has returned —
+/// the feed stays in the channel after the turn, so it must read as done.
 fn ran_line(tool: &str, detail: &str, elapsed: Option<u64>) -> String {
-    shell_line(tool, detail, elapsed, false)
+    shell_line(tool, detail, elapsed, elapsed.is_some())
+}
+
+/// Whether `row` puts a line in the feed. A row that does not (a quiet
+/// finish, a phase marker) never opens a new tool bubble on its own.
+pub fn narrates(row: &Value) -> bool {
+    line(row, None).is_some()
 }
 
 /// Receipt version of [`ran_line`]: the turn is over, so shell work reads as
@@ -387,8 +394,9 @@ struct BubbleLine {
     quiet: bool,
 }
 
-/// Render a drained batch into the bubble body: the last `KEEP_LINES`
-/// distinct lines, oldest first. `None` when nothing is worth showing.
+/// Render one tool bubble's rows into its body: every distinct line, oldest
+/// first (Hermes' accumulating progress bubble). `None` when nothing is
+/// worth showing.
 pub fn render(rows: &[Value]) -> Option<String> {
     let by_call = elapsed_by_call(rows);
     let mut lines: Vec<BubbleLine> = Vec::new();
@@ -436,8 +444,7 @@ pub fn render(rows: &[Value]) -> Option<String> {
     if shown.is_empty() {
         return None;
     }
-    let skip = shown.len().saturating_sub(KEEP_LINES);
-    Some(shown[skip..].join("\n"))
+    Some(shown.join("\n"))
 }
 
 #[derive(Default)]
@@ -590,14 +597,4 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
-}
-
-/// True when `text` is worth an edit: it changed, and the gap since the
-/// last edit has passed. Content equality is the real gate — Discord
-/// rejects a no-op edit, and a quiet turn should send nothing at all.
-pub fn should_publish(text: &str, last: Option<&str>, now: f64, last_at: f64) -> bool {
-    if Some(text) == last {
-        return false;
-    }
-    last_at < 0.0 || now - last_at >= MIN_EDIT_GAP
 }

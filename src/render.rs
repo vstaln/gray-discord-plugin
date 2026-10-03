@@ -172,13 +172,8 @@ pub fn card(title: &str, body: &str, accent: u32, actions: &[Value]) -> Result<V
         .map_err(|error| error.message)
 }
 
-/// Render a short live activity bubble.
-pub fn activity(text: &str) -> Result<Vec<Value>, String> {
-    card("gray · working", text, INFO_ACCENT, &[])
-}
-
-/// Render the persistent, bounded tool activity card. Same silhouette as
-/// the live bubble, one step quieter: this is the turn's receipt.
+/// Render the opt-in end-of-turn tally card (`activity_card`). Live
+/// narration and replies are plain Text Displays (see [`crate::stream`]).
 pub fn tool_card(text: &str) -> Result<Vec<Value>, String> {
     card("gray · done", text, QUIET_ACCENT, &[])
 }

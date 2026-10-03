@@ -7,7 +7,7 @@ use crate::component_media::FileStore;
 use crate::component_state::NewEvent;
 use crate::durable::{OutboxPart, Store};
 use crate::runner::{RunError, RunInput};
-use crate::transport::Rest;
+use crate::transport::{Rest, TransportError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
@@ -189,13 +189,14 @@ fn activity_key(channel: &str, conversation: &str) -> String {
     format!("{channel}\u{0}{conversation}")
 }
 
-/// The live status bubble for one channel/conversation: its message id,
-/// last published text, and timestamp.
-#[derive(Clone)]
-struct ActivityBubble {
-    id: String,
-    text: String,
-    at: f64,
+/// Discord (or the renderer) refused the request outright: retrying the
+/// same payload cannot succeed. Rate limits, 5xx and network errors can.
+fn refused(error: &TransportError) -> bool {
+    match error {
+        TransportError::Auth(_) | TransportError::Forbidden(_) | TransportError::Invalid(_) => true,
+        TransportError::Http(code, _) => (400..500).contains(code),
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -213,8 +214,11 @@ pub struct Runtime<R, D> {
     /// Rows the runner has read but nobody has narrated yet.
     pub activity: Option<crate::activity::Sink>,
     last_typing: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
-    activity_bubbles:
-        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, ActivityBubble>>>,
+    /// The live turn per channel/conversation: prose messages and tool
+    /// bubbles in channel order (see [`crate::stream`]).
+    timelines: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, crate::stream::Timeline>>,
+    >,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -234,7 +238,7 @@ impl<R, D> Runtime<R, D> {
             last_typing: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            activity_bubbles: std::sync::Arc::new(tokio::sync::Mutex::new(
+            timelines: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
@@ -317,6 +321,21 @@ impl<R, D> Runtime<R, D> {
         }
     }
 
+    /// Where a relative `MEDIA:` path resolves: the configured workdir, the
+    /// same root the delivery worker uses.
+    fn media_cwd(&self) -> PathBuf {
+        PathBuf::from(
+            self.config
+                .get("workdir")
+                .and_then(Value::as_str)
+                .unwrap_or("."),
+        )
+    }
+
+    fn media_roots(&self) -> Vec<PathBuf> {
+        crate::media_tags::roots_from_config(&self.config)
+    }
+
     /// The gray home for one conversation (the same layout `run_gray`
     /// builds), or `None` when the layout cannot be derived.
     pub fn conversation_home(&self, conversation: &str) -> Option<std::path::PathBuf> {
@@ -337,29 +356,33 @@ impl<R, D> Runtime<R, D> {
             .map(str::to_string)
     }
 
-    /// Narrate whatever the agent just did: one live status bubble per
-    /// active channel/conversation, overwritten in place. Best-effort throughout; live
-    /// narration can never fail a turn.
+    /// Narrate whatever the agent just did: tool lines in a live bubble, and
+    /// (with streamed prose) the reply itself, all edited in place.
+    /// Best-effort throughout; live narration can never fail a turn.
     pub async fn report_activity(&self, channel: &str) {
         self.report_activity_for(channel, "", false).await
     }
 
-    /// Start a fresh live bubble and row history for one turn. Keeping this
-    /// beside the renderer makes the reset explicit for tests and for any
-    /// future non-queue caller.
+    /// Start a fresh timeline and row history for one turn. Prose streams
+    /// only when `text` is set: a slash-command turn answers through its
+    /// interaction, so only its tool bubble runs in the channel.
     pub async fn begin_activity(&self, channel: &str, conversation: &str) {
+        self.begin_turn(channel, conversation, crate::stream::enabled(&self.config))
+            .await
+    }
+
+    pub async fn begin_turn(&self, channel: &str, conversation: &str, text: bool) {
         if let Some(ref sink) = self.activity {
             crate::activity::begin(sink, conversation);
         }
-        self.activity_bubbles
-            .lock()
-            .await
-            .remove(&activity_key(channel, conversation));
+        self.timelines.lock().await.insert(
+            activity_key(channel, conversation),
+            crate::stream::Timeline::new(text),
+        );
     }
 
-    /// `force` skips the edit gap for the final flush at turn end, so the
-    /// last action of a turn is never swallowed by the rate limit. The final
-    /// flush also posts the persistent, bounded tool-activity card.
+    /// `force` settles the turn: every pending edit goes out regardless of
+    /// the edit gap, cursors come off, and the timeline is retired.
     pub async fn report_activity_at(&self, channel: &str, force: bool) {
         self.report_activity_for(channel, "", force).await
     }
@@ -368,125 +391,164 @@ impl<R, D> Runtime<R, D> {
     /// daemon can run several channels concurrently; one global queue would
     /// let a fast turn drain or finalize another turn's terminal output.
     pub async fn report_activity_for(&self, channel: &str, conversation: &str, force: bool) {
-        let Some(sink) = self.activity.clone() else {
-            return;
-        };
-        if !crate::activity::enabled(&self.config) {
-            crate::activity::discard(&sink, conversation);
-            return;
-        }
-        // Peek before consuming: rows drained ahead of the edit rate-limit
-        // gate are dropped when the gate refuses, sticking the bubble on a
-        // bare "Running" line with the command never following. Only consume
-        // on publish (or when nothing is narratable); a gated turn retries
-        // on the next tick after the gap passes.
-        let peeked = crate::activity::peek_for(&sink, conversation);
-        let text = match crate::activity::render(&peeked) {
-            None => {
-                crate::activity::drain_for(&sink, conversation);
-                None
-            }
-            Some(text) => {
-                if !force {
-                    let key = activity_key(channel, conversation);
-                    let bubbles = self.activity_bubbles.lock().await;
-                    let (last_text, last_at) = match bubbles.get(&key) {
-                        Some(b) => (Some(b.text.as_str()), b.at),
-                        None => (None, -1.0),
-                    };
-                    if !crate::activity::should_publish(&text, last_text, self.now_secs(), last_at)
-                    {
-                        return;
-                    }
-                }
-                crate::activity::drain_for(&sink, conversation);
-                Some(text)
-            }
-        };
-        if let Some(text) = text {
-            self.publish_live_activity(channel, conversation, &text, force)
-                .await;
-        }
         if force {
-            let history = crate::activity::finish(&sink, conversation);
-            if let Some(card) = crate::activity::render_card(&history) {
-                self.publish_activity_card(channel, &card).await;
-            }
+            self.finish_turn(channel, conversation, None).await;
+        } else {
+            self.absorb_rows(channel, conversation).await;
+            self.publish_timeline(channel, conversation, false).await;
         }
     }
 
-    async fn publish_live_activity(
+    /// Settle the turn. With `answer` (prose, `MEDIA:` tags already taken
+    /// out) the streamed reply becomes that answer in place; the result says
+    /// where it landed, or `None` when the caller must post it durably.
+    pub async fn finish_turn(
         &self,
         channel: &str,
         conversation: &str,
-        text: &str,
-        force: bool,
-    ) {
+        answer: Option<&str>,
+    ) -> Option<crate::stream::Landed> {
+        self.absorb_rows(channel, conversation).await;
         let key = activity_key(channel, conversation);
-        let now = self.now_secs();
-        let prev = {
-            let map = self.activity_bubbles.lock().await;
-            map.get(&key).cloned()
+        let adopted = match answer {
+            Some(answer) => self
+                .timelines
+                .lock()
+                .await
+                .get_mut(&key)
+                .is_some_and(|timeline| timeline.adopt(answer)),
+            None => false,
         };
-        let (last_text, last_at) = match &prev {
-            Some(b) => (Some(b.text.as_str()), b.at),
-            None => (None, -1.0),
-        };
-        if !force && !crate::activity::should_publish(text, last_text, now, last_at) {
-            return;
+        self.publish_timeline(channel, conversation, true).await;
+        let timeline = self.timelines.lock().await.remove(&key);
+        if let Some(ref sink) = self.activity {
+            let history = crate::activity::finish(sink, conversation);
+            if crate::activity::enabled(&self.config) && crate::activity::card_enabled(&self.config)
+            {
+                if let Some(card) = crate::activity::render_card(&history) {
+                    self.publish_activity_card(channel, &card).await;
+                }
+            }
         }
+        if !adopted {
+            return None;
+        }
+        let timeline = timeline?;
+        if let Some(landed) = timeline.landed() {
+            return Some(landed);
+        }
+        // The answer did not fully land. Retract its preview so the durable
+        // resend below does not leave the same words on screen twice.
+        if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
+            for id in timeline.stale_answer() {
+                let _ = rest.delete_message(ch, &id).await;
+            }
+        }
+        None
+    }
+
+    /// Move the rows the runner has read into this turn's timeline.
+    async fn absorb_rows(&self, channel: &str, conversation: &str) {
+        let Some(sink) = self.activity.clone() else {
+            return;
+        };
+        let rows = crate::activity::drain_for(&sink, conversation);
+        let narrate = crate::activity::enabled(&self.config);
+        let key = activity_key(channel, conversation);
+        let mut timelines = self.timelines.lock().await;
+        let timeline = timelines
+            .entry(key)
+            .or_insert_with(|| crate::stream::Timeline::new(false));
+        for row in rows {
+            // Narration off hides tool lines, never the reply.
+            if !narrate && row.get("phase").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            timeline.absorb(&row);
+        }
+    }
+
+    /// Send whatever the timeline says is due, in order.
+    async fn publish_timeline(&self, channel: &str, conversation: &str, finishing: bool) {
         let Ok(ch) = channel.parse::<u64>() else {
             return;
         };
-        match &prev {
-            // Existing bubble: overwrite it.
-            Some(b) => {
-                if let Some(ref rest) = self.rest {
-                    let Ok(components) = crate::render::activity(text) else {
+        let key = activity_key(channel, conversation);
+        let now = self.now_secs();
+        let ops = match self.timelines.lock().await.get(&key) {
+            Some(timeline) => timeline.plan(now, crate::activity::MIN_EDIT_GAP, finishing),
+            None => return,
+        };
+        for op in ops {
+            match op {
+                crate::stream::Op::Post { block, chunk, body } => {
+                    let sent = match self.rest {
+                        Some(ref rest) => match crate::render::text_message(&body) {
+                            Ok(components) => rest.send_v2(ch, &components, None).await,
+                            Err(error) => Err(TransportError::Invalid(error)),
+                        },
+                        // No REST (tests, dry runs): still narrate via the hook.
+                        None => Ok(format!("hook-{block}-{chunk}")),
+                    };
+                    let mut timelines = self.timelines.lock().await;
+                    let Some(timeline) = timelines.get_mut(&key) else {
                         return;
                     };
-                    if !rest.edit_message_v2(ch, &b.id, &components).await {
-                        // The bubble was deleted (or is in another channel):
-                        // forget it so the next line posts a fresh one.
-                        self.activity_bubbles.lock().await.remove(&key);
-                        return;
-                    }
-                }
-                if let Some(ref hook) = self.activity_hook {
-                    hook(text, true);
-                }
-            }
-            // First line of the turn (or the first of the channel).
-            None => {
-                let id = match self.rest {
-                    Some(ref rest) => {
-                        let Ok(components) = crate::render::activity(text) else {
+                    match sent {
+                        Ok(id) => timeline.posted(block, chunk, &id, &body, now),
+                        Err(error) => {
+                            // Posts keep channel order, so nothing after this
+                            // one goes out this frame. A refused post gives
+                            // the block up; a blip is retried next frame.
+                            if refused(&error) {
+                                timeline.lose(block);
+                            }
                             return;
-                        };
-                        match rest.send_v2(ch, &components, None).await {
-                            Ok(id) => id,
-                            Err(_) => return,
                         }
                     }
-                    // No REST (tests, dry runs): still narrate via the hook.
-                    None => "hook".to_string(),
-                };
-                self.activity_bubbles.lock().await.insert(
-                    key.clone(),
-                    ActivityBubble {
-                        id,
-                        text: text.to_string(),
-                        at: now,
-                    },
-                );
-                if let Some(ref hook) = self.activity_hook {
-                    hook(text, false);
+                    drop(timelines);
+                    if let Some(ref hook) = self.activity_hook {
+                        hook(&body, false);
+                    }
+                }
+                crate::stream::Op::Edit {
+                    block,
+                    chunk,
+                    id,
+                    body,
+                } => {
+                    let outcome = match self.rest {
+                        Some(ref rest) => match crate::render::text_message(&body) {
+                            Ok(components) => rest.edit_v2(ch, &id, &components).await,
+                            Err(error) => Err(TransportError::Invalid(error)),
+                        },
+                        None => Ok(()),
+                    };
+                    let mut timelines = self.timelines.lock().await;
+                    let Some(timeline) = timelines.get_mut(&key) else {
+                        return;
+                    };
+                    match outcome {
+                        Ok(()) => timeline.edited(block, chunk, &body, now),
+                        // Deleted, forbidden or unrenderable: stop editing
+                        // it. A blip is retried on the next frame.
+                        Err(error) if refused(&error) => timeline.lose(block),
+                        Err(_) => continue,
+                    }
+                    drop(timelines);
+                    if let Some(ref hook) = self.activity_hook {
+                        hook(&body, true);
+                    }
+                }
+                crate::stream::Op::Delete { block, chunk, id } => {
+                    if let Some(ref rest) = self.rest {
+                        let _ = rest.delete_message(ch, &id).await;
+                    }
+                    if let Some(timeline) = self.timelines.lock().await.get_mut(&key) {
+                        timeline.deleted(block, chunk);
+                    }
                 }
             }
-        }
-        if let Some(b) = self.activity_bubbles.lock().await.get_mut(&key) {
-            b.text = text.to_string();
-            b.at = now;
         }
     }
 
@@ -563,9 +625,13 @@ where
 
         self.add_reaction(&item.channel, &item.id, "👀").await;
         self.report_progress(&item.channel).await;
-        // A new turn gets a new live bubble; the prior turn's persistent card
-        // remains in the channel history instead of being edited underneath.
-        self.begin_activity(&item.channel, &item.conversation).await;
+        // A new turn gets a new timeline; the prior turn's messages stay in
+        // the channel history instead of being edited underneath. A slash
+        // command's answer belongs to its interaction, so only ordinary
+        // turns stream their prose into the channel.
+        let stream_text = crate::stream::enabled(&self.config) && item.interaction_token.is_none();
+        self.begin_turn(&item.channel, &item.conversation, stream_text)
+            .await;
         // Bind this conversation's cron jobs to this channel. The chat id
         // is the live session when we have one (so a cron reply continues
         // in context), else the conversation key.
@@ -610,14 +676,45 @@ where
             }
         };
 
-        // Final flush before the answer lands: the bubble shows the last
-        // thing the agent did, then the answer arrives as its own message.
-        self.report_activity_for(&item.channel, &item.conversation, true)
+        // Settle the turn. A streamed reply becomes the answer in place
+        // (Hermes' final edit); `MEDIA:` files still go out through the
+        // durable outbox after it.
+        let (prose, media) = match &result {
+            Some(Ok(answer)) if stream_text => {
+                let (prose, media) =
+                    crate::media_tags::extract(answer, &self.media_cwd(), &self.media_roots());
+                (Some(prose), media)
+            }
+            _ => (None, Vec::new()),
+        };
+        let landed = self
+            .finish_turn(&item.channel, &item.conversation, prose.as_deref())
             .await;
         match result {
             Some(Ok(answer)) => {
                 let receipt = serde_json::json!({});
-                self.store.complete(&item.id, &answer, &receipt)?;
+                match landed {
+                    Some(landed) if !landed.parts.is_empty() || !media.is_empty() => {
+                        let media = (!media.is_empty()).then(|| {
+                            media
+                                .iter()
+                                .map(|path| format!("MEDIA:{}", path.display()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        });
+                        self.store.complete_streamed(
+                            &item.id,
+                            &receipt,
+                            &landed.parts,
+                            media.as_deref(),
+                        )?;
+                        if media.is_none() {
+                            self.remove_reaction(&item.channel, &item.id, "👀").await;
+                            self.add_reaction(&item.channel, &item.id, "✅").await;
+                        }
+                    }
+                    _ => self.store.complete(&item.id, &answer, &receipt)?,
+                }
             }
             Some(Err(RunError::Budget(_))) => {
                 self.store.fail(&item.id, "budget_blocked")?;

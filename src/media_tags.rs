@@ -83,6 +83,41 @@ pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBu
     (tidy(&out), paths)
 }
 
+/// Hide `MEDIA:` tags from a reply that is still streaming (Hermes'
+/// `strip_media_directives_for_display`): the files go out after the turn,
+/// and a half-typed path flickering in the preview is noise. A line that held
+/// only a tag disappears with it.
+pub fn strip_for_display(text: &str) -> String {
+    if !text.contains("MEDIA:") {
+        return text.to_string();
+    }
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        if !line.contains("MEDIA:") {
+            lines.push(line.to_string());
+            continue;
+        }
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(at) = rest.find("MEDIA:") {
+            out.push_str(rest[..at].trim_end_matches(['*', '_', '`']));
+            let body = rest[at + "MEDIA:".len()..].trim_start_matches([' ', '\t']);
+            let end = body
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(body.len());
+            rest = body[end..].trim_start_matches(['*', '_', '`']);
+            if out.ends_with(' ') {
+                rest = rest.trim_start_matches(' ');
+            }
+        }
+        out.push_str(rest);
+        if !out.trim().is_empty() {
+            lines.push(out.trim_end().to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 pub fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
@@ -287,6 +322,13 @@ fn tidy(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_display_hides_media_tags_and_their_lines() {
+        let text = "Here is the chart:\nMEDIA:/tmp/chart.png\nand **MEDIA:/tmp/b.pdf** too";
+        assert_eq!(strip_for_display(text), "Here is the chart:\nand too");
+        assert_eq!(strip_for_display("no tags\n\nkept"), "no tags\n\nkept");
+    }
 
     #[test]
     fn tags_are_stripped_only_when_deliverable() {

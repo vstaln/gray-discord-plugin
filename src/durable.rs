@@ -430,6 +430,52 @@ impl Store {
         })
     }
 
+    /// Complete a turn whose answer already streamed into Discord. The
+    /// landed messages are recorded as delivered parts (body and message
+    /// id), so recovery never posts them again. `media` is a media-only part
+    /// (`MEDIA:` lines) the delivery worker still has to upload; without it
+    /// the turn is `sent` at once.
+    pub fn complete_streamed(
+        &self,
+        id: &str,
+        receipt: &Value,
+        parts: &[(String, String)],
+        media: Option<&str>,
+    ) -> Result<(), String> {
+        if parts.is_empty() && media.is_none() {
+            return Err("A streamed answer needs a delivered part or media".to_string());
+        }
+        let receipt_text =
+            serde_json::to_string(receipt).map_err(|_| "cannot encode receipt".to_string())?;
+        let state = if media.is_some() { "delivery" } else { "sent" };
+        with_conn(&self.path, |db| {
+            let n = db
+                .execute(
+                    "UPDATE inbox SET state=?1,receipt=?2 WHERE id=?3 AND state='running'",
+                    params![state, receipt_text, id],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            if n == 0 {
+                return Err("Item is not running".to_string());
+            }
+            for (part, (content, message_id)) in parts.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO outbox(id,part,content,render,message_id) VALUES(?1,?2,?3,'v2',?4)",
+                    params![id, part as i64, content, message_id],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            if let Some(media) = media {
+                db.execute(
+                    "INSERT INTO outbox(id,part,content,render) VALUES(?1,?2,?3,'v2')",
+                    params![id, parts.len() as i64, media],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            Ok(())
+        })
+    }
+
     /// Complete a turn with a precompiled V2 document. The document is kept
     /// as JSON in the durable row so delivery can resume after a restart;
     /// callers must run it through the compiler before calling this method.

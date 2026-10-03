@@ -279,41 +279,69 @@ the check happens in the adapter before any typing call, so `false` stops
 the whole path (the REST poke and the host hook) rather than one loop of it.
 Reload by restarting the service (`gray discord restart`).
 
-## Activity narration
+## Live replies and activity narration
 
-While the agent works, one live status message per turn shows what it is
-doing, overwritten in place as the turn proceeds. At the end of the turn,
-Discord also keeps a separate bounded tool-activity card, so activity does
-not disappear when the next turn starts. Both show actions only — one line
-per meaningful call, never tool output. Shell introspection (`ls`, `cat`,
-…) stays unnarrated, and shell work reads the way gray's own transcript
-labels it (`Running` live, `Ran` on the receipt):
+Replies stream the way Hermes' Discord gateway shows them. The turn is laid
+out as an ordered run of plain Components V2 messages, with no embed-style
+cards:
+
+- the answer is posted as soon as the model starts writing and edited in
+  place about once a second, with a ` ▉` cursor until it is done;
+- each run of prose between tool calls is its own message, so "Let me
+  check…" stays above the work it introduced;
+- tool lines collect in one plain bubble below the prose before them, and
+  the next prose starts a new message below that bubble;
+- a long answer seals full messages (closing and reopening code fences at
+  the cut) and continues in the next one, up to 8 messages.
 
 ````markdown
-💻 Running `gray view /tmp/shot.png`
+Let me check the failing test.
 
-⋯ 0.9s · ran 2 commands
-💻 Ran `gray view /tmp/shot.png` (0.3s)
+💻 Ran `cargo test -p gray` (4.1s)
+✍️ edit `src/print.rs`
+
+Fixed: the parser dropped the last row. All 29 tests pass now.
 ````
 
-The rows come from gray core's `--json` progress stream (phase + tool +
-detail), so every chat surface can render the same data; only the
-presentation is Discord-specific. Safe tool activity is shown by default.
-Raw model reasoning is never sent to Discord: the bridge always runs gray
-with `GRAY_SHOW_REASONING=0`, even when activity is enabled. Secrets are
-redacted and everything is capped before it leaves gray, but secret-free
-paths stay verbatim so narration names the actual file. The card keeps at
-most 5 actions plus a tally and never includes reasoning.
+The final edit is the authoritative answer, recorded as delivered in the
+durable outbox, so a restart never posts it twice. `MEDIA:` tags are hidden
+from the preview and their files are uploaded after the prose. If the
+answer cannot land in place (the message was deleted, an edit was refused),
+the preview is retracted and the answer is posted durably instead. Slash
+command turns answer through their interaction and do not stream.
 
-Off in `config.json`:
+Streaming needs a gray core that emits `text` rows (`GRAY_STREAM_TEXT=1`,
+set by the bridge). With an older gray the bridge falls back to posting the
+whole answer at the end. Off in `config.json`:
+
+```json
+{"stream_replies": false}
+```
+
+Tool lines show actions only: one line per meaningful call, never tool
+output. Shell introspection (`ls`, `cat`, …) stays unnarrated, and shell
+work reads the way gray's own transcript labels it (`Running` while it
+runs, `Ran` with its duration once it returns). The bubbles stay in the
+channel as the turn's record.
+
+The rows come from gray core's `--json` progress stream (phase + tool +
+detail, plus the streamed prose), so every chat surface can render the same
+data; only the presentation is Discord-specific. Raw model reasoning is
+never sent to Discord: the bridge always runs gray with
+`GRAY_SHOW_REASONING=0`. Secrets are redacted before anything leaves gray
+(streamed prose holds back the word still being typed, so a key is never
+shown half written), but secret-free paths stay verbatim so narration names
+the actual file.
+
+Tool lines off (the reply still streams):
 
 ```json
 {"activity_indicator": false}
 ```
 
-Absent means on. Turning it off stops both the live status bubble and the
-persistent tool card; it never enables raw reasoning. Reload by restarting the service
-(`gray discord restart`).
+The old end-of-turn tally card (`⋯ 0.9s · ran 2 commands` plus up to 5
+actions) is opt-in with `{"activity_card": true}`. Reload any of these by
+restarting the service (`gray discord restart`).
 
 ## Sessions and new conversations
 

@@ -61,7 +61,8 @@ fn a_line_carries_the_duration_once_the_call_returns() {
         .push(json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "elapsed_ms": 420}));
     assert_eq!(
         activity::render(&with_done).as_deref(),
-        Some("💻 Running `ls` (0.4s)")
+        Some("💻 Ran `ls` (0.4s)"),
+        "the feed stays in the channel, so a returned call reads as done"
     );
 }
 
@@ -177,7 +178,7 @@ fn quiet_rows_render_to_nothing() {
 }
 
 #[test]
-fn repeated_lines_collapse_and_the_tail_is_kept() {
+fn repeated_lines_collapse_and_every_line_is_kept() {
     let batch: Vec<serde_json::Value> = [
         "cargo build",
         "cargo build",
@@ -190,9 +191,15 @@ fn repeated_lines_collapse_and_the_tail_is_kept() {
     .collect();
     let text = activity::render(&batch).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "keeps the last three: {text}");
-    assert_eq!(lines[0], "💻 Running `git status`", "a repeat collapsed");
-    assert_eq!(lines[2], "💻 Running `cargo test`");
+    // Hermes' accumulating bubble: the whole feed, not a sliding window.
+    assert_eq!(
+        lines.len(),
+        4,
+        "a repeat collapsed, nothing dropped: {text}"
+    );
+    assert_eq!(lines[0], "💻 Running `cargo build`");
+    assert_eq!(lines[1], "💻 Running `git status`");
+    assert_eq!(lines[3], "💻 Running `cargo test`");
 }
 
 #[test]
@@ -360,20 +367,6 @@ fn scoped_sinks_do_not_mix_conversations() {
     assert_eq!(fresh[0]["detail"], "fresh");
 }
 
-#[test]
-fn publishing_needs_new_content_and_a_gap() {
-    assert!(activity::should_publish("a", None, 0.0, -1.0));
-    assert!(
-        !activity::should_publish("a", Some("a"), 99.0, 0.0),
-        "no-op edit"
-    );
-    assert!(
-        !activity::should_publish("b", Some("a"), 0.5, 0.0),
-        "inside the gap"
-    );
-    assert!(activity::should_publish("b", Some("a"), 1.5, 0.0));
-}
-
 // ── wiring: one live bubble per channel/conversation, plus a final card ──
 
 /// A runtime wired for narration. A macro, not a fn: the runner/deliver
@@ -468,11 +461,47 @@ async fn gated_rows_are_kept_until_the_gap_passes() {
 }
 
 #[tokio::test]
-async fn final_flush_posts_a_separate_card_and_next_turn_gets_a_new_bubble() {
+async fn final_flush_posts_no_card_by_default_and_next_turn_gets_a_new_bubble() {
+    // Hermes posts no tally card: the bubble itself stays as the record.
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
     let rt = narrated!(json!({}), sink, seen, clock);
+
+    rt.begin_activity("42", "chat:one").await;
+    activity::push_for(
+        &sink,
+        "chat:one",
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
+    );
+    rt.report_activity_for("42", "chat:one", false).await;
+    rt.report_activity_for("42", "chat:one", true).await;
+
+    rt.begin_activity("42", "chat:one").await;
+    activity::push_for(
+        &sink,
+        "chat:one",
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "pwd"}),
+    );
+    rt.report_activity_for("42", "chat:one", false).await;
+
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec![
+            ("💻 Running `cargo test`".to_string(), false),
+            ("💻 Running `pwd`".to_string(), false),
+        ],
+        "one bubble per turn and no card"
+    );
+}
+
+#[tokio::test]
+async fn the_opt_in_card_still_follows_the_bubble() {
+    let sink = activity::sink();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+    let rt = narrated!(json!({"activity_card": true}), sink, seen, clock);
 
     rt.begin_activity("42", "chat:one").await;
     activity::push_for(
@@ -498,10 +527,7 @@ async fn final_flush_posts_a_separate_card_and_next_turn_gets_a_new_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 3, "{log:?}");
-    assert!(
-        log[0].0.starts_with("💻 Running `ls`"),
-        "first post: {log:?}"
-    );
+    assert!(log[0].0.starts_with("💻 Ran `ls`"), "first post: {log:?}");
     assert!(log[1].0.starts_with("⋯ "), "card: {log:?}");
     assert!(
         !log[1].0.contains("one\ntwo"),
@@ -520,7 +546,8 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
     let stub = common::Stub::start().await;
-    let rt = narrated!(json!({}), sink, seen, clock).with_rest(Rest::new(&stub.base, "TESTTOKEN"));
+    let rt = narrated!(json!({"activity_card": true}), sink, seen, clock)
+        .with_rest(Rest::new(&stub.base, "TESTTOKEN"));
 
     rt.begin_activity("42", "chat:rest").await;
     activity::push_for(
@@ -645,7 +672,7 @@ async fn a_real_gray_turn_narrates_end_to_end() {
     assert_eq!(rows.len(), 4, "one row per progress event: {rows:?}");
     let bubble = activity::render(&rows).unwrap();
     assert!(
-        bubble.starts_with("💻 Running `cargo test -p gray`"),
+        bubble.starts_with("💻 Ran `cargo test -p gray`"),
         "{bubble}"
     );
     assert!(bubble.ends_with(')'), "duration missing: {bubble}");

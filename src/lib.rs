@@ -26,5 +26,6 @@ pub mod service;
 pub mod session;
 pub mod setup;
 pub mod sidecar;
+pub mod stream;
 pub mod text;
 pub mod transport;

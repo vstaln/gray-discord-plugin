@@ -393,6 +393,12 @@ pub async fn run_gray_input(
     // Tool narration is safe to show; raw model reasoning is not. Keep the
     // wire quiet even when the activity bubble is enabled, matching Hermes.
     cmd.env("GRAY_SHOW_REASONING", "0");
+    // Hermes-style live replies: gray streams the prose as `text` rows and
+    // the gateway edits the reply in place. A gray without the flag just
+    // ignores it, and the answer is posted whole at the end as before.
+    if crate::stream::enabled(config) {
+        cmd.env("GRAY_STREAM_TEXT", "1");
+    }
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
     let mut child = cmd
         .spawn()

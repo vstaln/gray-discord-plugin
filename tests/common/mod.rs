@@ -188,9 +188,12 @@ impl Stub {
                             .await;
                         } else if path == "/api/v10/guilds/77/members/123" {
                             respond(&mut stream, 200, r#"{"roles":["78"]}"#).await;
-                        } else if method == "PATCH"
-                            && (path == "/api/v10/channels/42/messages/1000"
-                                || path == "/api/v10/channels/42/messages/1001")
+                        } else if (method == "PATCH" || method == "DELETE")
+                            && path
+                                .strip_prefix("/api/v10/channels/42/messages/")
+                                .is_some_and(|id| {
+                                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+                                })
                         {
                             let body = decode_request_body(&headers, &body);
                             let n = {

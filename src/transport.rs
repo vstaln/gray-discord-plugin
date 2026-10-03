@@ -1079,9 +1079,23 @@ impl Rest {
     /// Edit a live V2 message. Legacy fields are explicitly cleared because
     /// Discord preserves message flags across edits.
     pub async fn edit_message_v2(&self, channel: u64, message: &str, components: &[Value]) -> bool {
-        if crate::render::validate_components(components).is_err() {
-            return false;
+        match self.edit_v2(channel, message, components).await {
+            Ok(()) => true,
+            Err(TransportError::Http(404, _)) | Err(TransportError::Invalid(_)) => false,
+            Err(_) => true,
         }
+    }
+
+    /// [`Self::edit_message_v2`] with the failure kept: a streamed reply must
+    /// tell a deleted message (stop editing it) from a transient error (try
+    /// again next frame), and must never count a refused edit as delivered.
+    pub async fn edit_v2(
+        &self,
+        channel: u64,
+        message: &str,
+        components: &[Value],
+    ) -> Result<(), TransportError> {
+        crate::render::validate_components(components).map_err(TransportError::Invalid)?;
         let body = json!({
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
@@ -1090,14 +1104,26 @@ impl Rest {
             "embeds": [],
             "sticker_ids": [],
         });
-        match self
-            .patch(&format!("/channels/{channel}/messages/{message}"), &body)
+        self.patch(&format!("/channels/{channel}/messages/{message}"), &body)
             .await
-        {
-            Ok(_) => true,
-            Err(TransportError::Http(404, _)) => false,
-            Err(_) => true,
-        }
+            .map(|_| ())
+    }
+
+    /// Delete one of our own messages: a streamed preview the final answer
+    /// could not land in, so the durable resend does not post it twice.
+    pub async fn delete_message(&self, channel: u64, message: &str) -> Result<(), TransportError> {
+        let path = format!("/channels/{channel}/messages/{message}");
+        let route = format!("DELETE {path}");
+        self.wait_for_rate_limit(&route).await;
+        let resp = self
+            .client
+            .delete(format!("{}{}", self.base, path))
+            .send()
+            .await
+            .map_err(|e| TransportError::Net(trim_net_error(e)))?;
+        self.observe_rate_limit(&route, resp.headers());
+        let status = resp.status();
+        self.classify(status, resp).await.map(|_| ())
     }
 
     /// Respond to an application command/component with a V2 message.
