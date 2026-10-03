@@ -93,6 +93,12 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
             return Err(format!("{key} must be an absolute path"));
         }
     }
+    if data
+        .get("restart_notification")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err("restart_notification must be true or false".to_string());
+    }
     int_in(data, "timeout_seconds", 1, 86400)?;
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;

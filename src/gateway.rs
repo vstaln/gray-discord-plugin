@@ -1124,6 +1124,17 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     config["budget_required"] = Value::Bool(crate::budget::gate(&config, model)?);
 
     let store = open_store(config_path)?;
+    // How the last run ended, read before recovery marks its turns failed.
+    let notices = crate::lifecycle::enabled(&config);
+    let previous = crate::lifecycle::boot(parent);
+    let interrupted = store.running_channels().map(|c| c.len()).unwrap_or(0);
+    let mut startup_notice =
+        crate::lifecycle::startup_notice(previous, interrupted).filter(|_| notices);
+    let home_channel = config
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let media_root = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1408,9 +1419,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 return Err("cron task stopped".to_string());
             }
             _ = &mut sigterm_recv => {
+                announce_shutdown(&rest, &store, &home_channel, parent, notices).await;
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
+                announce_shutdown(&rest, &store, &home_channel, parent, notices).await;
                 break;
             }
             event = shard.next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE | EventTypeFlags::READY) => {
@@ -1440,6 +1453,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 "connected_at": crate::durable::now_secs()
                             });
                             let _ = crate::config::atomic_json(&state_path, &state);
+                        }
+                        // Once per process: a reconnect also sends Ready.
+                        if let Some(text) = startup_notice.take() {
+                            if let Ok(ch) = home_channel.parse::<u64>() {
+                                if let Err(e) = rest.send_text_v2(ch, &text, None).await {
+                                    eprintln!("[discord] startup notice failed: {e}");
+                                }
+                            }
                         }
                         let r_app_id = ready.application.id.to_string();
                         bot_id = ready.user.id.to_string();
@@ -1794,6 +1815,31 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Hermes' `_notify_active_sessions_of_shutdown`: while the connection is
+/// still up, tell every chat with a running turn (and the home channel)
+/// that the gateway is going away, then record the clean exit. Bounded so
+/// a slow Discord never outlasts the supervisor's stop timeout.
+async fn announce_shutdown(rest: &Rest, store: &Store, home: &str, dir: &Path, notices: bool) {
+    let restart = crate::lifecycle::restart_requested(dir);
+    if notices {
+        let running = store.running_channels().unwrap_or_default();
+        let sends = async {
+            for (ch, text) in crate::lifecycle::shutdown_targets(&running, home, restart) {
+                if let Err(e) = rest.send_text_v2(ch, text, None).await {
+                    eprintln!("[discord] shutdown notice failed: {e}");
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(4), sends)
+            .await
+            .is_err()
+        {
+            eprintln!("[discord] shutdown notices timed out");
+        }
+    }
+    crate::lifecycle::mark_stopped(dir, restart);
 }
 
 #[cfg(test)]
