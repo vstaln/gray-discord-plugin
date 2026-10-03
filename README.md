@@ -286,10 +286,10 @@ works:
 
 ````markdown
 ┃ Let me check what's running on the box.
-┃ -# 💻 Ran `gray ps` (0.3s)
+┃ -# Ran `gray ps` (0.3s)
 ┃ **Done / idle:** claude-sub plugin agent: done. PR #173 is ▉
 ┃ ───────────────────────────────────────────────
-┃ -# ⏳ started 20 seconds ago · ran 1 command    [⏹️ Stop]
+┃ -# Working · started 20 seconds ago · ran 1 command    [Stop]
 ````
 
 - The card is posted as soon as there is something to show. The answer then
@@ -298,21 +298,22 @@ works:
   lines it led to (small grey subtext), then the next prose. A group of
   more than 6 tool lines folds to a count plus its latest 2 lines; the full
   list sits in a spoiler box below the card (tap to show).
+- Everything is plain text: no emojis in tool lines, the footer or buttons.
 - The footer's clock is a Discord timestamp (`<t:…:R>`): every client keeps
-  "started 20 seconds ago" current on its own, so a quiet turn costs no
+  "Working · started 20 seconds ago" current on its own, so a quiet turn costs no
   edits. It also tallies the turn (`ran 3 commands · edited 1 file`).
 - **Stop** (danger button) stops the turn, like `/stop`. The pressed card
-  flips to "⏹️ stopping…" in the same interaction response, then settles.
+  flips to "Stopping…" in the same interaction response, then settles.
   Any admitted user in the channel can press it once.
 - The accent bar tracks the turn: blurple while working, green when done
-  (`✅ done in 7.2s · ran 1 command`), red on failure, grey when stopped
-  (`⏹️ stopped after 12s · actions may already have happened`). A failed or
+  (`Done in 7.2s · ran 1 command`), red on failure, grey when stopped
+  (`Stopped after 12s · actions may already have happened`). A failed or
   stopped card is the turn's notice, so nothing extra is posted.
 - Files the answer names with `MEDIA:` tags land **inside** the finished
   card: images and videos in a Media Gallery, anything else as File cards
   (up to 10; more go out as a separate post).
-- The finished card offers **🔁 Retry** (run the same message again as a
-  new turn) and **🆕 New chat** (same as `/new`). Only the latest card in a
+- The finished card offers **Retry** (run the same message again as a
+  new turn) and **New chat** (same as `/new`). Only the latest card in a
   conversation keeps them; starting the next turn removes them from the
   previous one. Buttons expire after a day.
 - A long turn continues in further cards (Discord allows 40 components and

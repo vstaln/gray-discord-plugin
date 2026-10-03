@@ -7,10 +7,10 @@
 //!
 //! ```text
 //! ┃ Let me check what's running on the box.          ← prose (Text Display)
-//! ┃ -# 💻 Ran `gray ps` (0.3s)                        ← tool lines (subtext)
+//! ┃ -# Ran `gray ps` (0.3s)                           ← tool lines (subtext)
 //! ┃ **Done / idle:** … ▉                             ← streaming prose
 //! ┃ ───────────────────────────────────────────────  ← Separator
-//! ┃ -# ⏳ started 20 seconds ago · ran 1 command [⏹️ Stop] ← Section + Button
+//! ┃ -# Working · started 20 seconds ago · ran 1 command [Stop] ← Section + Button
 //! ```
 //!
 //! Prose and tool lines keep Hermes' order: each run of prose, then the tool
@@ -306,7 +306,7 @@ impl Timeline {
                         let shown: Vec<String> = if lines.len() > FOLD_LINES {
                             log.extend(lines.iter().map(|line| line.to_string()));
                             let mut shown = vec![format!(
-                                "🔧 {} tool calls · the full list is in the tool log below",
+                                "{} tool calls · full list in the tool log below",
                                 lines.len()
                             )];
                             shown.extend(
@@ -424,14 +424,12 @@ impl Timeline {
         let mut buttons = Vec::new();
         if let Some(custom_id) = &self.retry {
             buttons.push(json!({
-                "type": 2, "style": 2, "label": "Retry",
-                "emoji": {"name": "🔁"}, "custom_id": custom_id,
+                "type": 2, "style": 2, "label": "Retry", "custom_id": custom_id,
             }));
         }
         if let Some(custom_id) = &self.new_chat {
             buttons.push(json!({
-                "type": 2, "style": 2, "label": "New chat",
-                "emoji": {"name": "🆕"}, "custom_id": custom_id,
+                "type": 2, "style": 2, "label": "New chat", "custom_id": custom_id,
             }));
         }
         (!buttons.is_empty()).then(|| json!({"type": 1, "components": buttons}))
@@ -442,10 +440,14 @@ impl Timeline {
         let mut line = match status {
             // A Discord timestamp: "started 20 seconds ago", kept current by
             // every client with no edits from us.
-            Status::Working => format!("⏳ started <t:{}:R>", self.started.max(0.0) as i64),
-            Status::Done => format!("✅ done in {}", duration(elapsed)),
-            Status::Failed(reason) => format!("❌ {reason} after {}", duration(elapsed)),
-            Status::Stopped => format!("⏹️ stopped after {}", duration(elapsed)),
+            Status::Working => {
+                format!("Working · started <t:{}:R>", self.started.max(0.0) as i64)
+            }
+            Status::Done => format!("Done in {}", duration(elapsed)),
+            Status::Failed(reason) => {
+                format!("{} after {}", capitalized(reason), duration(elapsed))
+            }
+            Status::Stopped => format!("Stopped after {}", duration(elapsed)),
         };
         if !summary.is_empty() {
             line.push_str(" · ");
@@ -463,7 +465,6 @@ impl Timeline {
                     "type": 2,
                     "style": 4,
                     "label": "Stop",
-                    "emoji": {"name": "⏹️"},
                     "custom_id": custom_id,
                 },
             }),
@@ -602,6 +603,15 @@ impl Timeline {
     }
 }
 
+/// "timed out" → "Timed out".
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// `4.1s`, `1m 12s`.
 fn duration(secs: f64) -> String {
     if secs < 60.0 {
@@ -633,7 +643,7 @@ fn tool_log(lines: &[String]) -> Option<(Value, usize)> {
     if dropped > 0 {
         kept.insert(0, format!("-# … +{dropped} earlier"));
     }
-    let head = format!("-# 🔧 tool log · {} calls", lines.len());
+    let head = format!("-# Tool log · {} calls", lines.len());
     let body = kept.join("\n");
     let size = crate::text::utf16_len(&head) + crate::text::utf16_len(&body);
     Some((
@@ -674,7 +684,7 @@ pub fn stopping(components: &Value, pressed: &str) -> Option<Vec<Value>> {
                     .and_then(Value::as_str)
                     == Some(pressed);
             if is_stop {
-                *child = json!({"type": 10, "content": "-# ⏹️ stopping…"});
+                *child = json!({"type": 10, "content": "-# Stopping…"});
                 found = true;
             }
         }
@@ -861,9 +871,12 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(
             cards[0].text,
-            "Let me check.\n-# 💻 Running `cargo test`\nAll ▉"
+            "Let me check.\n-# Running `cargo test`\nAll ▉"
         );
-        assert_eq!(footer(&cards[0]), "-# ⏳ started <t:0:R> · ran 1 command");
+        assert_eq!(
+            footer(&cards[0]),
+            "-# Working · started <t:0:R> · ran 1 command"
+        );
     }
 
     #[test]
@@ -873,7 +886,7 @@ mod tests {
         land(&mut t, 1_700_000_000.0, false);
         assert_eq!(
             footer(&t.render(1_700_000_000.0)[0]),
-            "-# ⏳ started <t:1700000000:R>",
+            "-# Working · started <t:1700000000:R>",
             "Discord keeps the relative time current itself"
         );
         assert!(
@@ -892,14 +905,14 @@ mod tests {
         crate::render::validate_components(&card.components).unwrap();
         assert_eq!(
             card.text,
-            "-# 🔧 9 tool calls · the full list is in the tool log below\n\
-             -# 💻 Running `step 7`\n-# 💻 Running `step 8`"
+            "-# 9 tool calls · full list in the tool log below\n\
+             -# Running `step 7`\n-# Running `step 8`"
         );
         let log = &card.components[1];
         assert_eq!(log["type"], 17);
         assert_eq!(log["spoiler"], true, "tap to reveal");
         let lines = log["components"][1]["content"].as_str().unwrap();
-        assert!(lines.starts_with("-# 💻 Running `step 0`"), "{lines}");
+        assert!(lines.starts_with("-# Running `step 0`"), "{lines}");
         assert_eq!(lines.lines().count(), 9);
     }
 
@@ -916,13 +929,13 @@ mod tests {
             panic!("{ops:?}")
         };
         assert_eq!(container(body)["accent_color"], json!(DONE));
-        assert_eq!(footer(body), "-# ✅ done in 4.1s · ran 1 command");
+        assert_eq!(footer(body), "-# Done in 4.1s · ran 1 command");
         assert!(!body.key().contains("turn:stop"));
         let landed = t.landed(30.0).unwrap();
         assert_eq!(
             landed.parts,
             vec![(
-                "-# 💻 Running `cargo test`\nFinal answer".to_string(),
+                "-# Running `cargo test`\nFinal answer".to_string(),
                 "m0".to_string()
             )]
         );
@@ -953,7 +966,7 @@ mod tests {
         assert_eq!(id, "m0");
         let flat = serde_json::to_string(&components).unwrap();
         assert!(!flat.contains("turn:retry") && !flat.contains("turn:new"));
-        assert!(flat.contains("done in 2.0s"), "only the buttons go");
+        assert!(flat.contains("Done in 2.0s"), "only the buttons go");
     }
 
     #[test]
@@ -1001,7 +1014,7 @@ mod tests {
         crate::render::validate_components(&flipped).unwrap();
         assert_eq!(flipped[0]["accent_color"], json!(STOPPED));
         let text = flipped[0].to_string();
-        assert!(text.contains("stopping…") && !text.contains("turn:stop:s"));
+        assert!(text.contains("Stopping…") && !text.contains("turn:stop:s"));
         assert!(stopping(&echoed, "turn:stop:other").is_none());
     }
 
@@ -1016,7 +1029,7 @@ mod tests {
         assert_eq!(container(card)["accent_color"], json!(STOPPED));
         assert_eq!(
             footer(card),
-            "-# ⏹️ stopped after 12.0s · actions may already have happened"
+            "-# Stopped after 12.0s · actions may already have happened"
         );
         assert_eq!(card.text, "Working on", "the cursor is gone");
         assert_eq!(t.status_card(99.0).as_deref(), Some("m0"));
@@ -1058,9 +1071,9 @@ mod tests {
             body.push('\n');
         }
         body.push_str("```\nafter");
-        let cards = pack(&["-# 💻 Ran `ls`".to_string(), body], CARD_TEXT);
+        let cards = pack(&["-# Ran `ls`".to_string(), body], CARD_TEXT);
         assert_eq!(cards.len(), 2, "{cards:?}");
-        assert_eq!(cards[0][0], "-# 💻 Ran `ls`", "earlier content stays put");
+        assert_eq!(cards[0][0], "-# Ran `ls`", "earlier content stays put");
         assert!(cards[0][1].ends_with("\n```"), "the cut closes its fence");
         assert!(cards[1][0].starts_with("```rust\n"), "and reopens it");
         for card in &cards {
@@ -1083,7 +1096,7 @@ mod tests {
             first.iter().all(|c| c["type"] == 10),
             "no footer: {first:?}"
         );
-        assert!(footer(&cards[1]).starts_with("-# ⏳ started"));
+        assert!(footer(&cards[1]).starts_with("-# Working · started"));
     }
 
     #[test]

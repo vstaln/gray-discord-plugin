@@ -220,7 +220,7 @@ async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
     assert_eq!(log[0].method, "POST");
     assert_eq!(log[0].body, "Hello ▉", "{log:?}");
     assert_eq!(
-        log[0].footer, "-# ⏳ started <t:0:R>",
+        log[0].footer, "-# Working · started <t:0:R>",
         "a live Discord timestamp, not a ticking edit"
     );
     assert_eq!(log[0].accent, WORKING);
@@ -239,7 +239,7 @@ async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
     let last = log.last().unwrap();
     assert_eq!(last.method, "PATCH");
     assert_eq!(last.body, "Hello there,\nhow are you?", "cursor gone");
-    assert!(last.footer.starts_with("-# ✅ done in "), "{last:?}");
+    assert!(last.footer.starts_with("-# Done in "), "{last:?}");
     assert_eq!(last.accent, DONE);
     assert_eq!(last.stop, None, "Stop goes away once the turn is over");
     let labels: Vec<&str> = last
@@ -291,7 +291,7 @@ async fn prose_and_tool_lines_alternate_inside_the_card() {
     let last = log.last().unwrap();
     assert!(
         last.body
-            .starts_with("Let me check.\n-# 💻 Ran `cargo test` ("),
+            .starts_with("Let me check.\n-# Ran `cargo test` ("),
         "{last:?}"
     );
     assert!(last.body.ends_with(")\nAll green."), "{last:?}");
@@ -345,7 +345,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
         "the pressed card updates in the same response"
     );
     let flipped = callback["data"]["components"].to_string();
-    assert!(flipped.contains("stopping…"), "{flipped}");
+    assert!(flipped.contains("Stopping…"), "{flipped}");
     assert!(
         !flipped.contains("turn:stop:"),
         "the button is gone at once"
@@ -358,7 +358,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
     let last = traffic(&stub).last().cloned().unwrap();
     assert_eq!(last.accent, STOPPED);
     assert_eq!(last.body, "Working on", "cursor gone");
-    assert!(last.footer.starts_with("-# ⏹️ stopped after "), "{last:?}");
+    assert!(last.footer.starts_with("-# Stopped after "), "{last:?}");
     assert!(last.footer.ends_with("actions may already have happened"));
     let item = store.get("m1").unwrap().unwrap();
     assert_eq!(item.error.as_deref(), Some("cancelled"));

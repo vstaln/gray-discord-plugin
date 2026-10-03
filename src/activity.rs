@@ -235,17 +235,18 @@ fn is_quiet_row(tool: &str, detail: &str) -> bool {
     false
 }
 
-/// The tool's icon plus its name. Shell work reads the way gray's own
-/// transcript labels it — "Running" while live, "Ran" once done — never
-/// "terminal". Any other tool goes by its display `name` (see [`name_of`]).
+/// The tool's name as a line starts with it, plain text (no icons). Shell
+/// work reads the way gray's own transcript labels it — "Running" while
+/// live, "Ran" once done — never "terminal". Any other tool goes by its
+/// display `name` (see [`name_of`]).
 fn label(tool: &str, name: &str) -> String {
     match tool {
-        "bash" | "shell" => "💻 Running".to_string(),
-        "read" | "cat" => "📖 read".to_string(),
-        "write" | "create" | "str_replace" => "✍️ write".to_string(),
-        "edit" | "apply_patch" => "✍️ edit".to_string(),
-        "" => "🔧 working".to_string(),
-        _ => format!("🔧 {name}"),
+        "bash" | "shell" => "Running".to_string(),
+        "read" | "cat" => "Read".to_string(),
+        "write" | "create" | "str_replace" => "Write".to_string(),
+        "edit" | "apply_patch" => "Edit".to_string(),
+        "" => "Working".to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -295,10 +296,12 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
         "tool_started" => Some(label(tool, &name)),
         "tool_ran" => Some(ran_line(tool, &name, detail, elapsed)),
         "tool_finished" if row.get("error").and_then(Value::as_bool) == Some(true) => Some(
-            format!("❌ {} failed", if tool.is_empty() { "tool" } else { &name }),
+            format!("{} failed", if tool.is_empty() { "Tool" } else { &name }),
         ),
-        "provider_retry" if !detail.is_empty() => Some(format!("⚠️ {}", one_line(detail))),
-        "compacted" => Some("🗜 context compacted".to_string()),
+        "provider_retry" if !detail.is_empty() => {
+            Some(format!("Provider retry: {}", one_line(detail)))
+        }
+        "compacted" => Some("Context compacted".to_string()),
         _ => None,
     }
 }
@@ -323,7 +326,7 @@ fn card_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> Stri
 
 fn shell_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
     let mut out = match tool {
-        "bash" | "shell" if done => "💻 Ran".to_string(),
+        "bash" | "shell" if done => "Ran".to_string(),
         _ => label(tool, name),
     };
     // A shell command earns cleaning (no redirections, no `;`-chain essay);
@@ -566,11 +569,11 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
             "provider_retry" => {
                 if let Some(detail) = row.get("detail").and_then(Value::as_str) {
                     if !detail.trim().is_empty() {
-                        notices.push(format!("⚠️ {}", one_line(detail)));
+                        notices.push(format!("Provider retry: {}", one_line(detail)));
                     }
                 }
             }
-            "compacted" => notices.push("🗜 context compacted".to_string()),
+            "compacted" => notices.push("Context compacted".to_string()),
             _ => {}
         }
     }

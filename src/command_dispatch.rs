@@ -642,7 +642,7 @@ pub async fn new_chat_button(ctx: &Ctx<'_>, custom_id: &str) {
         .join(crate::runner::hex_sha256(conversation.as_bytes()));
     ensure_private_dir(&home);
     let text = match crate::session::reset_home(&home, crate::durable::now_secs()) {
-        Ok(()) => "🆕 New chat. Your next message starts fresh.".to_string(),
+        Ok(()) => "New chat started. Your next message starts fresh.".to_string(),
         Err(e) => e,
     };
     answer(ctx, &commands::embed("New chat", text, &[]), &[], false).await;
