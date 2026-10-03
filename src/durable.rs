@@ -445,7 +445,10 @@ impl Store {
             }
             for (part, chunk) in capped.iter().enumerate() {
                 db.execute(
-                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'v2',NULL,NULL)",
+                    // Plain content, not a V2 card: the answer is a new
+                    // message, and a push notification previews only
+                    // `content`.
+                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'text',NULL,NULL)",
                     params![id, part as i64, chunk],
                 )
                 .map_err(|_| "cannot complete".to_string())?;
@@ -555,8 +558,13 @@ impl Store {
             "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,
             _ => "agent_failed",
         };
-        let notice =
-            format!("Turn {id}: {code}. Actions may already have happened; no automatic retry.");
+        // `interrupted` only comes from boot recovery: the gateway stopped
+        // mid-turn, so say that instead of a bare code.
+        let notice = if code == "interrupted" {
+            format!("Turn {id}: interrupted because the gateway stopped mid-turn. Actions may already have happened; send a message to continue.")
+        } else {
+            format!("Turn {id}: {code}. Actions may already have happened; no automatic retry.")
+        };
         with_conn(&self.path, |db| {
             db.execute(
                 "UPDATE inbox SET state='uncertain',error=?1 WHERE id=?2 AND state='running'",
@@ -564,11 +572,25 @@ impl Store {
             )
             .map_err(|_| "cannot fail".to_string())?;
             db.execute(
-                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'v2',NULL,NULL,?3)",
+                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'text',NULL,NULL,?3)",
                 params![id, notice, shown],
             )
             .map_err(|_| "cannot fail".to_string())?;
             Ok(())
+        })
+    }
+
+    /// Channel of every turn still marked running, one entry per turn.
+    pub fn running_channels(&self) -> Result<Vec<String>, String> {
+        with_conn(&self.path, |db| {
+            let mut stmt = db
+                .prepare("SELECT channel FROM inbox WHERE state='running' ORDER BY created")
+                .map_err(|_| "cannot list running turns".to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|_| "cannot list running turns".to_string())?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|_| "cannot list running turns".to_string())
         })
     }
 

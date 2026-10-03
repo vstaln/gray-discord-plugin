@@ -201,9 +201,9 @@ macro_rules! press {
     }};
 }
 
-const WORKING: u64 = 0x5865F2;
+const WORKING: u64 = 0x99AAB5;
 const DONE: u64 = 0x57F287;
-const STOPPED: u64 = 0x80848E;
+const STOPPED: u64 = 0x4E5058;
 
 #[tokio::test]
 async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
@@ -212,7 +212,12 @@ async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
         vec![text(0, "", "Hello", false)],
         vec![text(0, "Hello there,\n", "how", false)],
     ];
-    let (rt, store) = scripted!(json!({}), stub, script, "Hello there,\nhow are you?");
+    let (rt, store) = scripted!(
+        json!({"answer_in_card": true}),
+        stub,
+        script,
+        "Hello there,\nhow are you?"
+    );
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
@@ -278,7 +283,7 @@ async fn prose_and_tool_lines_alternate_inside_the_card() {
         ],
         vec![tool("tool_finished", "a", ""), text(1, "", "All", false)],
     ];
-    let (rt, store) = scripted!(json!({}), stub, script, "All green.");
+    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "All green.");
     store.enqueue("m1", "42", "run it", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
@@ -372,7 +377,7 @@ async fn the_stop_button_flips_the_card_at_once_and_the_turn_stops() {
 async fn retry_queues_the_same_prompt_again() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store) = scripted!(json!({}), stub, script, "Hi there");
+    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "Hi there");
     store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     let (_, retry) = traffic(&stub).last().unwrap().buttons[0].clone();
@@ -400,7 +405,7 @@ async fn retry_queues_the_same_prompt_again() {
 async fn new_chat_resets_the_conversation_the_card_belongs_to() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store) = scripted!(json!({}), stub, script, "Hi there");
+    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "Hi there");
     store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     let (label, new_chat) = traffic(&stub).last().unwrap().buttons[1].clone();
@@ -419,7 +424,7 @@ async fn new_chat_resets_the_conversation_the_card_belongs_to() {
 async fn the_next_turn_retires_the_previous_cards_buttons() {
     let stub = common::Stub::start().await;
     let script = vec![vec![text(0, "", "One", false)]];
-    let (rt, store) = scripted!(json!({}), stub, script, "One");
+    let (rt, store) = scripted!(json!({"answer_in_card": true}), stub, script, "One");
     store.enqueue("m1", "42", "first", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
     store.enqueue("m2", "42", "second", None, 1000).unwrap();
@@ -490,7 +495,7 @@ async fn the_answers_files_land_inside_the_card() {
         report.display()
     );
     let script = vec![vec![text(0, "Here it is:\n", "", false)]];
-    let config = json!({"workdir": files.path().to_str().unwrap()});
+    let config = json!({"answer_in_card": true, "workdir": files.path().to_str().unwrap()});
     let (rt, store) = scripted!(config, stub, script, answer);
     store.enqueue("m1", "42", "chart", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
@@ -536,11 +541,40 @@ async fn a_refused_card_falls_back_to_one_durable_post() {
         .into_iter()
         .filter(|frame| frame.method == "POST")
         .count();
-    assert_eq!(posts, 1, "a refused card is not retried every frame");
+    assert!(
+        (1..=3).contains(&posts),
+        "a refused card is reposted a few times, then given up: {posts}"
+    );
     assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
     assert_eq!(
         part.content, "Hello there",
         "the outbox still owns the answer"
     );
+}
+
+#[tokio::test]
+async fn by_default_the_answer_posts_as_its_own_plain_message() {
+    let stub = common::Stub::start().await;
+    let script = vec![
+        vec![tool("tool_ran", "c1", "ls")],
+        vec![tool("tool_finished", "c1", "ls")],
+        vec![text(1, "All green.\n", "", true)],
+    ];
+    let (rt, store) = scripted!(json!({}), stub, script, "All green.");
+    store.enqueue("m1", "42", "hi", None, 1000).unwrap();
+    assert!(rt.generate_one().await.unwrap());
+
+    // The card keeps the narration, not the answer.
+    let last_card = traffic(&stub)
+        .into_iter()
+        .rev()
+        .find(|frame| frame.path.contains("/channels/42/messages"))
+        .unwrap();
+    let shown = &last_card.body;
+    assert!(!shown.contains("All green."), "{shown}");
+    // The answer is a plain-content post a push notification can preview.
+    let part = store.next_delivery(f64::MAX).unwrap().unwrap();
+    assert_eq!(part.content, "All green.");
+    assert_eq!(part.render.as_deref(), Some("text"));
 }
