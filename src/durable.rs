@@ -445,7 +445,10 @@ impl Store {
             }
             for (part, chunk) in capped.iter().enumerate() {
                 db.execute(
-                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'v2',NULL,NULL)",
+                    // Plain content, not a V2 card: the answer is a new
+                    // message, and a push notification previews only
+                    // `content`.
+                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'text',NULL,NULL)",
                     params![id, part as i64, chunk],
                 )
                 .map_err(|_| "cannot complete".to_string())?;
@@ -569,7 +572,7 @@ impl Store {
             )
             .map_err(|_| "cannot fail".to_string())?;
             db.execute(
-                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'v2',NULL,NULL,?3)",
+                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'text',NULL,NULL,?3)",
                 params![id, notice, shown],
             )
             .map_err(|_| "cannot fail".to_string())?;

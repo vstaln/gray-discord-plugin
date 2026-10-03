@@ -15,7 +15,7 @@
 //!
 //! Prose and tool lines keep Hermes' order: each run of prose, then the tool
 //! lines it led to, then the next prose. The accent bar tracks the turn's
-//! status: blurple while working, green when done, red on failure, grey when
+//! status: grey while working, green when done, red on failure, dark grey when
 //! stopped. The footer's clock is a Discord timestamp (`<t:…:R>`) that every
 //! client keeps current on its own, so a quiet turn costs no edits.
 //!
@@ -46,19 +46,25 @@ const MAX_PIECES: usize = 18;
 const MIN_ROOM: usize = 300;
 /// Hermes' `MAX_SPLIT_MESSAGES`: a runaway turn never floods the channel.
 pub const MAX_CARDS: usize = 8;
-/// A tool group longer than this folds into the tool log.
-const FOLD_LINES: usize = 6;
-/// Lines a folded group still shows, so the live action stays visible.
-const KEEP_LIVE: usize = 2;
+/// A tool group longer than this folds to a one-line count, with every
+/// line in the tool log.
+const FOLD_LINES: usize = 1;
+/// Lines a folded group still shows while it is the live one, so the
+/// action in flight stays visible.
+const KEEP_LIVE: usize = 1;
 /// The tool log's share of a card's text.
 const LOG_CHARS: usize = 900;
+/// Refusals before a turn's card is given up for good.
+pub const MAX_REFUSALS: u32 = 3;
 /// Discord's attachment cap per message.
 pub const MAX_MEDIA: usize = 10;
 
-const WORKING: u32 = 0x5865F2;
+/// gray's own grey while the turn runs, not Discord's blurple.
+const WORKING: u32 = 0x99AAB5;
 const DONE: u32 = 0x57F287;
 const FAILED: u32 = 0xED4245;
-const STOPPED: u32 = 0x80848E;
+/// Darker than the working grey, so a stopped turn still reads as ended.
+const STOPPED: u32 = 0x4E5058;
 
 /// Live replies on/off. Default on; `"stream_replies": false` keeps the
 /// answer in one durable post at the end of the turn.
@@ -152,6 +158,8 @@ pub struct Timeline {
     /// A card was refused for good (deleted, forbidden). The turn is left
     /// alone from then on rather than retried every frame.
     lost: bool,
+    /// Sends and edits Discord refused this turn; see [`Timeline::refused`].
+    refusals: u32,
     /// Stream prose for this turn. Off for slash-command turns (their
     /// answer belongs to the interaction) and when `stream_replies` is off;
     /// `text` rows are then ignored and the card shows tool lines only.
@@ -280,6 +288,18 @@ impl Timeline {
         true
     }
 
+    /// Take the finished answer out of the card: the prose it streamed as
+    /// is dropped when it is the last thing shown, so the caller can post
+    /// the answer as its own message (a new message notifies with its
+    /// text; an edit to a card never does). Earlier prose stays as
+    /// narration.
+    pub fn release_answer(&mut self) {
+        if matches!(self.blocks.last(), Some(Block::Text { .. })) {
+            self.blocks.pop();
+        }
+        self.close_text();
+    }
+
     /// Record how the turn ended at `now`. The next plan settles the card.
     pub fn settle(&mut self, status: Status, now: f64) {
         self.status = Some((status, now));
@@ -296,7 +316,8 @@ impl Timeline {
         let mut pieces: Vec<String> = Vec::new();
         let mut tool_rows: Vec<Value> = Vec::new();
         let mut log: Vec<String> = Vec::new();
-        for block in &self.blocks {
+        let last_block = self.blocks.len().saturating_sub(1);
+        for (index, block) in self.blocks.iter().enumerate() {
             match block {
                 Block::Tools { rows } => {
                     tool_rows.extend(rows.iter().cloned());
@@ -304,16 +325,23 @@ impl Timeline {
                         let feed = crate::text::sanitize(&feed);
                         let lines: Vec<&str> = feed.lines().collect();
                         let shown: Vec<String> = if lines.len() > FOLD_LINES {
+                            // Claude Code's "Ran 3 commands": one line per
+                            // run of tools, the action in flight under it
+                            // while it runs, every line in the tool log.
                             log.extend(lines.iter().map(|line| line.to_string()));
-                            let mut shown = vec![format!(
-                                "{} tool calls · full list in the tool log below",
-                                lines.len()
-                            )];
-                            shown.extend(
-                                lines[lines.len() - KEEP_LIVE..]
-                                    .iter()
-                                    .map(|line| line.to_string()),
-                            );
+                            let summary = crate::activity::summary(rows).replace(" · ", ", ");
+                            let mut shown = vec![if summary.is_empty() {
+                                format!("{} tool calls", lines.len())
+                            } else {
+                                capitalized(&summary)
+                            }];
+                            if live && index == last_block {
+                                shown.extend(
+                                    lines[lines.len() - KEEP_LIVE..]
+                                        .iter()
+                                        .map(|line| line.to_string()),
+                                );
+                            }
                             shown
                         } else {
                             lines.iter().map(|line| line.to_string()).collect()
@@ -535,7 +563,20 @@ impl Timeline {
         self.cards.truncate(card);
     }
 
-    /// A send or edit was refused: stop touching this turn.
+    /// Discord refused a send or edit of `card`. The card and any after it
+    /// are forgotten (left in the channel as they are) and the next plan
+    /// posts them fresh, so one bad edit never freezes the turn. A turn
+    /// refused [`MAX_REFUSALS`] times is given up.
+    pub fn refused(&mut self, card: usize) {
+        self.refusals += 1;
+        if self.refusals >= MAX_REFUSALS {
+            self.lost = true;
+        } else {
+            self.cards.truncate(card);
+        }
+    }
+
+    /// Stop touching this turn.
     pub fn lose(&mut self) {
         self.lost = true;
     }
@@ -896,18 +937,20 @@ mod tests {
     }
 
     #[test]
-    fn a_long_tool_group_folds_into_a_spoiler_log() {
+    fn a_tool_run_folds_to_one_line_like_claude_code() {
         let mut t = Timeline::new(true, 0.0);
         for i in 0..9 {
             t.absorb(&ran(&format!("c{i}"), &format!("step {i}")));
         }
         let card = &t.render(0.0)[0];
         crate::render::validate_components(&card.components).unwrap();
-        assert_eq!(
-            card.text,
-            "-# 9 tool calls · full list in the tool log below\n\
-             -# Running `step 7`\n-# Running `step 8`"
-        );
+        // Live: the count, then the action in flight.
+        assert_eq!(card.text, "-# Ran 9 commands\n-# Running `step 8`");
+        // An earlier run, once prose follows it, is the count alone.
+        t.absorb(&text(1, "Built it.\n", "", true));
+        assert!(t.render(0.0)[0]
+            .text
+            .starts_with("-# Ran 9 commands\nBuilt it."));
         let log = &card.components[1];
         assert_eq!(log["type"], 17);
         assert_eq!(log["spoiler"], true, "tap to reveal");

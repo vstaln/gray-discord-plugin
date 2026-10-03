@@ -172,7 +172,7 @@ fn a_pre_conversation_schedule_keeps_the_configured_home_channel() {
 }
 
 #[test]
-fn new_outbox_rows_are_v2_and_component_state_is_single_use() {
+fn answers_post_as_plain_text_and_component_state_is_single_use() {
     let (_tmp, store) = store();
     let token = store
         .component_state_create("cron_remove", "user", "channel", "job-1", 3600)
@@ -208,7 +208,8 @@ fn new_outbox_rows_are_v2_and_component_state_is_single_use() {
         .complete(&item.id, "answer", &serde_json::json!({}))
         .unwrap();
     let part = store.next_delivery(0.0).unwrap().unwrap();
-    assert_eq!(part.render.as_deref(), Some("v2"));
+    // Answers post as plain content so a push notification shows the text.
+    assert_eq!(part.render.as_deref(), Some("text"));
 }
 
 #[test]

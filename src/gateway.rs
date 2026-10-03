@@ -496,7 +496,18 @@ impl<R, D> Runtime<R, D> {
             let mut timelines = self.timelines.lock().await;
             match timelines.get_mut(&key) {
                 Some(timeline) => {
-                    let adopted = answer.is_some_and(|answer| timeline.adopt(answer));
+                    // By default the answer leaves the card and posts as its
+                    // own message: a new message notifies with its text, an
+                    // edit never notifies. `answer_in_card` keeps it inside.
+                    let in_card = self
+                        .config
+                        .get("answer_in_card")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if answer.is_some() && !in_card {
+                        timeline.release_answer();
+                    }
+                    let adopted = in_card && answer.is_some_and(|answer| timeline.adopt(answer));
                     if adopted {
                         timeline.attach(
                             uploads[..shown]
@@ -514,8 +525,26 @@ impl<R, D> Runtime<R, D> {
                 None => false,
             }
         };
-        self.publish_timeline(channel, conversation, true, uploads)
-            .await;
+        // The settling edit is the card's last word: retry a blip a few
+        // times rather than leave it saying "Working" forever.
+        // A 429 is the usual blip here: the settle lands right after a live
+        // edit and the reaction swaps, inside Discord's per-message bucket.
+        for attempt in 0..4u64 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+            }
+            self.publish_timeline(channel, conversation, true, uploads)
+                .await;
+            let pending = match self.timelines.lock().await.get(&key) {
+                Some(timeline) => !timeline
+                    .plan(self.now_secs(), crate::activity::MIN_EDIT_GAP, true)
+                    .is_empty(),
+                None => false,
+            };
+            if !pending {
+                break;
+            }
+        }
         let timeline = self.timelines.lock().await.remove(&key);
         if let Some(retired) = timeline.as_ref().and_then(crate::stream::Timeline::retired) {
             self.retired.lock().await.insert(key.clone(), retired);
@@ -627,10 +656,11 @@ impl<R, D> Runtime<R, D> {
                         Ok(id) => timeline.posted(card, &id, &body, now),
                         Err(error) => {
                             // Cards keep channel order, so nothing after this
-                            // one goes out this frame. A refused post gives
-                            // the turn up; a blip is retried next frame.
+                            // one goes out this frame. A blip is retried next
+                            // frame; a refusal counts toward giving up.
+                            eprintln!("[discord] turn card post failed: {error}");
                             if refused(&error) {
-                                timeline.lose();
+                                timeline.refused(card);
                             }
                             return;
                         }
@@ -658,10 +688,17 @@ impl<R, D> Runtime<R, D> {
                     };
                     match outcome {
                         Ok(()) => timeline.edited(card, &body, now),
-                        // Deleted, forbidden or unrenderable: stop editing
-                        // it. A blip is retried on the next frame.
-                        Err(error) if refused(&error) => timeline.lose(),
-                        Err(_) => continue,
+                        // Deleted, forbidden or unrenderable: say why, and
+                        // post a fresh card next frame instead of freezing
+                        // this one. A blip is retried on the next frame.
+                        Err(error) => {
+                            eprintln!("[discord] turn card edit failed: {error}");
+                            if refused(&error) {
+                                timeline.refused(card);
+                                return;
+                            }
+                            continue;
+                        }
                     }
                     drop(timelines);
                     if let Some(ref hook) = self.activity_hook {
@@ -1247,7 +1284,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
 
     async fn deliver_text(rest: &Rest, part: OutboxPart) -> Result<String, String> {
         let text = crate::text::sanitize(&part.content);
-        let v2 = part.render.as_deref() == Some("v2");
+        // A slash command's answer replaces its deferred response, which
+        // only the V2 path does; plain `text` parts are for channel posts.
+        let v2 = part.render.as_deref() == Some("v2")
+            || (part.interaction_token.is_some() && part.render.as_deref() == Some("text"));
         if let Some(document_json) = part.document_json.as_deref() {
             let Ok(document) = serde_json::from_str::<Value>(document_json) else {
                 return Err("stored component document is invalid".to_string());
@@ -1457,7 +1497,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         // Once per process: a reconnect also sends Ready.
                         if let Some(text) = startup_notice.take() {
                             if let Ok(ch) = home_channel.parse::<u64>() {
-                                if let Err(e) = rest.send_text_v2(ch, &text, None).await {
+                                // Plain content, not a V2 card: a push
+                                // notification only previews `content`.
+                                if let Err(e) = rest.send(ch, &text, None).await {
                                     eprintln!("[discord] startup notice failed: {e}");
                                 }
                             }
@@ -1827,7 +1869,7 @@ async fn announce_shutdown(rest: &Rest, store: &Store, home: &str, dir: &Path, n
         let running = store.running_channels().unwrap_or_default();
         let sends = async {
             for (ch, text) in crate::lifecycle::shutdown_targets(&running, home, restart) {
-                if let Err(e) = rest.send_text_v2(ch, text, None).await {
+                if let Err(e) = rest.send(ch, text, None).await {
                     eprintln!("[discord] shutdown notice failed: {e}");
                 }
             }

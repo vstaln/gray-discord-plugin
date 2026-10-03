@@ -295,9 +295,17 @@ works:
 - The card is posted as soon as there is something to show. The answer then
   streams into it about once a second with a ` ▉` cursor.
 - Prose and tool lines keep their order: each run of prose, then the tool
-  lines it led to (small grey subtext), then the next prose. A group of
-  more than 6 tool lines folds to a count plus its latest 2 lines; the full
+  lines it led to (small grey subtext), then the next prose. Like Claude
+  Code, a run of several tool calls folds to one line (`Ran 3 commands,
+  read 1 file`), with the call in flight under it while it runs; the full
   list sits in a spoiler box below the card (tap to show).
+- When the turn ends, the answer posts as its **own plain message** below
+  the card, so the push notification shows its text (a V2 card has no
+  `content` to preview, and edits never notify). The card stays as the
+  turn's record. `"answer_in_card": true` keeps the answer inside the card.
+- A card edit Discord refuses is logged with Discord's reason and the card
+  is reposted (given up after 3 refusals); the settling edit is retried, so
+  a rate-limited final edit no longer leaves "Working" and Stop behind.
 - Everything is plain text: no emojis in tool lines, the footer or buttons.
 - The footer's clock is a Discord timestamp (`<t:…:R>`): every client keeps
   "Working · started 20 seconds ago" current on its own, so a quiet turn costs no
@@ -305,8 +313,8 @@ works:
 - **Stop** (danger button) stops the turn, like `/stop`. The pressed card
   flips to "Stopping…" in the same interaction response, then settles.
   Any admitted user in the channel can press it once.
-- The accent bar tracks the turn: blurple while working, green when done
-  (`Done in 7.2s · ran 1 command`), red on failure, grey when stopped
+- The accent bar tracks the turn: grey while working, green when done
+  (`Done in 7.2s · ran 1 command`), red on failure, dark grey when stopped
   (`Stopped after 12s · actions may already have happened`). A failed or
   stopped card is the turn's notice, so nothing extra is posted.
 - Files the answer names with `MEDIA:` tags land **inside** the finished
