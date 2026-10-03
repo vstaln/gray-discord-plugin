@@ -118,6 +118,42 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
                 }
             }
         }, {
+            "name": "discord_ask",
+            "label": "Discord Ask",
+            "description": "Ask the person on Discord and wait for their answer (up to about 4 minutes). Use it when you need a decision you should not guess. 1-3 questions; give options when there are clear choices (up to 4 show as buttons, more as a menu; set multiple to allow several). They can always type their own answer instead. Returns {\"answers\": {question_id: {\"answers\": [...]}}}; typed answers start with \"user_note: \". If nobody answers in time, go ahead on your best judgement and say what you assumed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Short key for this question in the result"},
+                                "header": {"type": "string", "description": "A few words naming the topic, at most 45 characters"},
+                                "question": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "At most 80 characters"},
+                                            "description": {"type": "string", "description": "Optional, at most 100 characters"}
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "multiple": {"type": "boolean", "description": "Allow picking several options"}
+                            },
+                            "required": ["id", "question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }
+        }, {
             "name": "discord_ui_schema",
             "label": "Discord UI Schema",
             "description": "Return the full Components V2 document reference: every component's fields, Discord's limits, and copy-ready examples.",
@@ -129,7 +165,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-const PROMPT_CONTEXT: &str = "Discord tools: discord_send posts markdown; add a line MEDIA:/absolute/path to attach a file. discord_file action=send posts local files (images become a gallery) with a caption. discord_send_ui posts rich Components V2 documents: wrap related content in a container with an accent_color, lead with a '## heading', use '-# ' for subtle footnotes, separators between sections, a section+thumbnail for an item with an image, media_gallery for pictures, and action_row buttons for links. discord_ui_schema has examples. Errors say exactly what to fix; nothing is sent when a document is invalid. Never send secrets.";
+const PROMPT_CONTEXT: &str = "Discord tools: discord_ask asks the person a question on Discord (buttons, a menu, or their own words) and waits for the answer: use it for a decision you should not guess. discord_send posts markdown; add a line MEDIA:/absolute/path to attach a file. discord_file action=send posts local files (images become a gallery) with a caption. discord_send_ui posts rich Components V2 documents: wrap related content in a container with an accent_color, lead with a '## heading', use '-# ' for subtle footnotes, separators between sections, a section+thumbnail for an item with an image, media_gallery for pictures, and action_row buttons for links. discord_ui_schema has examples. Errors say exactly what to fix; nothing is sent when a document is invalid. Never send secrets.";
 
 fn is_error() -> Value {
     json!({
@@ -171,10 +207,52 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
             "discord_open_modal" => open_modal(params, config_path).await,
             "discord_file" => file_tool(params, config_path).await,
             "discord_ui_schema" => ui_schema(params),
+            "discord_ask" => ask_tool(params, config_path).await,
             _ => is_error(),
         };
     }
     json!({"error": "Unsupported method"})
+}
+
+/// `discord_ask`: post a question card in this turn's channel and wait for
+/// the answer. The channel is the route the gateway wrote into this
+/// conversation's home (`GRAY_HOME`); outside a chat it is the configured
+/// home channel.
+async fn ask_tool(params: &Value, config_path: &Path) -> Value {
+    let args = params.get("args").cloned().unwrap_or(Value::Null);
+    let questions = match crate::ask::parse(&args) {
+        Ok(questions) => questions,
+        Err(error) => return not_sent(error),
+    };
+    let (_, token, home_channel) = match delivery_target(config_path) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let channel = std::env::var_os("GRAY_HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| crate::cron::read_route(&home))
+        .and_then(|route| {
+            route
+                .get("route")
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse::<u64>().ok())
+        })
+        .unwrap_or(home_channel);
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let store = match Store::new(&parent.join("queue.sqlite")) {
+        Ok(store) => store,
+        Err(_) => return is_error(),
+    };
+    let rest = crate::transport::Rest::production(&token);
+    crate::ask::ask(
+        &rest,
+        &store,
+        channel,
+        &questions,
+        std::time::Duration::from_secs(crate::ask::ASK_SECS),
+        std::time::Duration::from_millis(500),
+    )
+    .await
 }
 
 /// The calling session's working directory, falling back to the sidecar's.

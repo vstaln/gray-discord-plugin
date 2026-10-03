@@ -189,6 +189,23 @@ fn activity_key(channel: &str, conversation: &str) -> String {
     format!("{channel}\u{0}{conversation}")
 }
 
+/// The `value` of the modal input `custom_id` anywhere in a submitted
+/// modal's components (a Label wraps its input one level down).
+fn find_value(value: &Value, custom_id: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if map.get("custom_id").and_then(Value::as_str) == Some(custom_id) {
+                if let Some(text) = map.get("value").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+            map.values().find_map(|child| find_value(child, custom_id))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_value(child, custom_id)),
+        _ => None,
+    }
+}
+
 /// How a turn's card settled.
 #[derive(Debug, Default)]
 pub struct Settled {
@@ -1412,6 +1429,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             &allowed,
                         );
                         if let Some(prompt) = prompt {
+                            // A question card is waiting in this channel:
+                            // the message is its answer, not a new turn.
+                            if crate::ask::answer_typed(&store, &rest, &channel_id, &prompt).await {
+                                continue;
+                            }
                             let capacity = config
                                 .get("queue_capacity")
                                 .and_then(Value::as_u64)
@@ -1577,6 +1599,18 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 crate::command_dispatch::new_chat_button(&ctx, id).await;
                                 continue;
                             }
+                            if id.starts_with("ask:") {
+                                crate::command_dispatch::ask_press(&ctx, id, &component.values, None).await;
+                                continue;
+                            }
+                        }
+                        if let Some(twilight_model::application::interaction::InteractionData::ModalSubmit(modal)) = &interaction.data {
+                            if modal.custom_id.starts_with("ask:") {
+                                let raw = serde_json::to_value(&modal.components).unwrap_or(Value::Null);
+                                let typed = find_value(&raw, "note");
+                                crate::command_dispatch::ask_press(&ctx, &modal.custom_id, &[], typed.as_deref()).await;
+                                continue;
+                            }
                         }
                         if is_component || is_autocomplete {
                             let raw = serde_json::to_value(interaction)
@@ -1731,6 +1765,25 @@ mod component_tests {
         assert_eq!(
             choices,
             vec![("Gray Cloud".to_string(), "gray".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_label_wrapped_text_box_survives_twilight() {
+        // Discord's modal submit for the question card's text box.
+        let submit = serde_json::json!({
+            "custom_id": "ask:abc123:0:note",
+            "components": [{
+                "type": 18, "id": 1,
+                "component": {"type": 4, "id": 2, "custom_id": "note", "value": "the hotfix branch"}
+            }]
+        });
+        let data: twilight_model::application::interaction::modal::ModalInteractionData =
+            serde_json::from_value(submit).unwrap();
+        let raw = serde_json::to_value(&data.components).unwrap();
+        assert_eq!(
+            super::find_value(&raw, "note").as_deref(),
+            Some("the hotfix branch")
         );
     }
 }

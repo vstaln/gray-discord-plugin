@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod ask;
 pub mod attachments;
 pub mod budget;
 pub mod capabilities;

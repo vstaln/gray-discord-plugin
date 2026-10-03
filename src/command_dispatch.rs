@@ -648,6 +648,75 @@ pub async fn new_chat_button(ctx: &Ctx<'_>, custom_id: &str) {
     answer(ctx, &commands::embed("New chat", text, &[]), &[], false).await;
 }
 
+/// A press on a question card (`discord_ask`): an option button, the
+/// select menu, "Other…" (opens the text box), or the submitted text box
+/// (`typed`). The answer is recorded and the card redrawn in the same
+/// response; the asking sidecar picks it up from the store.
+pub async fn ask_press(ctx: &Ctx<'_>, custom_id: &str, values: &[String], typed: Option<&str>) {
+    use crate::ask::Choice;
+    let closed = "This question is closed.";
+    let Some(press) = crate::ask::parse_press(custom_id) else {
+        return expired(ctx, "Question", closed).await;
+    };
+    let row = match ctx.store.ask_get(&press.ask_id) {
+        Ok(Some(row)) if row.channel == ctx.channel_id && row.state == "open" => row,
+        _ => return expired(ctx, "Question", closed).await,
+    };
+    let questions: Vec<crate::ask::Question> =
+        serde_json::from_value(row.questions.clone()).unwrap_or_default();
+    let Some(question) = questions.get(press.question) else {
+        return expired(ctx, "Question", closed).await;
+    };
+    if press.choice == Choice::Other {
+        match crate::ask::note_modal(&row, press.question) {
+            Some(modal) => {
+                if let Err(e) = ctx
+                    .rest
+                    .interaction_callback(
+                        ctx.int_id,
+                        ctx.int_token,
+                        &json!({"type": 9, "data": modal}),
+                    )
+                    .await
+                {
+                    eprintln!("[discord] ask modal failed: {e}");
+                }
+            }
+            None => expired(ctx, "Question", closed).await,
+        }
+        return;
+    }
+    let answers = match press.choice {
+        Choice::Note => typed
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| vec![crate::ask::note(text)]),
+        _ => crate::ask::answers_for(question, &press.choice, values),
+    };
+    let Some(answers) = answers else {
+        return expired(ctx, "Question", "That answer was empty.").await;
+    };
+    match ctx.store.ask_answer(
+        &row.ask_id,
+        &question.id,
+        &answers,
+        crate::durable::now_secs(),
+    ) {
+        Ok(Some(updated)) => {
+            let card = crate::ask::render(&updated);
+            if ctx
+                .rest
+                .interaction_update_v2(ctx.int_id, ctx.int_token, &card)
+                .await
+                .is_err()
+            {
+                let _ = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await;
+            }
+        }
+        _ => expired(ctx, "Question", "That question was already answered.").await,
+    }
+}
+
 /// The private "that button no longer works" reply.
 async fn expired(ctx: &Ctx<'_>, title: &str, text: &str) {
     answer(ctx, &commands::embed(title, text, &[]), &[], false).await;

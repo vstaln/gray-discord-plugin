@@ -364,6 +364,37 @@ The old end-of-turn tally card (`⋯ 0.9s · ran 2 commands` plus up to 5
 actions) is opt-in with `{"activity_card": true}`. Reload any of these by
 restarting the service (`gray discord restart`).
 
+## Questions from the agent
+
+gray's own `host/ask` has nobody to ask in the bridge's headless turns, so
+the Discord sidecar gives the agent a `discord_ask` tool ("Discord Ask"):
+it posts a question card in the turn's channel and waits for the answer.
+
+````markdown
+┃ -# Question from gray
+┃ **Branch** · Which branch should I deploy?
+┃ -# **main**: production
+┃ [main] [staging] [Other…]
+┃ ───────────────────────────────────────
+┃ -# Waiting for your answer · expires in 4 minutes · or reply in this channel
+````
+
+- 1-3 questions per card. Up to 4 options show as buttons; more, or a
+  multiple choice, show as a select menu. "Other…" (or "Answer…" when there
+  are no options) opens a form with a text box.
+- A plain message in the channel answers every open question in your own
+  words, instead of starting a new turn.
+- The card is redrawn in place as you answer: each question shows its
+  answer, the accent turns green and the controls go away.
+- With no answer in about 4 minutes the card closes ("No answer in time")
+  and the agent goes ahead on its best judgement, saying what it assumed.
+  Stopping the turn closes the card too.
+- The agent gets `{"answers": {question_id: {"answers": [...]}}}`, the same
+  shape as gray-questions; typed answers start with `user_note: `.
+
+Anyone admitted to the bot in that channel may answer. Plain text
+throughout, no emojis.
+
 ## Sessions and new conversations
 
 A DM is one conversation. A native Discord thread is already a separate
