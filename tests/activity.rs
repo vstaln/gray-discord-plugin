@@ -156,13 +156,29 @@ fn write_and_edit_lines_distinguish_themselves() {
 }
 
 #[test]
-fn unknown_tool_still_names_itself() {
+fn other_tools_go_by_their_proper_name() {
+    // gray's label wins: the plugin's manifest label, or the humanized id.
+    let labeled = rows(json!({
+        "phase": "tool_ran", "tool": "discord_send_ui", "label": "Discord Send UI"
+    }));
+    assert_eq!(
+        activity::render(&labeled).as_deref(),
+        Some("🔧 Discord Send UI")
+    );
+    // An older gray sends no label: humanize the id the same way.
     let r = rows(json!({"phase": "tool_ran", "tool": "web_search"}));
-    assert_eq!(activity::render(&r).as_deref(), Some("🔧 web_search"));
-    let p = rows(json!({"phase": "tool_ran", "tool": "gray_plugin", "detail": "do thing"}));
+    assert_eq!(activity::render(&r).as_deref(), Some("🔧 Web Search"));
+    let p = rows(json!({"phase": "tool_ran", "tool": "discord_send", "detail": "hi there"}));
     assert_eq!(
         activity::render(&p).as_deref(),
-        Some("🔧 gray_plugin `do thing`")
+        Some("🔧 Discord Send `hi there`")
+    );
+    let single = rows(json!({"phase": "tool_ran", "tool": "custom"}));
+    assert_eq!(activity::render(&single).as_deref(), Some("🔧 custom"));
+    let failed = rows(json!({"phase": "tool_finished", "tool": "web_fetch", "error": true}));
+    assert_eq!(
+        activity::render(&failed).as_deref(),
+        Some("❌ Web Fetch failed")
     );
 }
 

@@ -235,18 +235,49 @@ fn is_quiet_row(tool: &str, detail: &str) -> bool {
     false
 }
 
-/// The tool's icon plus its short name. Shell work reads the way gray's own
+/// The tool's icon plus its name. Shell work reads the way gray's own
 /// transcript labels it — "Running" while live, "Ran" once done — never
-/// "terminal".
-fn label(tool: &str) -> String {
+/// "terminal". Any other tool goes by its display `name` (see [`name_of`]).
+fn label(tool: &str, name: &str) -> String {
     match tool {
         "bash" | "shell" => "💻 Running".to_string(),
         "read" | "cat" => "📖 read".to_string(),
         "write" | "create" | "str_replace" => "✍️ write".to_string(),
         "edit" | "apply_patch" => "✍️ edit".to_string(),
         "" => "🔧 working".to_string(),
-        other => format!("🔧 {other}"),
+        _ => format!("🔧 {name}"),
     }
+}
+
+/// What to call a row's tool: gray's `label` (the plugin's manifest label,
+/// or the wire name humanized), else the same humanizing done here for a
+/// gray that sends no label. `discord_send` reads "Discord Send".
+fn name_of(row: &Value) -> String {
+    row.get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| humanize(row.get("tool").and_then(Value::as_str).unwrap_or("")))
+}
+
+/// gray's `humanize_tool_name`: `web_search` → `Web Search`; a single token
+/// (`bash`, `custom`) is already displayable and stays as it is.
+pub fn humanize(name: &str) -> String {
+    if !name.contains(['_', '-']) {
+        return name.to_string();
+    }
+    name.split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One line for one row, or `None` when the row adds nothing a reader
@@ -256,14 +287,15 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
     let phase = row.get("phase").and_then(Value::as_str).unwrap_or("");
     let tool = row.get("tool").and_then(Value::as_str).unwrap_or("");
     let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
+    let name = name_of(row);
     match phase {
         // The call has begun but has not reported its arguments yet. The
         // matching `tool_ran` overwrites this line rather than stacking a
         // second one for the same call.
-        "tool_started" => Some(label(tool)),
-        "tool_ran" => Some(ran_line(tool, detail, elapsed)),
+        "tool_started" => Some(label(tool, &name)),
+        "tool_ran" => Some(ran_line(tool, &name, detail, elapsed)),
         "tool_finished" if row.get("error").and_then(Value::as_bool) == Some(true) => Some(
-            format!("❌ {} failed", if tool.is_empty() { "tool" } else { tool }),
+            format!("❌ {} failed", if tool.is_empty() { "tool" } else { &name }),
         ),
         "provider_retry" if !detail.is_empty() => Some(format!("⚠️ {}", one_line(detail))),
         "compacted" => Some("🗜 context compacted".to_string()),
@@ -273,8 +305,8 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
 
 /// A call reads "Running" while it runs and "Ran" once it has returned —
 /// the feed stays in the channel after the turn, so it must read as done.
-fn ran_line(tool: &str, detail: &str, elapsed: Option<u64>) -> String {
-    shell_line(tool, detail, elapsed, elapsed.is_some())
+fn ran_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> String {
+    shell_line(tool, name, detail, elapsed, elapsed.is_some())
 }
 
 /// Whether `row` puts a line in the feed. A row that does not (a quiet
@@ -285,14 +317,14 @@ pub fn narrates(row: &Value) -> bool {
 
 /// Receipt version of [`ran_line`]: the turn is over, so shell work reads as
 /// completed — "Ran", the way gray's own transcript labels it.
-fn card_line(tool: &str, detail: &str, elapsed: Option<u64>) -> String {
-    shell_line(tool, detail, elapsed, true)
+fn card_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> String {
+    shell_line(tool, name, detail, elapsed, true)
 }
 
-fn shell_line(tool: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
+fn shell_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
     let mut out = match tool {
         "bash" | "shell" if done => "💻 Ran".to_string(),
-        _ => label(tool),
+        _ => label(tool, name),
     };
     // A shell command earns cleaning (no redirections, no `;`-chain essay);
     // a file tool's detail is already a clean path.
@@ -473,6 +505,7 @@ pub fn render(rows: &[Value]) -> Option<String> {
 struct CardEntry {
     call_id: String,
     tool: String,
+    name: String,
     detail: String,
     elapsed: Option<u64>,
     failed: bool,
@@ -502,6 +535,7 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
             "tool_ran" => entries.push(CardEntry {
                 call_id,
                 tool,
+                name: name_of(row),
                 detail: row
                     .get("detail")
                     .and_then(Value::as_str)
@@ -523,6 +557,7 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
                     entries.push(CardEntry {
                         call_id,
                         tool,
+                        name: name_of(row),
                         failed,
                         ..CardEntry::default()
                     });
@@ -551,7 +586,12 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
         .collect();
     for entry in actions.iter().take(MAX_CARD_ROWS) {
         out.push('\n');
-        out.push_str(&card_line(&entry.tool, &entry.detail, entry.elapsed));
+        out.push_str(&card_line(
+            &entry.tool,
+            &entry.name,
+            &entry.detail,
+            entry.elapsed,
+        ));
         if entry.failed {
             out.push_str("\n  ↳ failed");
         }

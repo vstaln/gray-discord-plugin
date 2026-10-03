@@ -68,6 +68,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "hooks": ["prompt/context"],
         "tools": [{
             "name": "discord_send",
+            "label": "Discord Send",
             "description": "Send markdown text to the owner's Discord channel. Put MEDIA:/absolute/path.png on its own line to upload files with it (images show as a gallery).",
             "parameters": {
                 "type": "object",
@@ -76,6 +77,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
             }
         }, {
             "name": "discord_send_ui",
+            "label": "Discord Send UI",
             "description": "Send a rich Discord Components V2 message (cards, galleries, sections, buttons, selects). Pass the document as a JSON object. For local files, prefer discord_file action=send, or import with discord_file and reference the returned file_id as media.",
             "parameters": {
                 "type": "object",
@@ -87,6 +89,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
             }
         }, {
             "name": "discord_open_modal",
+            "label": "Discord Open Modal",
             "description": "Open a modal form in response to a Discord component interaction. Call discord_ui_schema surface=modal for the shape.",
             "parameters": {
                 "type": "object",
@@ -101,6 +104,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
             }
         }, {
             "name": "discord_file",
+            "label": "Discord File",
             "description": "Post or stage local files for Discord. action=send uploads files straight to the channel (images in a gallery, others as file cards) with an optional caption. action=import stores one file privately and returns a file_id for discord_send_ui media. Any readable path works except credentials/config files.",
             "parameters": {
                 "type": "object",
@@ -115,6 +119,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
             }
         }, {
             "name": "discord_ui_schema",
+            "label": "Discord UI Schema",
             "description": "Return the full Components V2 document reference: every component's fields, Discord's limits, and copy-ready examples.",
             "parameters": {
                 "type": "object",
