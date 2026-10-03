@@ -371,6 +371,9 @@ pub fn status(config_path: &Path) -> Result<String, String> {
 }
 
 pub fn stop(config_path: &Path) -> Result<String, String> {
+    // A marker left by a restart that never happened must not turn this
+    // stop into "restarting".
+    crate::lifecycle::clear_restart(&config_dir_of(config_path));
     stop_with(detect(), config_path)
 }
 
@@ -547,6 +550,9 @@ pub fn stop_with(sup: Supervisor, config_path: &Path) -> Result<String, String> 
 }
 
 pub fn restart_with(sup: Supervisor, config_path: &Path) -> Result<String, String> {
+    // Tells the old daemon its SIGTERM is a restart, so chats hear
+    // "restarting" rather than "shutting down".
+    crate::lifecycle::request_restart(&config_dir_of(config_path));
     match sup {
         Supervisor::Runit { dir } => {
             let svc = dir.join(SVC);

@@ -17,6 +17,7 @@ pub mod cron;
 pub mod doctor;
 pub mod durable;
 pub mod gateway;
+pub mod lifecycle;
 pub mod media_tags;
 pub mod pairing;
 pub mod policy;
