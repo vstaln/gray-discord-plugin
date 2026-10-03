@@ -24,9 +24,11 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-/// Bounded so a runaway turn cannot grow the queue without limit. 64 pending
-/// rows is far more than one status bubble shows; the oldest fall off.
-const MAX_PENDING: usize = 64;
+/// Bounded so a runaway turn cannot grow the queue without limit, but far
+/// above what a turn queues between two frames: the gateway drains it four
+/// times a second, and a dropped row is lost for good (a `text` delta is
+/// append-only, so dropping one would garble the prose on screen).
+pub const MAX_PENDING: usize = 4096;
 /// Keep a bounded history for the final card even after the live rows have
 /// been drained. This is intentionally larger than the pending queue so a
 /// turn with many quick tools still produces a useful transcript.
@@ -110,6 +112,11 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
     };
     let scope = state.scopes.entry(scope.to_string()).or_default();
     let mut row = row;
+    // Tool output is never narrated (see the module docs); do not hold
+    // up to a kilobyte of it per queued row.
+    if let Some(map) = row.as_object_mut() {
+        map.remove("output");
+    }
     stamp(&mut row, scope);
     if scope.pending.len() >= MAX_PENDING {
         scope.pending.pop_front();

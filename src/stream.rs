@@ -1,59 +1,63 @@
-//! A turn as one live Components V2 card.
+//! A turn as a stream of Discord messages, Hermes-style.
 //!
 //! With `GRAY_STREAM_TEXT=1`, gray's `--json` wire interleaves `text` rows
 //! (the assistant's prose, numbered by segment, one segment per run of prose
 //! between tool calls) with the tool progress rows. This module lays a turn
-//! out as a Container that grows while the agent works:
+//! out the way Hermes' gateway does: every run of prose is its own message,
+//! streamed in place, and every group of tool calls is its own progress
+//! bubble below it. The next prose after a tool call starts a fresh message,
+//! so the channel grows as the agent works instead of one message changing
+//! out of sight:
 //!
 //! ```text
-//! ┃ Let me check what's running on the box.          ← prose (Text Display)
-//! ┃ -# Ran `gray ps` (0.3s)                           ← tool lines (subtext)
-//! ┃ **Done / idle:** … ▉                             ← streaming prose
-//! ┃ ───────────────────────────────────────────────  ← Separator
-//! ┃ -# Working · started 20 seconds ago · ran 1 command [Stop] ← Section + Button
+//! Let me check what's running on the box.            ← message 1 (prose)
+//! -# Ran `gray ps` (0.3s)                             ← message 2 (tools)
+//! -# Running `cargo test`
+//! **Done / idle:** … ▉                               ← message 3 (prose)
+//! ┃ -# Working · started 20 seconds ago · ran 2 commands [Stop]
 //! ```
 //!
-//! Prose and tool lines keep Hermes' order: each run of prose, then the tool
-//! lines it led to, then the next prose. The accent bar tracks the turn's
-//! status: blurple while working, green when done, red on failure, grey when
-//! stopped. The footer's clock is a Discord timestamp (`<t:…:R>`) that every
-//! client keeps current on its own, so a quiet turn costs no edits.
+//! The newest message carries the turn's status chip: a small Container
+//! whose accent tracks the turn (blurple while working, green when done, red
+//! on failure, grey when stopped) with the Stop button while it runs and
+//! Retry / New chat once it has settled. Its clock is a Discord timestamp
+//! (`<t:…:R>`) that every client keeps current on its own, so a quiet turn
+//! costs no edits. When a newer message appears the chip moves down to it.
 //!
-//! Once the turn settles the card gains what a finished turn needs: files
-//! the answer named (`MEDIA:`) as a Media Gallery and File cards inside it,
-//! and Retry / New chat buttons. A run of more than a handful of tool lines
-//! folds to a one-line count plus its latest lines, with the full list in a
-//! spoiler container below (tap to reveal). A long turn continues in further
-//! cards (Discord caps one message at 40 components and 4000 characters);
-//! only the last carries the footer.
+//! The finished answer is the last message; the files it named (`MEDIA:`)
+//! sit inside it. A tool group of more than a handful of lines folds to a
+//! count plus its latest lines, with the full list in a spoiler below it.
+//! A message too long for Discord continues in the next one.
 //!
 //! [`Timeline`] is the pure model. The gateway feeds it rows, asks it which
 //! sends, edits and deletes are due ([`Timeline::plan`]), and reports back
-//! what landed. Clock and transport stay outside so the layout is testable.
+//! what landed or failed. Clock and transport stay outside so the layout is
+//! testable.
 
 use serde_json::{json, Value};
 
 /// Hermes' streaming cursor (`DEFAULT_STREAMING_CURSOR`).
 pub const CURSOR: &str = " ▉";
-/// Body text per card, in UTF-16 units. Discord allows 4000 across a V2
-/// message; the rest is the footer's.
+/// Body text per message, in UTF-16 units. Discord allows 4000 across a V2
+/// message; the rest is the status chip's and the tool log's.
 pub const CARD_TEXT: usize = 3600;
-/// Text Displays per card. With the container, media, separator, footer,
-/// buttons and tool log this stays under Discord's 40 components.
-const MAX_PIECES: usize = 18;
-/// A card with less room than this starts a fresh one rather than holding a
-/// sliver of the next piece.
-const MIN_ROOM: usize = 300;
-/// Hermes' `MAX_SPLIT_MESSAGES`: a runaway turn never floods the channel.
-pub const MAX_CARDS: usize = 8;
-/// A tool group longer than this folds into the tool log.
+/// Hermes' `MAX_SPLIT_MESSAGES`: one runaway run of prose never floods the
+/// channel.
+pub const MAX_SPLIT: usize = 8;
+/// Messages one turn may open. Past it, later steps share the last one.
+pub const MAX_MESSAGES: usize = 30;
+/// A tool group longer than this folds into its tool log.
 const FOLD_LINES: usize = 6;
 /// Lines a folded group still shows, so the live action stays visible.
 const KEEP_LIVE: usize = 2;
-/// The tool log's share of a card's text.
+/// The tool log's share of a message's text.
 const LOG_CHARS: usize = 900;
 /// Discord's attachment cap per message.
 pub const MAX_MEDIA: usize = 10;
+/// Refused requests (HTTP 400) tolerated before a message is left as it is.
+const STRIKES: u32 = 3;
+/// Times a deleted newest message is posted again.
+const REPOSTS: u32 = 2;
 
 const WORKING: u32 = 0x5865F2;
 const DONE: u32 = 0x57F287;
@@ -69,7 +73,7 @@ pub fn enabled(config: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// Where the turn ended up; drives the accent and the footer.
+/// Where the turn ended up; drives the accent and the status line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
     Working,
@@ -79,14 +83,29 @@ pub enum Status {
     Stopped,
 }
 
+/// Why a send or edit did not land, as far as the turn cares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Failure {
+    /// Rate limited, a 5xx, a timeout or a dropped connection: try again
+    /// after this many seconds.
+    Busy(f64),
+    /// Discord refused this payload (HTTP 400). The next frame differs, so
+    /// it is retried with backoff, a few times.
+    Refused,
+    /// The message is gone (deleted by someone, HTTP 404).
+    Gone,
+    /// The bot may not post or edit here (HTTP 401/403).
+    Forbidden,
+}
+
 #[derive(Debug, Clone)]
 enum Block {
     Text {
-        segment: u64,
         /// Append-only lines from `delta`s.
         stable: String,
         /// The provisional unfinished line from the latest row.
         tail: String,
+        segment: u64,
         done: bool,
         /// The authoritative answer once the turn has finished. Already
         /// stripped of delivered `MEDIA:` tags.
@@ -103,21 +122,29 @@ struct Posted {
     id: String,
     shown: String,
     at: f64,
+    /// Refused edits in a row.
+    strikes: u32,
+    /// No edit before this time (backoff after a failure).
+    retry_at: f64,
+    /// Left as it is for the rest of the turn.
+    frozen: bool,
 }
 
-/// One card as it should look now.
+/// One message as it should look now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Card {
     pub components: Vec<Value>,
-    /// The card's body as plain markdown (no footer): what the durable
-    /// outbox records for it, and what the activity hook reports.
+    /// The message's body as plain markdown (no status chip): what the
+    /// durable outbox records for it, and what the activity hook reports.
     pub text: String,
-    /// Uploads this card references as `attachment://<name>`; a send or
+    /// Uploads this message references as `attachment://<name>`; a send or
     /// edit must carry them.
     pub files: Vec<String>,
+    /// The last block of the turn this message shows.
+    pub block: usize,
 }
 
-/// A file the finished answer named, shown inside the card.
+/// A file the finished answer named, shown inside its message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Media {
     pub name: String,
@@ -139,29 +166,40 @@ pub enum Op {
     Delete { card: usize, id: String },
 }
 
-/// The finished answer as it landed: each card's body and Discord id.
+/// The finished answer as it landed: each of its messages' body and id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Landed {
     pub parts: Vec<(String, String)>,
+}
+
+/// One block's share of the layout before it is cut into messages.
+struct Unit {
+    text: String,
+    log: Option<(Value, usize)>,
+    block: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Timeline {
     blocks: Vec<Block>,
     cards: Vec<Posted>,
-    /// A card was refused for good (deleted, forbidden). The turn is left
-    /// alone from then on rather than retried every frame.
+    /// Messages cannot be posted here at all (forbidden, or refused again
+    /// and again). The turn is left alone from then on.
     lost: bool,
+    /// Refused posts in a row, and no post before `post_retry`.
+    post_strikes: u32,
+    post_retry: f64,
+    reposts: u32,
     /// Stream prose for this turn. Off for slash-command turns (their
     /// answer belongs to the interaction) and when `stream_replies` is off;
-    /// `text` rows are then ignored and the card shows tool lines only.
+    /// `text` rows are then ignored and only tool bubbles show.
     text: bool,
     started: f64,
-    /// How the turn ended, and when: the footer's time stops there.
+    /// How the turn ended, and when: the status line's time stops there.
     status: Option<(Status, f64)>,
-    /// `custom_id` of the footer's Stop button while the turn runs.
+    /// `custom_id` of the status chip's Stop button while the turn runs.
     stop: Option<String>,
-    /// `custom_id`s of the settled card's Retry and New chat buttons.
+    /// `custom_id`s of the settled chip's Retry and New chat buttons.
     retry: Option<String>,
     new_chat: Option<String>,
     media: Vec<Media>,
@@ -176,7 +214,7 @@ impl Timeline {
         }
     }
 
-    /// Offer a Stop button in the footer while the turn runs.
+    /// Offer a Stop button in the status chip while the turn runs.
     pub fn with_stop(mut self, custom_id: String) -> Self {
         self.stop = Some(custom_id);
         self
@@ -189,7 +227,7 @@ impl Timeline {
         self
     }
 
-    /// Show the answer's files inside the card (at most [`MAX_MEDIA`]).
+    /// Show the answer's files inside its message (at most [`MAX_MEDIA`]).
     pub fn attach(&mut self, media: Vec<Media>) {
         self.media = media.into_iter().take(MAX_MEDIA).collect();
     }
@@ -265,27 +303,43 @@ impl Timeline {
     }
 
     /// Hand the finished turn's authoritative answer (prose only, `MEDIA:`
-    /// tags already taken out) to the prose it streamed as. Only when that
-    /// prose is the last thing in the card: an answer above tool lines
-    /// would read out of order, so the caller posts it fresh instead.
+    /// tags already taken out) to the turn. When the turn's last message is
+    /// the prose it streamed as, that message becomes the answer in place;
+    /// otherwise (the agent's last act was a tool call, or this gray streams
+    /// no prose) the answer is the next new message below the tool lines.
+    /// `false` when the caller must deliver the answer itself: prose
+    /// streaming is off for this turn, the turn cannot post here, or nothing
+    /// was shown before the answer (it is then one plain durable post).
     pub fn adopt(&mut self, prose: &str) -> bool {
-        if self.lost {
+        if self.lost || !self.text || prose.trim().is_empty() {
             return false;
         }
-        let Some(Block::Text { done, answer, .. }) = self.blocks.last_mut() else {
-            return false;
-        };
-        *done = true;
-        *answer = Some(prose.to_string());
+        match self.blocks.last_mut() {
+            None => return false,
+            Some(Block::Text { done, answer, .. }) => {
+                *done = true;
+                *answer = Some(prose.to_string());
+            }
+            Some(Block::Tools { .. }) => {
+                self.close_text();
+                self.blocks.push(Block::Text {
+                    segment: u64::MAX,
+                    stable: String::new(),
+                    tail: String::new(),
+                    done: true,
+                    answer: Some(prose.to_string()),
+                });
+            }
+        }
         true
     }
 
-    /// Record how the turn ended at `now`. The next plan settles the card.
+    /// Record how the turn ended at `now`. The next plan settles the turn.
     pub fn settle(&mut self, status: Status, now: f64) {
         self.status = Some((status, now));
     }
 
-    /// The cards this turn should show at `now`.
+    /// The messages this turn should show at `now`.
     pub fn render(&self, now: f64) -> Vec<Card> {
         self.render_with(now, true)
     }
@@ -293,39 +347,13 @@ impl Timeline {
     fn render_with(&self, now: f64, buttons: bool) -> Vec<Card> {
         let (status, now) = self.status.clone().unwrap_or((Status::Working, now));
         let live = status == Status::Working;
-        let mut pieces: Vec<String> = Vec::new();
+        let mut units: Vec<Unit> = Vec::new();
         let mut tool_rows: Vec<Value> = Vec::new();
-        let mut log: Vec<String> = Vec::new();
-        for block in &self.blocks {
-            match block {
+        for (index, block) in self.blocks.iter().enumerate() {
+            let unit = match block {
                 Block::Tools { rows } => {
                     tool_rows.extend(rows.iter().cloned());
-                    if let Some(feed) = crate::activity::render(rows) {
-                        let feed = crate::text::sanitize(&feed);
-                        let lines: Vec<&str> = feed.lines().collect();
-                        let shown: Vec<String> = if lines.len() > FOLD_LINES {
-                            log.extend(lines.iter().map(|line| line.to_string()));
-                            let mut shown = vec![format!(
-                                "{} tool calls · full list in the tool log below",
-                                lines.len()
-                            )];
-                            shown.extend(
-                                lines[lines.len() - KEEP_LIVE..]
-                                    .iter()
-                                    .map(|line| line.to_string()),
-                            );
-                            shown
-                        } else {
-                            lines.iter().map(|line| line.to_string()).collect()
-                        };
-                        pieces.push(
-                            shown
-                                .iter()
-                                .map(|line| format!("-# {line}"))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                    }
+                    tool_unit(rows)
                 }
                 Block::Text {
                     stable,
@@ -341,68 +369,76 @@ impl Timeline {
                     let prose = crate::text::sanitize(&prose);
                     let prose = prose.trim_end();
                     if prose.trim().is_empty() {
-                        continue;
+                        None
+                    } else if live && !done {
+                        Some((format!("{prose}{CURSOR}"), None))
+                    } else {
+                        Some((prose.to_string(), None))
                     }
-                    let mut prose = prose.to_string();
-                    if live && !done {
-                        prose.push_str(CURSOR);
-                    }
-                    pieces.push(prose);
                 }
+            };
+            if let Some((text, log)) = unit {
+                units.push(Unit {
+                    text,
+                    log,
+                    block: index,
+                });
             }
         }
-        if pieces.is_empty() {
+        if units.is_empty() {
             return Vec::new();
         }
-        let accent = match &status {
-            Status::Working => WORKING,
-            Status::Done => DONE,
-            Status::Failed(_) => FAILED,
-            Status::Stopped => STOPPED,
-        };
-        let footer = self.footer(&status, &crate::activity::summary(&tool_rows), now);
-        let tool_log = tool_log(&log);
-        let log_size = tool_log.as_ref().map_or(0, |(_, size)| *size);
-        let bodies = pack(&pieces, CARD_TEXT.saturating_sub(log_size));
-        let last = bodies.len() - 1;
+        // A turn of dozens of steps shares one last message rather than
+        // flooding the channel.
+        if units.len() > MAX_MESSAGES {
+            let tail = units.split_off(MAX_MESSAGES - 1);
+            let block = tail.last().map_or(0, |unit| unit.block);
+            let text = tail
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            units.push(Unit {
+                text,
+                log: None,
+                block,
+            });
+        }
         let settled = status != Status::Working;
-        bodies
-            .into_iter()
-            .enumerate()
-            .map(|(index, body)| {
-                let mut children: Vec<Value> = body
-                    .iter()
-                    .map(|piece| json!({"type": 10, "content": piece}))
-                    .collect();
-                let mut files = Vec::new();
-                let mut extra = Vec::new();
+        let chip = self.chip(
+            &status,
+            &crate::activity::summary(&tool_rows),
+            now,
+            buttons && settled,
+        );
+        let mut cards: Vec<Card> = Vec::new();
+        for unit in units {
+            let log_size = unit.log.as_ref().map_or(0, |(_, size)| *size);
+            let chunks = split_block(&unit.text, CARD_TEXT.saturating_sub(log_size));
+            let last = chunks.len().saturating_sub(1);
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let mut components = vec![json!({"type": 10, "content": chunk})];
                 if index == last {
-                    children.extend(self.media_components());
-                    files = self.media.iter().map(|media| media.name.clone()).collect();
-                    children.push(json!({"type": 14, "divider": true, "spacing": 1}));
-                    children.push(footer.clone());
-                    if buttons && settled {
-                        children.extend(self.action_row());
-                    }
-                    extra.extend(tool_log.clone().map(|(container, _)| container));
+                    components.extend(unit.log.clone().map(|(container, _)| container));
                 }
-                let mut components = vec![json!({
-                    "type": 17,
-                    "accent_color": accent,
-                    "components": children,
-                })];
-                components.extend(extra);
-                Card {
+                cards.push(Card {
                     components,
-                    text: body.join("\n"),
-                    files,
-                }
-            })
-            .collect()
+                    text: chunk,
+                    files: Vec::new(),
+                    block: unit.block,
+                });
+            }
+        }
+        if let Some(last) = cards.last_mut() {
+            last.components.extend(self.media_components());
+            last.files = self.media.iter().map(|media| media.name.clone()).collect();
+            last.components.push(chip);
+        }
+        cards
     }
 
     /// The answer's files: images and videos in one gallery, the rest as
-    /// File cards, all referencing uploads that travel with the edit.
+    /// File cards, all referencing uploads that travel with the request.
     fn media_components(&self) -> Vec<Value> {
         let mut out = Vec::new();
         let visuals: Vec<Value> = self
@@ -435,7 +471,9 @@ impl Timeline {
         (!buttons.is_empty()).then(|| json!({"type": 1, "components": buttons}))
     }
 
-    fn footer(&self, status: &Status, summary: &str, now: f64) -> Value {
+    /// The status chip: an accented Container with the status line, Stop
+    /// while the turn runs, and Retry / New chat once it has settled.
+    fn chip(&self, status: &Status, summary: &str, now: f64, actions: bool) -> Value {
         let elapsed = (now - self.started).max(0.0);
         let mut line = match status {
             // A Discord timestamp: "started 20 seconds ago", kept current by
@@ -457,7 +495,7 @@ impl Timeline {
             line.push_str(" · actions may already have happened");
         }
         let text = json!({"type": 10, "content": format!("-# {line}")});
-        match (&self.stop, status) {
+        let first = match (&self.stop, status) {
             (Some(custom_id), Status::Working) => json!({
                 "type": 9,
                 "components": [text],
@@ -469,12 +507,24 @@ impl Timeline {
                 },
             }),
             _ => text,
+        };
+        let mut children = vec![first];
+        if actions {
+            children.extend(self.action_row());
         }
+        let accent = match status {
+            Status::Working => WORKING,
+            Status::Done => DONE,
+            Status::Failed(_) => FAILED,
+            Status::Stopped => STOPPED,
+        };
+        json!({"type": 17, "accent_color": accent, "components": children})
     }
 
-    /// The requests due now. Posts go strictly in card order; an edit waits
-    /// `gap` seconds after the card's last change unless the turn is
-    /// `finishing`, when everything settles at once.
+    /// The requests due now. Posts go strictly in message order; an edit
+    /// waits `gap` seconds after the message's last change (and out any
+    /// backoff) unless the turn is `finishing`, when everything settles at
+    /// once.
     pub fn plan(&self, now: f64, gap: f64, finishing: bool) -> Vec<Op> {
         if self.lost {
             return Vec::new();
@@ -483,8 +533,10 @@ impl Timeline {
         let mut ops = Vec::new();
         for (index, body) in cards.iter().enumerate() {
             match self.cards.get(index) {
+                Some(posted) if posted.frozen => {}
                 Some(posted) => {
-                    if posted.shown != body.key() && (finishing || now - posted.at >= gap) {
+                    let due = finishing || (now - posted.at >= gap && now >= posted.retry_at);
+                    if posted.shown != body.key() && due {
                         ops.push(Op::Edit {
                             card: index,
                             id: posted.id.clone(),
@@ -492,14 +544,18 @@ impl Timeline {
                         });
                     }
                 }
-                None => ops.push(Op::Post {
-                    card: index,
-                    body: body.clone(),
-                }),
+                None => {
+                    if finishing || now >= self.post_retry {
+                        ops.push(Op::Post {
+                            card: index,
+                            body: body.clone(),
+                        });
+                    }
+                }
             }
         }
         // The turn shrank (the final answer is shorter than its preview):
-        // retire the cards it no longer fills.
+        // retire the messages it no longer fills.
         if finishing {
             for (index, posted) in self.cards.iter().enumerate().skip(cards.len()) {
                 ops.push(Op::Delete {
@@ -513,11 +569,13 @@ impl Timeline {
 
     /// A post landed as message `id`.
     pub fn posted(&mut self, card: usize, id: &str, body: &Card, now: f64) {
+        self.post_strikes = 0;
         if card == self.cards.len() {
             self.cards.push(Posted {
                 id: id.to_string(),
                 shown: body.key(),
                 at: now,
+                ..Posted::default()
             });
         }
     }
@@ -527,80 +585,181 @@ impl Timeline {
         if let Some(posted) = self.cards.get_mut(card) {
             posted.shown = body.key();
             posted.at = now;
+            posted.strikes = 0;
         }
     }
 
-    /// A card was deleted (by us, at the end of the turn).
+    /// A post did not land. A busy Discord is waited out; a refused post is
+    /// retried a few times (the next frame differs); a forbidden channel
+    /// ends the turn's messages.
+    pub fn post_failed(&mut self, failure: Failure, now: f64) {
+        match failure {
+            Failure::Busy(secs) => self.post_retry = now + secs.clamp(0.5, 30.0),
+            Failure::Refused => {
+                self.post_strikes += 1;
+                if self.post_strikes >= STRIKES {
+                    self.lost = true;
+                } else {
+                    self.post_retry = now + backoff(self.post_strikes);
+                }
+            }
+            Failure::Gone | Failure::Forbidden => self.lost = true,
+        }
+    }
+
+    /// An edit did not land. Only that message is affected: a busy Discord
+    /// is waited out, a refused edit is retried with backoff and then left
+    /// as it is, and a deleted newest message is posted again.
+    pub fn edit_failed(&mut self, card: usize, failure: Failure, now: f64) {
+        let newest = card + 1 == self.cards.len();
+        let reposts = self.reposts;
+        let Some(posted) = self.cards.get_mut(card) else {
+            return;
+        };
+        match failure {
+            Failure::Busy(secs) => posted.retry_at = now + secs.clamp(0.5, 30.0),
+            Failure::Refused => {
+                posted.strikes += 1;
+                if posted.strikes >= STRIKES {
+                    posted.frozen = true;
+                } else {
+                    posted.retry_at = now + backoff(posted.strikes);
+                }
+            }
+            Failure::Gone if newest && reposts < REPOSTS => {
+                self.reposts += 1;
+                self.cards.truncate(card);
+            }
+            Failure::Gone | Failure::Forbidden => posted.frozen = true,
+        }
+    }
+
+    /// A message was deleted (by us, at the end of the turn).
     pub fn deleted(&mut self, card: usize) {
         self.cards.truncate(card);
     }
 
-    /// A send or edit was refused: stop touching this turn.
+    /// Give the turn up: nothing more is sent or edited.
     pub fn lose(&mut self) {
         self.lost = true;
     }
 
-    /// Every card is on screen exactly as rendered at `now`.
-    fn settled(&self, now: f64) -> Option<Vec<(String, String)>> {
+    /// Whether the newest message is on screen exactly as rendered at `now`.
+    fn newest_shown(&self, now: f64) -> Option<(Card, String)> {
         if self.lost {
             return None;
         }
         let cards = self.render(now);
-        if cards.is_empty() || cards.len() != self.cards.len() {
-            return None;
-        }
-        cards
-            .into_iter()
-            .zip(&self.cards)
-            .map(|(body, posted)| {
-                (posted.shown == body.key()).then(|| (body.text, posted.id.clone()))
-            })
-            .collect()
+        let index = cards.len().checked_sub(1)?;
+        let posted = self.cards.get(index)?;
+        let card = cards.into_iter().nth(index)?;
+        (posted.shown == card.key()).then(|| (card, posted.id.clone()))
     }
 
-    /// The adopted answer, if it is on screen exactly as rendered. `None`
-    /// means the caller must deliver the answer itself.
-    pub fn landed(&self, now: f64) -> Option<Landed> {
-        if !matches!(
-            self.blocks.last(),
+    /// The index of the adopted answer's block, if there is one.
+    fn answer_block(&self) -> Option<usize> {
+        match self.blocks.last() {
             Some(Block::Text {
-                answer: Some(_),
-                ..
-            })
-        ) {
-            return None;
+                answer: Some(_), ..
+            }) => Some(self.blocks.len() - 1),
+            _ => None,
         }
-        self.settled(now).map(|parts| Landed { parts })
     }
 
-    /// The card that shows how the turn ended, if it is on screen: a failed
-    /// or stopped turn needs no separate notice when its footer says so.
+    /// The adopted answer, if every message of it is on screen exactly as
+    /// rendered. `None` means the caller must deliver the answer itself.
+    pub fn landed(&self, now: f64) -> Option<Landed> {
+        let answer = self.answer_block()?;
+        if self.lost {
+            return None;
+        }
+        let cards = self.render(now);
+        if self.cards.len() > cards.len() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for (index, card) in cards.iter().enumerate() {
+            if card.block != answer {
+                continue;
+            }
+            let posted = self.cards.get(index)?;
+            if posted.shown != card.key() {
+                return None;
+            }
+            parts.push((card.text.clone(), posted.id.clone()));
+        }
+        (!parts.is_empty()).then_some(Landed { parts })
+    }
+
+    /// The message whose status chip shows how the turn ended, if it is on
+    /// screen: a failed or stopped turn needs no separate notice when its
+    /// chip says so.
     pub fn status_card(&self, now: f64) -> Option<String> {
         self.status.as_ref()?;
-        self.settled(now)?.last().map(|(_, id)| id.clone())
+        self.newest_shown(now).map(|(_, id)| id)
     }
 
-    /// The settled last card without its Retry / New chat buttons, for
+    /// The settled newest message without its Retry / New chat buttons, for
     /// when the next turn starts: only the latest turn offers them. `None`
-    /// when there is nothing to retire, or the card carries uploads (an
+    /// when there is nothing to retire, or the message carries uploads (an
     /// edit would have to resend them).
     pub fn retired(&self) -> Option<(String, Vec<Value>)> {
         self.status.as_ref()?;
         if (self.retry.is_none() && self.new_chat.is_none()) || !self.media.is_empty() {
             return None;
         }
-        self.settled(0.0)?;
-        let cards = self.render_with(0.0, false);
-        let last = cards.last()?;
-        let posted = self.cards.get(cards.len() - 1)?;
-        Some((posted.id.clone(), last.components.clone()))
+        let (_, id) = self.newest_shown(0.0)?;
+        let last = self.render_with(0.0, false).pop()?;
+        Some((id, last.components))
     }
 
-    /// Every card on screen, for retracting a preview whose answer did not
-    /// land before the durable resend.
-    pub fn posted_ids(&self) -> Vec<String> {
-        self.cards.iter().map(|posted| posted.id.clone()).collect()
+    /// The answer's messages on screen, for retracting a preview whose
+    /// answer did not land before the durable resend.
+    pub fn answer_ids(&self) -> Vec<String> {
+        let Some(answer) = self.answer_block() else {
+            return Vec::new();
+        };
+        let cards = self.render(0.0);
+        self.cards
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| cards.get(*index).is_none_or(|card| card.block == answer))
+            .map(|(_, posted)| posted.id.clone())
+            .collect()
     }
+}
+
+/// One tool group's lines, folded when long, and its tool log.
+fn tool_unit(rows: &[Value]) -> Option<(String, Option<(Value, usize)>)> {
+    let feed = crate::activity::render(rows)?;
+    let feed = crate::text::sanitize(&feed);
+    let lines: Vec<&str> = feed.lines().collect();
+    let (shown, log) = if lines.len() > FOLD_LINES {
+        let mut shown = vec![format!(
+            "{} tool calls · full list in the tool log below",
+            lines.len()
+        )];
+        shown.extend(
+            lines[lines.len() - KEEP_LIVE..]
+                .iter()
+                .map(|line| line.to_string()),
+        );
+        let all: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        (shown, tool_log(&all))
+    } else {
+        (lines.iter().map(|line| line.to_string()).collect(), None)
+    };
+    let text = shown
+        .iter()
+        .map(|line| format!("-# {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((text, log))
+}
+
+/// Seconds to wait after the `strikes`-th refusal: 2, 4, 8 … capped at 30.
+fn backoff(strikes: u32) -> f64 {
+    2f64.powi(strikes.min(5) as i32).min(30.0)
 }
 
 /// "timed out" → "Timed out".
@@ -659,10 +818,10 @@ fn tool_log(lines: &[String]) -> Option<(Value, usize)> {
     ))
 }
 
-/// The pressed card, flipped to "stopping…" for the interaction's own
+/// The pressed message, flipped to "stopping…" for the interaction's own
 /// UPDATE_MESSAGE response: grey accent, the Stop section replaced by a
-/// line. The worker settles the card properly on its next frame. `None`
-/// when the button is not on this card.
+/// line. The worker settles the turn properly on its next frame. `None`
+/// when the button is not on this message.
 pub fn stopping(components: &Value, pressed: &str) -> Option<Vec<Value>> {
     let mut out = components.as_array()?.clone();
     let mut found = false;
@@ -707,49 +866,30 @@ fn strip_nulls(value: &mut Value) {
     }
 }
 
-/// Fill cards in order. A piece that does not fit is cut to fill the room
-/// left (Hermes seals an overflowing preview the same way), so content never
-/// moves between cards as the turn grows: a cut lands on the last newline
-/// that keeps at least half the room, and a code fence open at the cut is
-/// closed there and reopened in the next card.
-pub fn pack(pieces: &[String], budget: usize) -> Vec<Vec<String>> {
-    let mut cards: Vec<Vec<String>> = vec![Vec::new()];
-    let mut used = 0usize;
-    for piece in pieces {
-        let mut rest = piece.clone();
-        while !rest.is_empty() {
-            let room = budget.saturating_sub(used);
-            let size = crate::text::utf16_len(&rest);
-            let full = cards.last().map_or(0, Vec::len) >= MAX_PIECES;
-            if full || (size > room && room < MIN_ROOM) {
-                cards.push(Vec::new());
-                used = 0;
-                continue;
-            }
-            if size <= room {
-                used += size;
-                if let Some(card) = cards.last_mut() {
-                    card.push(rest);
-                }
-                break;
-            }
-            let (head, tail) = split_at(&rest, room);
-            if let Some(card) = cards.last_mut() {
-                card.push(head);
-            }
-            cards.push(Vec::new());
-            used = 0;
-            rest = tail;
+/// Cut one block's text into messages of at most `budget` UTF-16 units
+/// (Hermes seals an overflowing preview the same way), so text never moves
+/// between messages as it grows: a cut lands on the last newline that keeps
+/// at least half the room, and a code fence open at the cut is closed there
+/// and reopened in the next message. At most [`MAX_SPLIT`] messages.
+pub fn split_block(text: &str, budget: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut rest = text.to_string();
+    while !rest.trim().is_empty() {
+        if crate::text::utf16_len(&rest) <= budget {
+            chunks.push(rest);
+            break;
         }
-    }
-    cards.retain(|card| !card.is_empty());
-    if cards.len() > MAX_CARDS {
-        cards.truncate(MAX_CARDS);
-        if let Some(card) = cards.last_mut() {
-            card.push("-# … (truncated)".to_string());
+        if chunks.len() + 1 == MAX_SPLIT {
+            let (head, _) = split_at(&rest, budget.saturating_sub(24));
+            chunks.push(format!("{head}\n-# … (truncated)"));
+            break;
         }
+        let (head, tail) = split_at(&rest, budget);
+        chunks.push(head);
+        rest = tail;
     }
-    cards
+    chunks.retain(|chunk| !chunk.trim().is_empty());
+    chunks
 }
 
 /// Cut `text` to fit `room`, returning the head and what remains.
@@ -817,24 +957,24 @@ mod tests {
         ops
     }
 
-    fn container(card: &Card) -> &Value {
-        &card.components[0]
+    /// The status chip: the last component of the newest message.
+    fn chip(card: &Card) -> &Value {
+        card.components.last().unwrap()
     }
 
-    fn footer(card: &Card) -> String {
-        let children = container(card)["components"].as_array().unwrap();
-        let last = children.last().unwrap();
-        match last["type"].as_u64() {
-            Some(9) => last["components"][0]["content"]
+    fn status_line(card: &Card) -> String {
+        let first = &chip(card)["components"][0];
+        match first["type"].as_u64() {
+            Some(9) => first["components"][0]["content"]
                 .as_str()
                 .unwrap()
                 .to_string(),
-            _ => last["content"].as_str().unwrap().to_string(),
+            _ => first["content"].as_str().unwrap().to_string(),
         }
     }
 
     #[test]
-    fn a_turn_is_one_valid_v2_card_that_grows_in_place() {
+    fn prose_streams_into_its_own_message_with_the_status_chip() {
         let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:t".into());
         t.absorb(&text(0, "", "Hello", false));
         let ops = land(&mut t, 0.0, false);
@@ -842,14 +982,12 @@ mod tests {
             panic!("{ops:?}")
         };
         crate::render::validate_components(&body.components).unwrap();
-        assert_eq!(container(body)["accent_color"], json!(WORKING));
         assert_eq!(body.text, "Hello ▉");
-        let stop = container(body)["components"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap();
-        assert_eq!(stop["type"], 9, "footer is a Section with the Stop button");
+        assert_eq!(body.components[0]["type"], 10, "prose is plain text");
+        assert_eq!(chip(body)["type"], 17);
+        assert_eq!(chip(body)["accent_color"], json!(WORKING));
+        let stop = &chip(body)["components"][0];
+        assert_eq!(stop["type"], 9, "the status line carries Stop");
         assert_eq!(stop["accessory"]["custom_id"], "turn:stop:t");
 
         t.absorb(&text(0, "Hello world\n", "and", false));
@@ -862,21 +1000,38 @@ mod tests {
     }
 
     #[test]
-    fn tool_lines_sit_between_prose_as_subtext() {
-        let mut t = Timeline::new(true, 0.0);
-        t.absorb(&text(0, "Let me check.", "", true));
+    fn each_step_of_the_turn_is_a_new_message() {
+        let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:t".into());
+        t.absorb(&text(0, "Let me check.", "", false));
+        land(&mut t, 0.0, false);
         t.absorb(&ran("a", "cargo test"));
-        t.absorb(&text(1, "", "All", false));
-        let cards = t.render(0.0);
-        assert_eq!(cards.len(), 1);
+        let ops = land(&mut t, 2.0, false);
+        let [Op::Edit {
+            card: 0,
+            body: prose,
+            ..
+        }, Op::Post {
+            card: 1,
+            body: tools,
+        }] = &ops[..]
+        else {
+            panic!("{ops:?}")
+        };
+        assert_eq!(prose.text, "Let me check.", "closed: cursor gone");
+        assert_eq!(prose.components.len(), 1, "the chip moved on");
+        assert_eq!(tools.text, "-# Running `cargo test`");
         assert_eq!(
-            cards[0].text,
-            "Let me check.\n-# Running `cargo test`\nAll ▉"
-        );
-        assert_eq!(
-            footer(&cards[0]),
+            status_line(tools),
             "-# Working · started <t:0:R> · ran 1 command"
         );
+
+        t.absorb(&text(1, "", "All", false));
+        let ops = land(&mut t, 4.0, false);
+        assert!(
+            matches!(&ops[..], [Op::Edit { card: 1, .. }, Op::Post { card: 2, body }] if body.text == "All ▉"),
+            "the next prose opens a third message: {ops:?}"
+        );
+        assert_eq!(t.cards.len(), 3);
     }
 
     #[test]
@@ -885,7 +1040,7 @@ mod tests {
         t.absorb(&text(0, "", "Hi", false));
         land(&mut t, 1_700_000_000.0, false);
         assert_eq!(
-            footer(&t.render(1_700_000_000.0)[0]),
+            status_line(&t.render(1_700_000_000.0)[0]),
             "-# Working · started <t:1700000000:R>",
             "Discord keeps the relative time current itself"
         );
@@ -917,47 +1072,68 @@ mod tests {
     }
 
     #[test]
-    fn settling_recolors_the_card_and_drops_the_stop_button() {
+    fn settling_recolors_the_chip_and_drops_the_stop_button() {
         let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:t".into());
         t.absorb(&ran("a", "cargo test"));
         t.absorb(&text(0, "", "Draft", false));
         land(&mut t, 0.0, false);
+        assert_eq!(t.cards.len(), 2);
         assert!(t.adopt("Final answer"));
         t.settle(Status::Done, 4.1);
         let ops = land(&mut t, 9.0, true);
-        let [Op::Edit { body, .. }] = &ops[..] else {
+        let [Op::Edit { card: 1, body, .. }] = &ops[..] else {
             panic!("{ops:?}")
         };
-        assert_eq!(container(body)["accent_color"], json!(DONE));
-        assert_eq!(footer(body), "-# Done in 4.1s · ran 1 command");
+        assert_eq!(chip(body)["accent_color"], json!(DONE));
+        assert_eq!(status_line(body), "-# Done in 4.1s · ran 1 command");
         assert!(!body.key().contains("turn:stop"));
         let landed = t.landed(30.0).unwrap();
         assert_eq!(
             landed.parts,
-            vec![(
-                "-# Running `cargo test`\nFinal answer".to_string(),
-                "m0".to_string()
-            )]
+            vec![("Final answer".to_string(), "m1".to_string())],
+            "only the answer's messages are the answer"
         );
     }
 
     #[test]
-    fn a_settled_card_offers_retry_and_new_chat_and_retires_them_later() {
+    fn an_answer_after_tool_lines_is_a_new_message_below_them() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "Checking", "", true));
+        t.absorb(&ran("a", "ls -la"));
+        land(&mut t, 0.0, false);
+        assert!(t.adopt("Answer"));
+        t.settle(Status::Done, 1.0);
+        let ops = land(&mut t, 1.0, true);
+        assert!(
+            matches!(&ops[..], [Op::Edit { card: 1, .. }, Op::Post { card: 2, body }] if body.text == "Answer"),
+            "{ops:?}"
+        );
+        assert_eq!(
+            t.landed(1.0).unwrap().parts,
+            vec![("Answer".to_string(), "m2".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_settled_turn_offers_retry_and_new_chat_and_retires_them_later() {
         let mut t = Timeline::new(true, 0.0)
             .with_stop("turn:stop:s".into())
             .with_actions(Some("turn:retry:r".into()), Some("turn:new:n".into()));
         t.absorb(&text(0, "", "Hi", false));
         land(&mut t, 0.0, false);
         let live = t.render(0.0);
-        assert!(!live[0].components[0].to_string().contains("turn:retry"));
+        assert!(!live[0].key().contains("turn:retry"));
         t.adopt("Hi there");
         t.settle(Status::Done, 2.0);
         land(&mut t, 2.0, true);
         let done = t.render(2.0);
         crate::render::validate_components(&done[0].components).unwrap();
-        let children = container(&done[0])["components"].as_array().unwrap();
-        let row = children.last().unwrap();
-        assert_eq!(row["type"], 1, "an action row closes the settled card");
+        let row = chip(&done[0])["components"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(row["type"], 1, "an action row closes the settled chip");
         assert_eq!(row["components"][0]["custom_id"], "turn:retry:r");
         assert_eq!(row["components"][1]["custom_id"], "turn:new:n");
         assert_eq!(row["components"][1]["label"], "New chat");
@@ -970,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn the_answer_files_sit_inside_the_settled_card() {
+    fn the_answer_files_sit_inside_its_message() {
         let mut t = Timeline::new(true, 0.0);
         t.absorb(&text(0, "", "Here", false));
         land(&mut t, 0.0, false);
@@ -992,56 +1168,49 @@ mod tests {
         };
         crate::render::validate_components(&body.components).unwrap();
         assert_eq!(body.files, vec!["chart.png", "report.pdf"]);
-        let children = container(body)["components"].as_array().unwrap();
-        assert_eq!(children[1]["type"], 12, "gallery after the prose");
+        assert_eq!(body.components[1]["type"], 12, "gallery after the prose");
         assert_eq!(
-            children[1]["items"][0]["media"]["url"],
+            body.components[1]["items"][0]["media"]["url"],
             "attachment://chart.png"
         );
-        assert_eq!(children[2]["type"], 13, "then the file card");
+        assert_eq!(body.components[2]["type"], 13, "then the file card");
         assert!(t.landed(1.0).is_some());
-        assert!(t.retired().is_none(), "a card with uploads is left as is");
+        assert!(
+            t.retired().is_none(),
+            "a message with uploads is left as is"
+        );
     }
 
     #[test]
-    fn stop_flips_the_pressed_card_at_once() {
+    fn stop_flips_the_pressed_message_at_once() {
         let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:s".into());
         t.absorb(&text(0, "", "Working", false));
         let mut echoed = json!(t.render(0.0)[0].components);
         // Discord echoes optional fields back as null.
-        echoed[0]["components"][0]["id"] = Value::Null;
+        echoed[0]["id"] = Value::Null;
         let flipped = stopping(&echoed, "turn:stop:s").unwrap();
         crate::render::validate_components(&flipped).unwrap();
-        assert_eq!(flipped[0]["accent_color"], json!(STOPPED));
-        let text = flipped[0].to_string();
+        assert_eq!(flipped.last().unwrap()["accent_color"], json!(STOPPED));
+        let text = serde_json::to_string(&flipped).unwrap();
         assert!(text.contains("Stopping…") && !text.contains("turn:stop:s"));
         assert!(stopping(&echoed, "turn:stop:other").is_none());
     }
 
     #[test]
-    fn a_stopped_turn_says_so_in_its_footer() {
+    fn a_stopped_turn_says_so_in_its_chip() {
         let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:t".into());
         t.absorb(&text(0, "", "Working on", false));
         land(&mut t, 0.0, false);
         t.settle(Status::Stopped, 12.0);
         land(&mut t, 12.5, true);
         let card = &t.render(99.0)[0];
-        assert_eq!(container(card)["accent_color"], json!(STOPPED));
+        assert_eq!(chip(card)["accent_color"], json!(STOPPED));
         assert_eq!(
-            footer(card),
+            status_line(card),
             "-# Stopped after 12.0s · actions may already have happened"
         );
         assert_eq!(card.text, "Working on", "the cursor is gone");
         assert_eq!(t.status_card(99.0).as_deref(), Some("m0"));
-    }
-
-    #[test]
-    fn an_answer_below_tool_lines_is_not_adopted() {
-        let mut t = Timeline::new(true, 0.0);
-        t.absorb(&text(0, "Checking", "", true));
-        t.absorb(&ran("a", "ls -la"));
-        assert!(!t.adopt("Answer"));
-        assert!(t.landed(0.0).is_none());
     }
 
     #[test]
@@ -1050,6 +1219,7 @@ mod tests {
         t.absorb(&text(0, "secret plan", "", true));
         assert!(!t.has_text());
         assert!(t.plan(0.0, 1.0, true).is_empty());
+        assert!(!t.adopt("answer"), "the answer belongs to someone else");
     }
 
     #[test]
@@ -1063,7 +1233,64 @@ mod tests {
     }
 
     #[test]
-    fn a_long_turn_fills_cards_in_order_and_balances_fences() {
+    fn a_refused_edit_backs_off_then_leaves_only_that_message() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "One", false));
+        land(&mut t, 0.0, false);
+        t.absorb(&text(0, "One two\n", "", false));
+        let [Op::Edit { card: 0, .. }] = &t.plan(1.0, 1.0, false)[..] else {
+            panic!()
+        };
+        t.edit_failed(0, Failure::Refused, 1.0);
+        assert!(t.plan(2.0, 1.0, false).is_empty(), "backing off");
+        assert_eq!(t.plan(3.0, 1.0, false).len(), 1, "then tried again");
+        t.edit_failed(0, Failure::Refused, 3.0);
+        t.edit_failed(0, Failure::Refused, 30.0);
+        assert!(t.plan(60.0, 1.0, false).is_empty(), "left as it is");
+
+        // The turn goes on: the next step still lands as a new message.
+        t.absorb(&ran("a", "cargo build"));
+        let ops = land(&mut t, 61.0, false);
+        assert!(matches!(&ops[..], [Op::Post { card: 1, .. }]), "{ops:?}");
+    }
+
+    #[test]
+    fn a_busy_discord_is_waited_out_not_given_up() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "Hi", false));
+        let [Op::Post { .. }] = &t.plan(0.0, 1.0, false)[..] else {
+            panic!()
+        };
+        t.post_failed(Failure::Busy(5.0), 0.0);
+        assert!(t.plan(1.0, 1.0, false).is_empty());
+        assert_eq!(t.plan(5.0, 1.0, false).len(), 1);
+        for _ in 0..10 {
+            t.post_failed(Failure::Busy(1.0), 5.0);
+        }
+        assert_eq!(t.plan(9.0, 1.0, false).len(), 1, "never lost to a busy API");
+    }
+
+    #[test]
+    fn a_deleted_newest_message_is_posted_again() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "Hi", false));
+        land(&mut t, 0.0, false);
+        t.absorb(&text(0, "Hi there\n", "", false));
+        t.edit_failed(0, Failure::Gone, 1.0);
+        let ops = land(&mut t, 1.0, false);
+        assert!(matches!(&ops[..], [Op::Post { card: 0, .. }]), "{ops:?}");
+    }
+
+    #[test]
+    fn a_forbidden_channel_ends_the_turns_messages() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "Hi", false));
+        t.post_failed(Failure::Forbidden, 0.0);
+        assert!(t.plan(99.0, 1.0, true).is_empty());
+    }
+
+    #[test]
+    fn a_long_block_fills_messages_in_order_and_balances_fences() {
         let line = "x".repeat(99);
         let mut body = String::from("```rust\n");
         for _ in 0..50 {
@@ -1071,19 +1298,17 @@ mod tests {
             body.push('\n');
         }
         body.push_str("```\nafter");
-        let cards = pack(&["-# Ran `ls`".to_string(), body], CARD_TEXT);
-        assert_eq!(cards.len(), 2, "{cards:?}");
-        assert_eq!(cards[0][0], "-# Ran `ls`", "earlier content stays put");
-        assert!(cards[0][1].ends_with("\n```"), "the cut closes its fence");
-        assert!(cards[1][0].starts_with("```rust\n"), "and reopens it");
-        for card in &cards {
-            let size: usize = card.iter().map(|p| crate::text::utf16_len(p)).sum();
-            assert!(size <= CARD_TEXT, "{size}");
+        let chunks = split_block(&body, CARD_TEXT);
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(chunks[0].ends_with("\n```"), "the cut closes its fence");
+        assert!(chunks[1].starts_with("```rust\n"), "and reopens it");
+        for chunk in &chunks {
+            assert!(crate::text::utf16_len(chunk) <= CARD_TEXT);
         }
     }
 
     #[test]
-    fn only_the_last_card_carries_the_footer() {
+    fn only_the_newest_message_carries_the_chip() {
         let mut t = Timeline::new(true, 0.0);
         t.absorb(&text(0, &"word ".repeat(1000), "", false));
         let cards = t.render(0.0);
@@ -1091,23 +1316,37 @@ mod tests {
         for card in &cards {
             crate::render::validate_components(&card.components).unwrap();
         }
-        let first = container(&cards[0])["components"].as_array().unwrap();
         assert!(
-            first.iter().all(|c| c["type"] == 10),
-            "no footer: {first:?}"
+            cards[0].components.iter().all(|c| c["type"] == 10),
+            "no chip: {:?}",
+            cards[0].components
         );
-        assert!(footer(&cards[1]).starts_with("-# Working · started"));
+        assert!(status_line(&cards[1]).starts_with("-# Working · started"));
     }
 
     #[test]
-    fn a_runaway_turn_is_capped() {
-        let cards = pack(&["word ".repeat(20_000)], CARD_TEXT);
-        assert_eq!(cards.len(), MAX_CARDS);
-        assert_eq!(cards.last().unwrap().last().unwrap(), "-# … (truncated)");
+    fn a_runaway_block_is_capped() {
+        let chunks = split_block(&"word ".repeat(20_000), CARD_TEXT);
+        assert_eq!(chunks.len(), MAX_SPLIT);
+        assert!(chunks.last().unwrap().ends_with("-# … (truncated)"));
     }
 
     #[test]
-    fn a_shorter_answer_retires_extra_cards() {
+    fn a_turn_of_many_steps_stops_opening_messages() {
+        let mut t = Timeline::new(true, 0.0);
+        for step in 0..40u64 {
+            t.absorb(&text(step, &format!("step {step}"), "", true));
+            t.absorb(&ran(&format!("c{step}"), &format!("make {step}")));
+        }
+        let cards = t.render(0.0);
+        assert_eq!(cards.len(), MAX_MESSAGES);
+        let last = cards.last().unwrap();
+        crate::render::validate_components(&last.components).unwrap();
+        assert!(last.text.ends_with("-# Running `make 39`"), "{}", last.text);
+    }
+
+    #[test]
+    fn a_shorter_answer_retires_extra_messages() {
         let mut t = Timeline::new(true, 0.0);
         t.absorb(&text(0, &"y".repeat(5000), "", false));
         land(&mut t, 0.0, false);

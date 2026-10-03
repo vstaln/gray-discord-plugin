@@ -281,50 +281,67 @@ Reload by restarting the service (`gray discord restart`).
 
 ## Live replies and activity narration
 
-Each turn is one live Components V2 card, edited in place while the agent
-works:
+A turn is a stream of messages, the way Hermes posts it: every run of prose
+is a new message, every group of tool calls is a tool bubble below it, and
+the next prose after a tool call starts a fresh message. The channel grows as
+the agent works; each message is edited in place only while it is live:
 
 ````markdown
-┃ Let me check what's running on the box.
-┃ -# Ran `gray ps` (0.3s)
-┃ **Done / idle:** claude-sub plugin agent: done. PR #173 is ▉
-┃ ───────────────────────────────────────────────
-┃ -# Working · started 20 seconds ago · ran 1 command    [Stop]
+Let me check what's running on the box.                    ← message 1
+-# Ran `gray ps` (0.3s)                                     ← message 2
+-# Running `cargo test`
+**Done / idle:** claude-sub plugin agent: done. PR #173 is ▉ ← message 3
+┃ -# Working · started 20 seconds ago · ran 2 commands    [Stop]
 ````
 
-- The card is posted as soon as there is something to show. The answer then
-  streams into it about once a second with a ` ▉` cursor.
-- Prose and tool lines keep their order: each run of prose, then the tool
-  lines it led to (small grey subtext), then the next prose. A group of
-  more than 6 tool lines folds to a count plus its latest 2 lines; the full
-  list sits in a spoiler box below the card (tap to show).
-- Everything is plain text: no emojis in tool lines, the footer or buttons.
-- The footer's clock is a Discord timestamp (`<t:…:R>`): every client keeps
-  "Working · started 20 seconds ago" current on its own, so a quiet turn costs no
-  edits. It also tallies the turn (`ran 3 commands · edited 1 file`).
-- **Stop** (danger button) stops the turn, like `/stop`. The pressed card
+- A message is posted as soon as its step has something to show. Prose
+  streams into its message about once a second with a ` ▉` cursor; a tool
+  line reads `Running` until the call returns, then `Ran` with its duration.
+- A group of more than 6 tool lines folds to a count plus its latest 2
+  lines; the full list sits in a spoiler box below them (tap to show).
+- Everything is plain text: no emojis in tool lines, the status chip or
+  buttons.
+- The newest message carries the turn's **status chip**: a small box whose
+  clock is a Discord timestamp (`<t:…:R>`), so every client keeps "Working ·
+  started 20 seconds ago" current on its own and a quiet turn (a long
+  build) costs no edits. It also tallies the turn (`ran 3 commands · edited
+  1 file`). When a newer message appears, the chip moves down to it.
+- **Stop** (danger button) stops the turn, like `/stop`. The pressed message
   flips to "Stopping…" in the same interaction response, then settles.
   Any admitted user in the channel can press it once.
-- The accent bar tracks the turn: blurple while working, green when done
+- The chip's accent tracks the turn: blurple while working, green when done
   (`Done in 7.2s · ran 1 command`), red on failure, grey when stopped
   (`Stopped after 12s · actions may already have happened`). A failed or
-  stopped card is the turn's notice, so nothing extra is posted.
-- Files the answer names with `MEDIA:` tags land **inside** the finished
-  card: images and videos in a Media Gallery, anything else as File cards
+  stopped turn's chip is its notice, so nothing extra is posted.
+- The answer is the last message. When the agent's last step was prose, that
+  message becomes the answer in place; otherwise the answer is posted as a
+  new message below the tool lines.
+- Files the answer names with `MEDIA:` tags land **inside** the answer's
+  message: images and videos in a Media Gallery, anything else as File cards
   (up to 10; more go out as a separate post).
-- The finished card offers **Retry** (run the same message again as a
-  new turn) and **New chat** (same as `/new`). Only the latest card in a
-  conversation keeps them; starting the next turn removes them from the
-  previous one. Buttons expire after a day.
-- A long turn continues in further cards (Discord allows 40 components and
-  4000 characters per message), cut at a newline, with code fences closed
-  and reopened at the cut, up to 8 cards. Only the last card has the footer.
+- The settled chip offers **Retry** (run the same message again as a new
+  turn) and **New chat** (same as `/new`). Only the latest turn keeps them;
+  starting the next turn removes them from the previous one. Buttons expire
+  after a day.
+- A message too long for Discord (4000 characters) continues in the next
+  one, cut at a newline, with code fences closed and reopened at the cut, up
+  to 8. A turn opens at most 30 messages; past that, later steps share the
+  last one.
 
-The final edit is the authoritative answer, recorded in the durable outbox
-as delivered, so a restart never posts it twice. If the answer cannot land
-in place (a refused post, a deleted card), the preview is retracted and the
-answer is posted durably instead. Slash command turns answer through their
-interaction; their card shows tool lines and Stop only.
+The answer's last edit is the authoritative answer, recorded in the durable
+outbox as delivered, so a restart never posts it twice. If the answer cannot
+land in place, only its preview is retracted (the tool lines above stay as
+the turn's record) and the answer is posted durably instead. Slash command
+turns answer through their interaction; their messages show tool lines and
+Stop only.
+
+Discord trouble never stalls the agent: the turn's messages are driven
+beside the gray child, not between reads of its output, and every Discord
+request has a timeout. A rate limit, a 5xx or a dropped connection is waited
+out and retried; an edit Discord refuses is retried with backoff and, after
+three refusals, that one message is left as it is while the turn carries on
+in new messages. Each failure is logged on the service's stderr with
+Discord's reason (`gray discord status` / the service log).
 
 The agent itself can author any Components V2 surface (all message and
 modal component types: containers, sections, galleries, files, buttons, every
@@ -342,7 +359,7 @@ whole answer at the end. Off in `config.json`:
 Tool lines show actions only: one line per meaningful call, never tool
 output. Shell introspection (`ls`, `cat`, …) stays unnarrated, and shell
 work reads the way gray's own transcript labels it (`Running` while it
-runs, `Ran` with its duration once it returns). The card stays in the
+runs, `Ran` with its duration once it returns). The messages stay in the
 channel as the turn's record.
 
 The rows come from gray core's `--json` progress stream (phase + tool +
@@ -354,7 +371,7 @@ never sent to Discord: the bridge always runs gray with
 shown half written), but secret-free paths stay verbatim so narration names
 the actual file.
 
-Tool lines off (the reply still streams into its card):
+Tool lines off (the reply still streams into its message):
 
 ```json
 {"activity_indicator": false}

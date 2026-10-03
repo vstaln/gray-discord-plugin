@@ -113,6 +113,13 @@ impl TransportError {
     }
 }
 
+/// A Discord request that has not answered in this long is given up as a
+/// network error (retried by its caller), never waited on forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Uploads carry files and get longer.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Thin REST client. `base` is a constructor arg so tests can inject the
 /// loopback stub; production call sites always pass `API_BASE` (never read a
 /// base URL from user config — same rule as the Python's "no api_base").
@@ -176,8 +183,15 @@ impl Rest {
                 "gray-discord/0.1 (+https://github.com/vstaln/gray-discord-plugin)",
             ),
         );
+        // Every request is bounded. Without this a pooled connection that
+        // died under us (a laptop's wifi, a NAT timeout) leaves a request
+        // waiting forever, and the turn's messages freeze with it.
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builds");
         Self {
@@ -958,7 +972,8 @@ impl Rest {
         let request = match method {
             "PATCH" => self.client.patch(url).multipart(form),
             _ => self.client.post(url).multipart(form),
-        };
+        }
+        .timeout(UPLOAD_TIMEOUT);
         let response = request
             .send()
             .await
@@ -1040,9 +1055,6 @@ impl Rest {
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
             "allowed_mentions": {"parse": []},
-            "content": Value::Null,
-            "embeds": [],
-            "sticker_ids": [],
         });
         self.multipart_v2(
             reqwest::Method::PATCH,
@@ -1092,6 +1104,7 @@ impl Rest {
             .client
             .request(method, format!("{}{}", self.base, path))
             .multipart(form)
+            .timeout(UPLOAD_TIMEOUT)
             .send()
             .await
             .map_err(|error| TransportError::Net(trim_net_error(error)))?;
@@ -1140,6 +1153,11 @@ impl Rest {
     /// [`Self::edit_message_v2`] with the failure kept: a streamed reply must
     /// tell a deleted message (stop editing it) from a transient error (try
     /// again next frame), and must never count a refused edit as delivered.
+    ///
+    /// Every message edited here was created as V2, so the body is the
+    /// create body's shape: the flag plus components. The legacy fields
+    /// (`content`, `embeds`, `sticker_ids`) only matter when converting a
+    /// legacy message, and `sticker_ids` is not an Edit Message field.
     pub async fn edit_v2(
         &self,
         channel: u64,
@@ -1151,9 +1169,6 @@ impl Rest {
             "flags": crate::render::IS_COMPONENTS_V2,
             "components": components,
             "allowed_mentions": {"parse": []},
-            "content": Value::Null,
-            "embeds": [],
-            "sticker_ids": [],
         });
         self.patch(&format!("/channels/{channel}/messages/{message}"), &body)
             .await

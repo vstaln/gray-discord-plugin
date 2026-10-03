@@ -22,6 +22,11 @@ pub struct Stub {
     pub sent: Arc<Mutex<Vec<Sent>>>,
     pub fail_auth: Arc<Mutex<bool>>,
     pub fail_send: Arc<Mutex<bool>>,
+    /// Answer message edits (PATCH) with this status instead of 200.
+    pub edit_status: Arc<Mutex<Option<u16>>>,
+    /// Hold every message edit (PATCH) this long before answering: a slow
+    /// or stuck Discord.
+    pub edit_delay_ms: Arc<Mutex<u64>>,
     /// When set, `/channels/42` reports a guild channel (id 77) so doctor's
     /// permission path runs; the guild has a permissions-bearing role 78.
     pub channel_guild: Arc<Mutex<bool>>,
@@ -160,11 +165,15 @@ impl Stub {
         let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
         let fail_auth: Arc<Mutex<bool>> = Arc::default();
         let fail_send: Arc<Mutex<bool>> = Arc::default();
+        let edit_status: Arc<Mutex<Option<u16>>> = Arc::default();
+        let edit_delay_ms: Arc<Mutex<u64>> = Arc::default();
         let channel_guild: Arc<Mutex<bool>> = Arc::default();
         let task = {
             let sent = sent.clone();
             let fail_auth = fail_auth.clone();
             let fail_send = fail_send.clone();
+            let edit_status = edit_status.clone();
+            let edit_delay_ms = edit_delay_ms.clone();
             let channel_guild = channel_guild.clone();
             tokio::spawn(async move {
                 loop {
@@ -174,6 +183,8 @@ impl Stub {
                     let sent = sent.clone();
                     let fail_auth = fail_auth.clone();
                     let fail_send = fail_send.clone();
+                    let edit_status = edit_status.clone();
+                    let edit_delay_ms = edit_delay_ms.clone();
                     let channel_guild = channel_guild.clone();
                     tokio::spawn(async move {
                         let Some((method, path, headers, body)) = read_request(&mut stream).await
@@ -227,6 +238,23 @@ impl Stub {
                                 });
                                 n
                             };
+                            if method == "PATCH" {
+                                let delay = *edit_delay_ms.lock().unwrap();
+                                if delay > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay))
+                                        .await;
+                                }
+                                let status = *edit_status.lock().unwrap();
+                                if let Some(status) = status {
+                                    respond(
+                                        &mut stream,
+                                        status,
+                                        r#"{"message":"Invalid Form Body","code":50035}"#,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
                             let reply = format!(r#"{{"id":"{}","channel_id":"42"}}"#, 1000 + n);
                             respond(&mut stream, 200, &reply).await;
                         } else if method == "POST"
@@ -326,6 +354,8 @@ impl Stub {
             sent,
             fail_auth,
             fail_send,
+            edit_status,
+            edit_delay_ms,
             channel_guild,
             _task: task,
         }

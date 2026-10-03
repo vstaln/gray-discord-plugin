@@ -322,13 +322,14 @@ fn narration_is_on_unless_explicitly_off() {
 #[test]
 fn the_sink_is_bounded_and_drains() {
     let s = activity::sink();
-    for i in 0..200 {
+    let total = activity::MAX_PENDING + 200;
+    for i in 0..total {
         activity::push(&s, json!({"phase": "tool_ran", "detail": i.to_string()}));
     }
     let got = activity::drain(&s);
-    assert!(got.len() <= 64, "unbounded queue: {}", got.len());
+    assert_eq!(got.len(), activity::MAX_PENDING, "bounded queue");
     // The newest survive: that is the action in flight.
-    assert_eq!(got.last().unwrap()["detail"], "199");
+    assert_eq!(got.last().unwrap()["detail"], (total - 1).to_string());
     assert!(activity::drain(&s).is_empty(), "drain empties the queue");
     assert!(activity::finish(&s, "").len() <= 128);
     assert!(activity::finish(&s, "").is_empty(), "finish is one-shot");
@@ -601,7 +602,13 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
         .cloned()
         .collect();
     assert_eq!(sent.len(), 2, "expected the turn card plus the tally card");
-    assert_eq!(sent[0].body["components"][0]["type"], 17, "a V2 Container");
+    let turn = sent[0].body["components"].as_array().unwrap();
+    assert_eq!(turn[0]["type"], 10, "the tool lines as V2 text");
+    assert_eq!(
+        turn.last().unwrap()["type"],
+        17,
+        "the status chip is a V2 Container"
+    );
     let card = component_text(&sent[1].body["components"]);
     assert!(card.contains("gray · done"), "{card}");
     assert!(card.contains("Ran `printf hi`"), "{card}");

@@ -229,14 +229,35 @@ pub struct TurnButtons {
     pub new_chat: Option<String>,
 }
 
-/// Discord (or the renderer) refused the request outright: retrying the
-/// same payload cannot succeed. Rate limits, 5xx and network errors can.
-fn refused(error: &TransportError) -> bool {
+/// What a failed turn-message request means for the turn (Hermes' edit
+/// failure classes): rate limits, 5xx, timeouts and dropped connections are
+/// waited out; a refused payload is retried with the next frame; a missing
+/// message or a forbidden channel is final.
+fn failure(error: &TransportError) -> crate::stream::Failure {
+    use crate::stream::Failure;
     match error {
-        TransportError::Auth(_) | TransportError::Forbidden(_) | TransportError::Invalid(_) => true,
-        TransportError::Http(code, _) => (400..500).contains(code),
-        _ => false,
+        TransportError::RateLimited(after) => Failure::Busy(after.unwrap_or(1.0)),
+        TransportError::Net(_) => Failure::Busy(2.0),
+        TransportError::Http(429, _) => Failure::Busy(1.0),
+        TransportError::Http(code, _) if *code >= 500 => Failure::Busy(2.0),
+        TransportError::Http(404, _) => Failure::Gone,
+        TransportError::Auth(_) | TransportError::Forbidden(_) => Failure::Forbidden,
+        TransportError::Http(_, _) | TransportError::Invalid(_) => Failure::Refused,
     }
+}
+
+/// One line on the daemon's stderr for a turn message that did not land,
+/// with Discord's own reason when it gave one. Never message content.
+fn log_failure(what: &str, channel: &str, error: &TransportError) {
+    let detail = match error {
+        TransportError::Http(code, detail) => format!("HTTP {code}: {detail}"),
+        TransportError::Net(detail) => format!("network: {detail}"),
+        TransportError::RateLimited(after) => format!("rate limited, retry after {after:?}s"),
+        TransportError::Invalid(detail) => format!("not sent: {detail}"),
+        TransportError::Auth(_) => "unauthorized".to_string(),
+        TransportError::Forbidden(_) => "forbidden".to_string(),
+    };
+    eprintln!("[discord] turn message {what} failed in channel {channel}: {detail}");
 }
 
 #[derive(Clone)]
@@ -475,6 +496,27 @@ impl<R, D> Runtime<R, D> {
         }
     }
 
+    /// Keep one turn's messages current until `stop` is signalled: gray's
+    /// rows in, sends and edits out, about four frames a second. Runs beside
+    /// the gray child rather than between reads of its output (Hermes'
+    /// stream consumer is its own task for the same reason): a slow or
+    /// rate-limited Discord request must never stall the agent or the rows
+    /// queued behind it. Returns after the request in flight has finished,
+    /// so a post is never cut off halfway and sent twice.
+    pub async fn drive_turn(&self, channel: &str, conversation: &str, stop: &tokio::sync::Notify) {
+        let mut every = tokio::time::interval(std::time::Duration::from_millis(250));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.notified() => return,
+                _ = every.tick() => {}
+            }
+            self.report_progress(channel).await;
+            self.report_activity_for(channel, conversation, false).await;
+        }
+    }
+
     /// Settle the turn's card with `status`. With `answer` (prose, `MEDIA:`
     /// tags already taken out) the streamed reply becomes that answer in
     /// place, with `uploads` (the files those tags named) shown inside the
@@ -514,8 +556,17 @@ impl<R, D> Runtime<R, D> {
                 None => false,
             }
         };
-        self.publish_timeline(channel, conversation, true, uploads)
-            .await;
+        // A busy Discord (rate limit, 5xx, timeout) gets a couple more
+        // chances before the answer falls back to a durable post.
+        for _ in 0..3 {
+            let Some(wait) = self
+                .publish_timeline(channel, conversation, true, uploads)
+                .await
+            else {
+                break;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait.clamp(0.5, 5.0))).await;
+        }
         let timeline = self.timelines.lock().await.remove(&key);
         if let Some(retired) = timeline.as_ref().and_then(crate::stream::Timeline::retired) {
             self.retired.lock().await.insert(key.clone(), retired);
@@ -546,9 +597,11 @@ impl<R, D> Runtime<R, D> {
         }
         if settled.landed.is_none() {
             // The answer did not fully land. Retract its preview so the
-            // durable resend does not leave the same words on screen twice.
+            // durable resend does not leave the same words on screen twice;
+            // the tool lines above it stay as the turn's record.
+            eprintln!("[discord] the answer did not land in place in channel {channel}; posting it durably");
             if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
-                for id in timeline.posted_ids() {
+                for id in timeline.answer_ids() {
                     let _ = rest.delete_message(ch, &id).await;
                 }
             }
@@ -579,15 +632,16 @@ impl<R, D> Runtime<R, D> {
         }
     }
 
-    /// Send whatever the timeline says is due, in order. A card that shows
-    /// files carries the matching `uploads` with its request.
+    /// Send whatever the timeline says is due, in order. A message that
+    /// shows files carries the matching `uploads` with its request. Returns
+    /// how long to wait when Discord was busy and the frame stopped early.
     async fn publish_timeline(
         &self,
         channel: &str,
         conversation: &str,
         finishing: bool,
         uploads: &[crate::media_tags::Upload],
-    ) {
+    ) -> Option<f64> {
         let files_for = |body: &crate::stream::Card| -> Vec<crate::media_tags::Upload> {
             body.files
                 .iter()
@@ -596,14 +650,15 @@ impl<R, D> Runtime<R, D> {
                 .collect()
         };
         let Ok(ch) = channel.parse::<u64>() else {
-            return;
+            return None;
         };
         let key = activity_key(channel, conversation);
         let now = self.now_secs();
         let ops = match self.timelines.lock().await.get(&key) {
             Some(timeline) => timeline.plan(now, crate::activity::MIN_EDIT_GAP, finishing),
-            None => return,
+            None => return None,
         };
+        let mut busy: Option<f64> = None;
         for op in ops {
             match op {
                 crate::stream::Op::Post { card, body } => {
@@ -619,23 +674,30 @@ impl<R, D> Runtime<R, D> {
                         // No REST (tests, dry runs): still narrate via the hook.
                         None => Ok(format!("hook-{card}")),
                     };
+                    let at = self.now_secs();
                     let mut timelines = self.timelines.lock().await;
-                    let Some(timeline) = timelines.get_mut(&key) else {
-                        return;
-                    };
+                    let timeline = timelines.get_mut(&key)?;
                     match sent {
-                        Ok(id) => timeline.posted(card, &id, &body, now),
+                        Ok(id) => timeline.posted(card, &id, &body, at),
                         Err(error) => {
-                            // Cards keep channel order, so nothing after this
-                            // one goes out this frame. A refused post gives
-                            // the turn up; a blip is retried next frame.
-                            if refused(&error) {
-                                timeline.lose();
+                            // Messages keep channel order, so nothing after
+                            // this one goes out this frame.
+                            log_failure("post", channel, &error);
+                            let failure = failure(&error);
+                            timeline.post_failed(failure, at);
+                            if let crate::stream::Failure::Busy(wait) = failure {
+                                return Some(wait);
                             }
-                            return;
+                            return None;
                         }
                     }
                     drop(timelines);
+                    // Discord drops the typing bubble when the bot posts;
+                    // the next frame pokes it again (Hermes restores it the
+                    // same way after each progress message).
+                    if !finishing {
+                        self.last_typing.lock().await.remove(channel);
+                    }
                     if let Some(ref hook) = self.activity_hook {
                         hook(&body.text, false);
                     }
@@ -652,16 +714,22 @@ impl<R, D> Runtime<R, D> {
                         }
                         None => Ok(()),
                     };
+                    let at = self.now_secs();
                     let mut timelines = self.timelines.lock().await;
-                    let Some(timeline) = timelines.get_mut(&key) else {
-                        return;
-                    };
+                    let timeline = timelines.get_mut(&key)?;
                     match outcome {
-                        Ok(()) => timeline.edited(card, &body, now),
-                        // Deleted, forbidden or unrenderable: stop editing
-                        // it. A blip is retried on the next frame.
-                        Err(error) if refused(&error) => timeline.lose(),
-                        Err(_) => continue,
+                        Ok(()) => timeline.edited(card, &body, at),
+                        // Only this message is affected: the turn goes on,
+                        // and its next step is a new message anyway.
+                        Err(error) => {
+                            log_failure("edit", channel, &error);
+                            let failure = failure(&error);
+                            timeline.edit_failed(card, failure, at);
+                            if let crate::stream::Failure::Busy(wait) = failure {
+                                busy = Some(busy.map_or(wait, |seen: f64| seen.max(wait)));
+                            }
+                            continue;
+                        }
                     }
                     drop(timelines);
                     if let Some(ref hook) = self.activity_hook {
@@ -670,7 +738,9 @@ impl<R, D> Runtime<R, D> {
                 }
                 crate::stream::Op::Delete { card, id } => {
                     if let Some(ref rest) = self.rest {
-                        let _ = rest.delete_message(ch, &id).await;
+                        if let Err(error) = rest.delete_message(ch, &id).await {
+                            log_failure("delete", channel, &error);
+                        }
                     }
                     if let Some(timeline) = self.timelines.lock().await.get_mut(&key) {
                         timeline.deleted(card);
@@ -678,6 +748,7 @@ impl<R, D> Runtime<R, D> {
                 }
             }
         }
+        busy
     }
 
     async fn publish_activity_card(&self, channel: &str, text: &str) {
@@ -804,8 +875,19 @@ where
             ),
             None => RunInput::Text(item.prompt.clone()),
         };
-        let run_fut = (self.runner)(&self.config, &self.config_path, &item.conversation, &input);
-        tokio::pin!(run_fut);
+        let mut run_fut = Box::pin((self.runner)(
+            &self.config,
+            &self.config_path,
+            &item.conversation,
+            &input,
+        ));
+
+        // The turn's messages are driven beside the run, never between its
+        // reads: a slow Discord request must not stall gray's output.
+        let stop_messages = tokio::sync::Notify::new();
+        let messages = self.drive_turn(&item.channel, &item.conversation, &stop_messages);
+        tokio::pin!(messages);
+        let mut messages_done = false;
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
         ticker.tick().await;
@@ -815,35 +897,48 @@ where
                 res = &mut run_fut => {
                     break Some(res);
                 }
+                _ = &mut messages, if !messages_done => {
+                    messages_done = true;
+                }
                 _ = ticker.tick() => {
-                    self.report_progress(&item.channel).await;
-                    self.report_activity_for(&item.channel, &item.conversation, false).await;
                     if let Ok(Some(cur)) = self.store.get(&item.id) {
                         if cur.cancel {
-                            let settled = self
-                                .finish_turn(
-                                    &item.channel,
-                                    &item.conversation,
-                                    None,
-                                    &[],
-                                    crate::stream::Status::Stopped,
-                                )
-                                .await;
-                            self.fail_turn(&item.id, "cancelled", &settled)?;
-                            self.remove_reaction(&item.channel, &item.id, "👀").await;
-                            self.add_reaction(&item.channel, &item.id, "❌").await;
-                            return Ok(true);
+                            break None;
                         }
                     }
                 }
             }
         };
+        // Let the request in flight finish (bounded by the REST timeouts),
+        // then settle the turn from here.
+        stop_messages.notify_one();
+        if !messages_done {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(45), &mut messages).await;
+        }
+        let Some(result) = result else {
+            // Stopped: end the gray child (and its process group) first.
+            drop(run_fut);
+            let settled = self
+                .finish_turn(
+                    &item.channel,
+                    &item.conversation,
+                    None,
+                    &[],
+                    crate::stream::Status::Stopped,
+                )
+                .await;
+            self.fail_turn(&item.id, "cancelled", &settled)?;
+            self.remove_reaction(&item.channel, &item.id, "👀").await;
+            self.add_reaction(&item.channel, &item.id, "❌").await;
+            return Ok(true);
+        };
 
-        // Settle the turn. A streamed reply becomes the answer in place
-        // (Hermes' final edit), with the files its `MEDIA:` tags named shown
-        // inside the card; any the card cannot hold go through the outbox.
+        // Settle the turn. The answer is its last message: the streamed
+        // prose becomes it in place (Hermes' final edit), or it is posted
+        // below the tool lines, with the files its `MEDIA:` tags named shown
+        // inside it; any it cannot hold go through the outbox.
         let (prose, media) = match &result {
-            Some(Ok(answer)) if stream_text => {
+            Ok(answer) if stream_text => {
                 let (prose, media) =
                     crate::media_tags::extract(answer, &self.media_cwd(), &self.media_roots());
                 (Some(prose), media)
@@ -851,12 +946,10 @@ where
             _ => (None, Vec::new()),
         };
         let status = match &result {
-            Some(Ok(_)) | None => crate::stream::Status::Done,
-            Some(Err(RunError::Budget(_))) => {
-                crate::stream::Status::Failed("hit the budget".to_string())
-            }
-            Some(Err(RunError::Timeout)) => crate::stream::Status::Failed("timed out".to_string()),
-            Some(Err(_)) => crate::stream::Status::Failed("failed".to_string()),
+            Ok(_) => crate::stream::Status::Done,
+            Err(RunError::Budget(_)) => crate::stream::Status::Failed("hit the budget".to_string()),
+            Err(RunError::Timeout) => crate::stream::Status::Failed("timed out".to_string()),
+            Err(_) => crate::stream::Status::Failed("failed".to_string()),
         };
         let loaded = crate::media_tags::load_pairs(&media);
         let uploads: Vec<crate::media_tags::Upload> =
@@ -871,7 +964,7 @@ where
             )
             .await;
         match result {
-            Some(Ok(answer)) => {
+            Ok(answer) => {
                 let receipt = serde_json::json!({});
                 let leftover: Vec<String> = loaded
                     .iter()
@@ -895,22 +988,21 @@ where
                     _ => self.store.complete(&item.id, &answer, &receipt)?,
                 }
             }
-            Some(Err(RunError::Budget(_))) => {
+            Err(RunError::Budget(_)) => {
                 self.fail_turn(&item.id, "budget_blocked", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
-            Some(Err(RunError::Timeout)) => {
+            Err(RunError::Timeout) => {
                 self.fail_turn(&item.id, "timeout", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
-            Some(Err(_)) => {
+            Err(_) => {
                 self.fail_turn(&item.id, "agent_failed", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
-            None => {}
         }
         Ok(true)
     }
