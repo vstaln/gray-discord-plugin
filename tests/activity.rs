@@ -418,10 +418,14 @@ async fn the_second_line_edits_the_first_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], ("💻 Running `ls`".to_string(), false), "first post");
+    assert_eq!(
+        log[0],
+        ("-# 💻 Running `ls`".to_string(), false),
+        "first post"
+    );
     assert_eq!(
         log[1],
-        ("💻 Running `cargo test`".to_string(), true),
+        ("-# 💻 Running `cargo test`".to_string(), true),
         "then an edit"
     );
 }
@@ -452,17 +456,18 @@ async fn gated_rows_are_kept_until_the_gap_passes() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], ("💻 Running".to_string(), false), "first post");
+    assert_eq!(log[0], ("-# 💻 Running".to_string(), false), "first post");
     assert_eq!(
         log[1],
-        ("💻 Running `cargo test`".to_string(), true),
+        ("-# 💻 Running `cargo test`".to_string(), true),
         "the command must follow, not stick bare"
     );
 }
 
 #[tokio::test]
-async fn final_flush_posts_no_card_by_default_and_next_turn_gets_a_new_bubble() {
-    // Hermes posts no tally card: the bubble itself stays as the record.
+async fn final_flush_settles_the_card_and_next_turn_gets_a_new_one() {
+    // No separate tally card: the turn's own card settles (green, done
+    // footer) and stays as the record.
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
@@ -489,10 +494,11 @@ async fn final_flush_posts_no_card_by_default_and_next_turn_gets_a_new_bubble() 
     assert_eq!(
         log,
         vec![
-            ("💻 Running `cargo test`".to_string(), false),
-            ("💻 Running `pwd`".to_string(), false),
+            ("-# 💻 Running `cargo test`".to_string(), false),
+            ("-# 💻 Running `cargo test`".to_string(), true),
+            ("-# 💻 Running `pwd`".to_string(), false),
         ],
-        "one bubble per turn and no card"
+        "post, settle in place, then a fresh card for the next turn"
     );
 }
 
@@ -526,17 +532,21 @@ async fn the_opt_in_card_still_follows_the_bubble() {
     rt.report_activity_for("42", "chat:one", false).await;
 
     let log = seen.lock().unwrap().clone();
-    assert_eq!(log.len(), 3, "{log:?}");
-    assert!(log[0].0.starts_with("💻 Ran `ls`"), "first post: {log:?}");
-    assert!(log[1].0.starts_with("⋯ "), "card: {log:?}");
+    assert_eq!(log.len(), 4, "{log:?}");
     assert!(
-        !log[1].0.contains("one\ntwo"),
+        log[0].0.starts_with("-# 💻 Ran `ls`"),
+        "first post: {log:?}"
+    );
+    assert!(log[1].1, "the turn's card settles in place: {log:?}");
+    assert!(log[2].0.starts_with("⋯ "), "tally card: {log:?}");
+    assert!(
+        !log[2].0.contains("one\ntwo"),
         "tool output leaked: {log:?}"
     );
     assert_eq!(
-        log[2],
-        ("💻 Running `pwd`".to_string(), false),
-        "new turn bubble"
+        log[3],
+        ("-# 💻 Running `pwd`".to_string(), false),
+        "new turn card"
     );
 }
 
@@ -563,8 +573,16 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
     rt.report_activity_for("42", "chat:rest", false).await;
     rt.report_activity_for("42", "chat:rest", true).await;
 
-    let sent = stub.sent.lock().unwrap().clone();
-    assert_eq!(sent.len(), 2, "expected live bubble plus card");
+    let sent: Vec<common::Sent> = stub
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sent| sent.method == "POST")
+        .cloned()
+        .collect();
+    assert_eq!(sent.len(), 2, "expected the turn card plus the tally card");
+    assert_eq!(sent[0].body["components"][0]["type"], 17, "a V2 Container");
     let card = component_text(&sent[1].body["components"]);
     assert!(card.contains("gray · done"), "{card}");
     assert!(card.contains("💻 Ran `printf hi`"), "{card}");
@@ -592,18 +610,19 @@ async fn off_activity_narrates_nothing() {
 }
 
 #[tokio::test]
-async fn an_unchanged_bubble_is_not_reposted() {
+async fn an_unchanged_card_is_not_reposted() {
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
     let rt = narrated!(json!({}), sink, seen, clock);
 
+    activity::push(
+        &sink,
+        json!({"phase": "tool_ran", "tool": "bash", "detail": "ls"}),
+    );
     for _ in 0..3 {
-        activity::push(
-            &sink,
-            json!({"phase": "tool_ran", "tool": "bash", "detail": "ls"}),
-        );
-        *clock.lock().unwrap() += 10.0;
+        // Past the edit gap, short of the footer clock's next step.
+        *clock.lock().unwrap() += 2.0;
         rt.report_activity("42").await;
     }
     assert_eq!(seen.lock().unwrap().len(), 1, "a quiet turn sends nothing");

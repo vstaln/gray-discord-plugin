@@ -540,6 +540,39 @@ async fn update_original_or_answer(ctx: &Ctx<'_>, embed: &Value) {
     }
 }
 
+/// The live card's Stop button: `turn:stop:<opaque-token>`. Any admitted
+/// user in the turn's channel may press it once. The press only flags the
+/// turn; the worker settles the card as stopped on its next frame, so the
+/// interaction itself is acknowledged without changing the message.
+pub async fn stop_button(ctx: &Ctx<'_>, custom_id: &str) {
+    let token = custom_id.strip_prefix("turn:stop:").unwrap_or("");
+    let stopped =
+        match ctx
+            .store
+            .component_state_take(token, ctx.user_id, ctx.channel_id, "turn_stop")
+        {
+            Ok(Some(turn)) => ctx.store.cancel(&turn).is_ok(),
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("[discord] stop state failed: {e}");
+                false
+            }
+        };
+    if stopped {
+        if let Err(e) = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await {
+            eprintln!("[discord] stop acknowledgement failed: {e}");
+        }
+        return;
+    }
+    answer(
+        ctx,
+        &commands::embed("Stop", "That turn already finished.", &[]),
+        &[],
+        false,
+    )
+    .await;
+}
+
 /// A pressed button: `cron:remove:<opaque-token>`. The token is
 /// consumed atomically and is valid only for the original user/channel.
 pub async fn button(ctx: &Ctx<'_>, custom_id: &str) {

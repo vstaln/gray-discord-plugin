@@ -281,34 +281,39 @@ Reload by restarting the service (`gray discord restart`).
 
 ## Live replies and activity narration
 
-Replies stream the way Hermes' Discord gateway shows them. The turn is laid
-out as an ordered run of plain Components V2 messages, with no embed-style
-cards:
-
-- the answer is posted as soon as the model starts writing and edited in
-  place about once a second, with a ` ▉` cursor until it is done;
-- each run of prose between tool calls is its own message, so "Let me
-  check…" stays above the work it introduced;
-- tool lines collect in one plain bubble below the prose before them, and
-  the next prose starts a new message below that bubble;
-- a long answer seals full messages (closing and reopening code fences at
-  the cut) and continues in the next one, up to 8 messages.
+Each turn is one live Components V2 card, edited in place while the agent
+works:
 
 ````markdown
-Let me check the failing test.
-
-💻 Ran `cargo test -p gray` (4.1s)
-✍️ edit `src/print.rs`
-
-Fixed: the parser dropped the last row. All 29 tests pass now.
+┃ Let me check what's running on the box.
+┃ -# 💻 Ran `gray ps` (0.3s)
+┃ **Done / idle:** claude-sub plugin agent: done. PR #173 is ▉
+┃ ───────────────────────────────────────────────
+┃ -# ⏳ working · 20s · ran 1 command          [⏹️ Stop]
 ````
 
-The final edit is the authoritative answer, recorded as delivered in the
-durable outbox, so a restart never posts it twice. `MEDIA:` tags are hidden
-from the preview and their files are uploaded after the prose. If the
-answer cannot land in place (the message was deleted, an edit was refused),
-the preview is retracted and the answer is posted durably instead. Slash
-command turns answer through their interaction and do not stream.
+- The card is posted as soon as there is something to show. The answer then
+  streams into it about once a second with a ` ▉` cursor.
+- Prose and tool lines keep their order: each run of prose, then the tool
+  lines it led to (small grey subtext), then the next prose.
+- The footer shows status, time and a tally. Its clock moves in 10-second
+  steps, so an idle turn costs one edit per step.
+- **Stop** (danger button) stops the turn, like `/stop`. Any admitted user
+  in the channel can press it once.
+- The accent bar tracks the turn: blurple while working, green when done
+  (`✅ done in 7.2s · ran 1 command`), red on failure, grey when stopped
+  (`⏹️ stopped after 12s · actions may already have happened`). A failed or
+  stopped card is the turn's notice, so nothing extra is posted.
+- A long turn continues in further cards (Discord allows 40 components and
+  4000 characters per message), cut at a newline, with code fences closed
+  and reopened at the cut, up to 8 cards. Only the last card has the footer.
+
+The final edit is the authoritative answer, recorded in the durable outbox
+as delivered, so a restart never posts it twice. `MEDIA:` tags are hidden
+from the preview and their files are uploaded after the card. If the answer
+cannot land in place (a refused post, a deleted card), the preview is
+retracted and the answer is posted durably instead. Slash command turns
+answer through their interaction; their card shows tool lines only.
 
 Streaming needs a gray core that emits `text` rows (`GRAY_STREAM_TEXT=1`,
 set by the bridge). With an older gray the bridge falls back to posting the
@@ -321,7 +326,7 @@ whole answer at the end. Off in `config.json`:
 Tool lines show actions only: one line per meaningful call, never tool
 output. Shell introspection (`ls`, `cat`, …) stays unnarrated, and shell
 work reads the way gray's own transcript labels it (`Running` while it
-runs, `Ran` with its duration once it returns). The bubbles stay in the
+runs, `Ran` with its duration once it returns). The card stays in the
 channel as the turn's record.
 
 The rows come from gray core's `--json` progress stream (phase + tool +
@@ -333,7 +338,7 @@ never sent to Discord: the bridge always runs gray with
 shown half written), but secret-free paths stay verbatim so narration names
 the actual file.
 
-Tool lines off (the reply still streams):
+Tool lines off (the reply still streams into its card):
 
 ```json
 {"activity_indicator": false}

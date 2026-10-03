@@ -555,12 +555,36 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
 /// Hermes' post-turn accounting line: `⋯ 12.4s · edited 2 files · read 4
 /// files · ran 3 commands`. Counted from the same rows, so it is free.
 fn tally(entries: &[CardEntry], turn_ms: Option<u64>) -> String {
+    let parts = counts(entries.iter().map(|entry| entry.tool.as_str()));
+    if parts.is_empty() {
+        return String::new();
+    }
+    let head = match turn_ms {
+        Some(ms) => format!("⋯ {}", secs(ms)),
+        None => "⋯".to_string(),
+    };
+    format!("{head} · {}", parts.join(" · "))
+}
+
+/// The same accounting for a live footer: `ran 2 commands · edited 1 file`,
+/// one count per call that reported its arguments. Empty for a turn that
+/// has not touched a tool.
+pub fn summary(rows: &[Value]) -> String {
+    counts(
+        rows.iter()
+            .filter(|row| row.get("phase").and_then(Value::as_str) == Some("tool_ran"))
+            .map(|row| row.get("tool").and_then(Value::as_str).unwrap_or("")),
+    )
+    .join(" · ")
+}
+
+fn counts<'a>(tools: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut ran = 0usize;
     let mut read = 0usize;
     let mut edited = 0usize;
     let mut other = 0usize;
-    for entry in entries {
-        match entry.tool.as_str() {
+    for tool in tools {
+        match tool {
             "bash" | "shell" => ran += 1,
             "read" | "cat" | "find" | "grep" | "glob" | "ls" => read += 1,
             "write" | "create" | "str_replace" | "edit" | "apply_patch" => edited += 1,
@@ -581,14 +605,7 @@ fn tally(entries: &[CardEntry], turn_ms: Option<u64>) -> String {
     if other > 0 {
         parts.push(format!("called {other} tool{}", plural(other)));
     }
-    if parts.is_empty() {
-        return String::new();
-    }
-    let head = match turn_ms {
-        Some(ms) => format!("⋯ {}", secs(ms)),
-        None => "⋯".to_string(),
-    };
-    format!("{head} · {}", parts.join(" · "))
+    parts
 }
 
 fn plural(n: usize) -> &'static str {

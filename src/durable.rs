@@ -516,6 +516,17 @@ impl Store {
     }
 
     pub fn fail(&self, id: &str, code: &str) -> Result<(), String> {
+        self.fail_with(id, code, None)
+    }
+
+    /// [`Self::fail`] for a turn whose live card already shows the failure
+    /// (message `shown`): the notice is recorded as delivered there instead
+    /// of being posted a second time.
+    pub fn fail_shown(&self, id: &str, code: &str, shown: &str) -> Result<(), String> {
+        self.fail_with(id, code, Some(shown))
+    }
+
+    fn fail_with(&self, id: &str, code: &str, shown: Option<&str>) -> Result<(), String> {
         let code = match code {
             "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,
             _ => "agent_failed",
@@ -529,8 +540,8 @@ impl Store {
             )
             .map_err(|_| "cannot fail".to_string())?;
             db.execute(
-                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,0,?2,'v2',NULL,NULL)",
-                params![id, notice],
+                "INSERT OR IGNORE INTO outbox(id,part,content,render,document_json,document_version,message_id) VALUES(?1,0,?2,'v2',NULL,NULL,?3)",
+                params![id, notice, shown],
             )
             .map_err(|_| "cannot fail".to_string())?;
             Ok(())
@@ -736,9 +747,11 @@ impl Store {
             let Some((stored_kind, stored_user, stored_channel, resource, expires)) = row else {
                 return Ok(None);
             };
+            // `*` binds a token to its channel alone: any admitted user
+            // there may press it (a turn's Stop button).
             let valid = expires >= now
                 && stored_kind == kind
-                && stored_user == user_id
+                && (stored_user == user_id || stored_user == "*")
                 && stored_channel == channel_id;
             if valid {
                 db.execute(

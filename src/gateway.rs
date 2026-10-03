@@ -189,6 +189,15 @@ fn activity_key(channel: &str, conversation: &str) -> String {
     format!("{channel}\u{0}{conversation}")
 }
 
+/// How a turn's card settled.
+#[derive(Debug, Default)]
+pub struct Settled {
+    /// The answer streamed into the card and is on screen as rendered.
+    pub landed: Option<crate::stream::Landed>,
+    /// The card whose footer shows how the turn ended, when it is on screen.
+    pub status_card: Option<String>,
+}
+
 /// Discord (or the renderer) refused the request outright: retrying the
 /// same payload cannot succeed. Rate limits, 5xx and network errors can.
 fn refused(error: &TransportError) -> bool {
@@ -363,26 +372,43 @@ impl<R, D> Runtime<R, D> {
         self.report_activity_for(channel, "", false).await
     }
 
-    /// Start a fresh timeline and row history for one turn. Prose streams
+    /// Start a fresh card and row history for one turn. Prose streams
     /// only when `text` is set: a slash-command turn answers through its
-    /// interaction, so only its tool bubble runs in the channel.
+    /// interaction, so its card carries tool lines only.
     pub async fn begin_activity(&self, channel: &str, conversation: &str) {
-        self.begin_turn(channel, conversation, crate::stream::enabled(&self.config))
-            .await
+        self.begin_turn(
+            channel,
+            conversation,
+            crate::stream::enabled(&self.config),
+            None,
+        )
+        .await
     }
 
-    pub async fn begin_turn(&self, channel: &str, conversation: &str, text: bool) {
+    /// `stop` is the footer's Stop button `custom_id`, when one was minted.
+    pub async fn begin_turn(
+        &self,
+        channel: &str,
+        conversation: &str,
+        text: bool,
+        stop: Option<String>,
+    ) {
         if let Some(ref sink) = self.activity {
             crate::activity::begin(sink, conversation);
         }
-        self.timelines.lock().await.insert(
-            activity_key(channel, conversation),
-            crate::stream::Timeline::new(text),
-        );
+        let mut timeline = crate::stream::Timeline::new(text, self.now_secs());
+        if let Some(stop) = stop {
+            timeline = timeline.with_stop(stop);
+        }
+        self.timelines
+            .lock()
+            .await
+            .insert(activity_key(channel, conversation), timeline);
     }
 
-    /// `force` settles the turn: every pending edit goes out regardless of
-    /// the edit gap, cursors come off, and the timeline is retired.
+    /// `force` settles the turn as done: every pending edit goes out
+    /// regardless of the edit gap, the cursor comes off, and the timeline is
+    /// retired.
     pub async fn report_activity_at(&self, channel: &str, force: bool) {
         self.report_activity_for(channel, "", force).await
     }
@@ -392,32 +418,38 @@ impl<R, D> Runtime<R, D> {
     /// let a fast turn drain or finalize another turn's terminal output.
     pub async fn report_activity_for(&self, channel: &str, conversation: &str, force: bool) {
         if force {
-            self.finish_turn(channel, conversation, None).await;
+            self.finish_turn(channel, conversation, None, crate::stream::Status::Done)
+                .await;
         } else {
             self.absorb_rows(channel, conversation).await;
             self.publish_timeline(channel, conversation, false).await;
         }
     }
 
-    /// Settle the turn. With `answer` (prose, `MEDIA:` tags already taken
-    /// out) the streamed reply becomes that answer in place; the result says
-    /// where it landed, or `None` when the caller must post it durably.
+    /// Settle the turn's card with `status`. With `answer` (prose, `MEDIA:`
+    /// tags already taken out) the streamed reply becomes that answer in
+    /// place; `landed` says where it landed, or is `None` when the caller
+    /// must post it durably.
     pub async fn finish_turn(
         &self,
         channel: &str,
         conversation: &str,
         answer: Option<&str>,
-    ) -> Option<crate::stream::Landed> {
+        status: crate::stream::Status,
+    ) -> Settled {
         self.absorb_rows(channel, conversation).await;
         let key = activity_key(channel, conversation);
-        let adopted = match answer {
-            Some(answer) => self
-                .timelines
-                .lock()
-                .await
-                .get_mut(&key)
-                .is_some_and(|timeline| timeline.adopt(answer)),
-            None => false,
+        let now = self.now_secs();
+        let adopted = {
+            let mut timelines = self.timelines.lock().await;
+            match timelines.get_mut(&key) {
+                Some(timeline) => {
+                    let adopted = answer.is_some_and(|answer| timeline.adopt(answer));
+                    timeline.settle(status, now);
+                    adopted
+                }
+                None => false,
+            }
         };
         self.publish_timeline(channel, conversation, true).await;
         let timeline = self.timelines.lock().await.remove(&key);
@@ -430,21 +462,28 @@ impl<R, D> Runtime<R, D> {
                 }
             }
         }
+        let Some(timeline) = timeline else {
+            return Settled::default();
+        };
+        let mut settled = Settled {
+            landed: None,
+            status_card: timeline.status_card(now),
+        };
         if !adopted {
-            return None;
+            return settled;
         }
-        let timeline = timeline?;
-        if let Some(landed) = timeline.landed() {
-            return Some(landed);
-        }
-        // The answer did not fully land. Retract its preview so the durable
-        // resend below does not leave the same words on screen twice.
-        if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
-            for id in timeline.stale_answer() {
-                let _ = rest.delete_message(ch, &id).await;
+        settled.landed = timeline.landed(now);
+        if settled.landed.is_none() {
+            // The answer did not fully land. Retract its preview so the
+            // durable resend does not leave the same words on screen twice.
+            if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
+                for id in timeline.posted_ids() {
+                    let _ = rest.delete_message(ch, &id).await;
+                }
             }
+            settled.status_card = None;
         }
-        None
+        settled
     }
 
     /// Move the rows the runner has read into this turn's timeline.
@@ -455,10 +494,11 @@ impl<R, D> Runtime<R, D> {
         let rows = crate::activity::drain_for(&sink, conversation);
         let narrate = crate::activity::enabled(&self.config);
         let key = activity_key(channel, conversation);
+        let now = self.now_secs();
         let mut timelines = self.timelines.lock().await;
         let timeline = timelines
             .entry(key)
-            .or_insert_with(|| crate::stream::Timeline::new(false));
+            .or_insert_with(|| crate::stream::Timeline::new(false, now));
         for row in rows {
             // Narration off hides tool lines, never the reply.
             if !narrate && row.get("phase").and_then(Value::as_str) != Some("text") {
@@ -481,47 +521,36 @@ impl<R, D> Runtime<R, D> {
         };
         for op in ops {
             match op {
-                crate::stream::Op::Post { block, chunk, body } => {
+                crate::stream::Op::Post { card, body } => {
                     let sent = match self.rest {
-                        Some(ref rest) => match crate::render::text_message(&body) {
-                            Ok(components) => rest.send_v2(ch, &components, None).await,
-                            Err(error) => Err(TransportError::Invalid(error)),
-                        },
+                        Some(ref rest) => rest.send_v2(ch, &body.components, None).await,
                         // No REST (tests, dry runs): still narrate via the hook.
-                        None => Ok(format!("hook-{block}-{chunk}")),
+                        None => Ok(format!("hook-{card}")),
                     };
                     let mut timelines = self.timelines.lock().await;
                     let Some(timeline) = timelines.get_mut(&key) else {
                         return;
                     };
                     match sent {
-                        Ok(id) => timeline.posted(block, chunk, &id, &body, now),
+                        Ok(id) => timeline.posted(card, &id, &body, now),
                         Err(error) => {
-                            // Posts keep channel order, so nothing after this
+                            // Cards keep channel order, so nothing after this
                             // one goes out this frame. A refused post gives
-                            // the block up; a blip is retried next frame.
+                            // the turn up; a blip is retried next frame.
                             if refused(&error) {
-                                timeline.lose(block);
+                                timeline.lose();
                             }
                             return;
                         }
                     }
                     drop(timelines);
                     if let Some(ref hook) = self.activity_hook {
-                        hook(&body, false);
+                        hook(&body.text, false);
                     }
                 }
-                crate::stream::Op::Edit {
-                    block,
-                    chunk,
-                    id,
-                    body,
-                } => {
+                crate::stream::Op::Edit { card, id, body } => {
                     let outcome = match self.rest {
-                        Some(ref rest) => match crate::render::text_message(&body) {
-                            Ok(components) => rest.edit_v2(ch, &id, &components).await,
-                            Err(error) => Err(TransportError::Invalid(error)),
-                        },
+                        Some(ref rest) => rest.edit_v2(ch, &id, &body.components).await,
                         None => Ok(()),
                     };
                     let mut timelines = self.timelines.lock().await;
@@ -529,23 +558,23 @@ impl<R, D> Runtime<R, D> {
                         return;
                     };
                     match outcome {
-                        Ok(()) => timeline.edited(block, chunk, &body, now),
+                        Ok(()) => timeline.edited(card, &body, now),
                         // Deleted, forbidden or unrenderable: stop editing
                         // it. A blip is retried on the next frame.
-                        Err(error) if refused(&error) => timeline.lose(block),
+                        Err(error) if refused(&error) => timeline.lose(),
                         Err(_) => continue,
                     }
                     drop(timelines);
                     if let Some(ref hook) = self.activity_hook {
-                        hook(&body, true);
+                        hook(&body.text, true);
                     }
                 }
-                crate::stream::Op::Delete { block, chunk, id } => {
+                crate::stream::Op::Delete { card, id } => {
                     if let Some(ref rest) = self.rest {
                         let _ = rest.delete_message(ch, &id).await;
                     }
                     if let Some(timeline) = self.timelines.lock().await.get_mut(&key) {
-                        timeline.deleted(block, chunk);
+                        timeline.deleted(card);
                     }
                 }
             }
@@ -630,7 +659,20 @@ where
         // command's answer belongs to its interaction, so only ordinary
         // turns stream their prose into the channel.
         let stream_text = crate::stream::enabled(&self.config) && item.interaction_token.is_none();
-        self.begin_turn(&item.channel, &item.conversation, stream_text)
+        // The card's Stop button: an opaque token bound to this channel and
+        // turn, good for as long as the turn may run.
+        let ttl = self
+            .config
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .saturating_add(120);
+        let stop = self
+            .store
+            .component_state_create("turn_stop", "*", &item.channel, &item.id, ttl)
+            .ok()
+            .map(|token| format!("turn:stop:{token}"));
+        self.begin_turn(&item.channel, &item.conversation, stream_text, stop)
             .await;
         // Bind this conversation's cron jobs to this channel. The chat id
         // is the live session when we have one (so a cron reply continues
@@ -665,8 +707,15 @@ where
                     self.report_activity_for(&item.channel, &item.conversation, false).await;
                     if let Ok(Some(cur)) = self.store.get(&item.id) {
                         if cur.cancel {
-                            self.report_activity_for(&item.channel, &item.conversation, true).await;
-                            self.store.fail(&item.id, "cancelled")?;
+                            let settled = self
+                                .finish_turn(
+                                    &item.channel,
+                                    &item.conversation,
+                                    None,
+                                    crate::stream::Status::Stopped,
+                                )
+                                .await;
+                            self.fail_turn(&item.id, "cancelled", &settled)?;
                             self.remove_reaction(&item.channel, &item.id, "👀").await;
                             self.add_reaction(&item.channel, &item.id, "❌").await;
                             return Ok(true);
@@ -687,13 +736,21 @@ where
             }
             _ => (None, Vec::new()),
         };
-        let landed = self
-            .finish_turn(&item.channel, &item.conversation, prose.as_deref())
+        let status = match &result {
+            Some(Ok(_)) | None => crate::stream::Status::Done,
+            Some(Err(RunError::Budget(_))) => {
+                crate::stream::Status::Failed("hit the budget".to_string())
+            }
+            Some(Err(RunError::Timeout)) => crate::stream::Status::Failed("timed out".to_string()),
+            Some(Err(_)) => crate::stream::Status::Failed("failed".to_string()),
+        };
+        let settled = self
+            .finish_turn(&item.channel, &item.conversation, prose.as_deref(), status)
             .await;
         match result {
             Some(Ok(answer)) => {
                 let receipt = serde_json::json!({});
-                match landed {
+                match settled.landed {
                     Some(landed) if !landed.parts.is_empty() || !media.is_empty() => {
                         let media = (!media.is_empty()).then(|| {
                             media
@@ -717,23 +774,32 @@ where
                 }
             }
             Some(Err(RunError::Budget(_))) => {
-                self.store.fail(&item.id, "budget_blocked")?;
+                self.fail_turn(&item.id, "budget_blocked", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Some(Err(RunError::Timeout)) => {
-                self.store.fail(&item.id, "timeout")?;
+                self.fail_turn(&item.id, "timeout", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Some(Err(_)) => {
-                self.store.fail(&item.id, "agent_failed")?;
+                self.fail_turn(&item.id, "agent_failed", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             None => {}
         }
         Ok(true)
+    }
+
+    /// Record a failed turn. When its card's footer already says how it
+    /// ended, that card is the notice; otherwise the notice is posted.
+    fn fail_turn(&self, id: &str, code: &str, settled: &Settled) -> Result<(), String> {
+        match settled.status_card.as_deref() {
+            Some(card) => self.store.fail_shown(id, code, card),
+            None => self.store.fail(id, code),
+        }
     }
 
     pub async fn deliver_one(&self) -> Result<bool, String> {
@@ -1385,6 +1451,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             )
                         );
                         let is_autocomplete = interaction.kind == InteractionType::ApplicationCommandAutocomplete;
+                        // The live card's Stop button is plugin-owned, not a
+                        // typed agent component: handle it before that router.
+                        if let Some(twilight_model::application::interaction::InteractionData::MessageComponent(component)) = &interaction.data {
+                            if component.custom_id.starts_with("turn:stop:") {
+                                crate::command_dispatch::stop_button(&ctx, &component.custom_id).await;
+                                continue;
+                            }
+                        }
                         if is_component || is_autocomplete {
                             let raw = serde_json::to_value(interaction)
                                 .map_err(|_| "interaction could not be normalized".to_string())?;

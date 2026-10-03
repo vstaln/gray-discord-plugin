@@ -80,24 +80,63 @@ macro_rules! scripted {
     }};
 }
 
-/// Message posts and edits the stub saw, as (method, text).
-fn traffic(stub: &common::Stub) -> Vec<(String, String)> {
+/// One card request the stub saw.
+#[derive(Debug, Clone, PartialEq)]
+struct Frame {
+    method: String,
+    /// The card's Text Displays above the footer, joined by newlines.
+    body: String,
+    footer: String,
+    accent: u64,
+    stop: Option<String>,
+}
+
+/// Card posts and edits the stub saw, in order.
+fn traffic(stub: &common::Stub) -> Vec<Frame> {
     stub.sent
         .lock()
         .unwrap()
         .iter()
         .filter(|sent| sent.path.starts_with("/api/v10/channels/42/messages"))
+        .filter(|sent| sent.method != "DELETE")
         .map(|sent| {
-            (
-                sent.method.clone(),
-                component_text(&sent.body["components"]),
-            )
+            let card = &sent.body["components"][0];
+            assert_eq!(card["type"], 17, "every turn message is a V2 Container");
+            let children = card["components"].as_array().unwrap();
+            let footer = children.last().unwrap();
+            let (footer_text, stop) = match footer["type"].as_u64() {
+                Some(9) => (
+                    component_text(&footer["components"]),
+                    footer["accessory"]["custom_id"]
+                        .as_str()
+                        .map(str::to_string),
+                ),
+                _ => (component_text(footer), None),
+            };
+            let body = children
+                .iter()
+                .filter(|child| child["type"] == 10)
+                .take_while(|child| *child != footer)
+                .map(component_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            Frame {
+                method: sent.method.clone(),
+                body,
+                footer: footer_text,
+                accent: card["accent_color"].as_u64().unwrap_or(0),
+                stop,
+            }
         })
         .collect()
 }
 
+const WORKING: u64 = 0x5865F2;
+const DONE: u64 = 0x57F287;
+const STOPPED: u64 = 0x80848E;
+
 #[tokio::test]
-async fn a_reply_streams_in_place_and_lands_as_the_answer() {
+async fn a_reply_streams_into_one_card_and_lands_as_the_answer() {
     let stub = common::Stub::start().await;
     let script = vec![
         vec![text(0, "", "Hello", false)],
@@ -108,20 +147,32 @@ async fn a_reply_streams_in_place_and_lands_as_the_answer() {
     assert!(rt.generate_one().await.unwrap());
 
     let log = traffic(&stub);
-    assert_eq!(log[0], ("POST".into(), "Hello ▉".into()), "{log:?}");
+    assert_eq!(log[0].method, "POST");
+    assert_eq!(log[0].body, "Hello ▉", "{log:?}");
+    assert_eq!(log[0].footer, "-# ⏳ working");
+    assert_eq!(log[0].accent, WORKING);
     assert!(
-        log.contains(&("PATCH".into(), "Hello there,\nhow ▉".into())),
+        log[0]
+            .stop
+            .as_deref()
+            .is_some_and(|id| id.starts_with("turn:stop:")),
+        "a live card offers Stop: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|frame| frame.method == "PATCH" && frame.body == "Hello there,\nhow ▉"),
         "the preview grows in place: {log:?}"
     );
+    let last = log.last().unwrap();
+    assert_eq!(last.method, "PATCH");
+    assert_eq!(last.body, "Hello there,\nhow are you?", "cursor gone");
+    assert!(last.footer.starts_with("-# ✅ done in "), "{last:?}");
+    assert_eq!(last.accent, DONE);
+    assert_eq!(last.stop, None, "Stop goes away once the turn is over");
     assert_eq!(
-        log.last().unwrap(),
-        &("PATCH".into(), "Hello there,\nhow are you?".into()),
-        "the final edit is the answer, cursor gone: {log:?}"
-    );
-    assert_eq!(
-        log.iter().filter(|(method, _)| method == "POST").count(),
+        log.iter().filter(|frame| frame.method == "POST").count(),
         1,
-        "one message for the whole reply: {log:?}"
+        "one message for the whole turn: {log:?}"
     );
     let sent = stub.sent.lock().unwrap().clone();
     assert_eq!(sent[0].body["flags"], json!(32768), "Components V2");
@@ -135,7 +186,7 @@ async fn a_reply_streams_in_place_and_lands_as_the_answer() {
 }
 
 #[tokio::test]
-async fn prose_and_tool_bubbles_alternate_in_channel_order() {
+async fn prose_and_tool_lines_alternate_inside_the_card() {
     let stub = common::Stub::start().await;
     let script = vec![
         vec![
@@ -148,22 +199,89 @@ async fn prose_and_tool_bubbles_alternate_in_channel_order() {
     store.enqueue("m1", "42", "run it", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
-    let posts: Vec<String> = traffic(&stub)
-        .into_iter()
-        .filter(|(method, _)| method == "POST")
-        .map(|(_, body)| body)
-        .collect();
-    assert_eq!(posts.len(), 3, "{posts:?}");
-    assert_eq!(posts[0], "Let me check.");
-    assert!(posts[1].starts_with("💻 Running `cargo test`"), "{posts:?}");
-    assert_eq!(posts[2], "All ▉");
     let log = traffic(&stub);
-    assert_eq!(log.last().unwrap(), &("PATCH".into(), "All green.".into()));
+    assert_eq!(
+        log.iter().filter(|frame| frame.method == "POST").count(),
+        1,
+        "{log:?}"
+    );
+    let last = log.last().unwrap();
     assert!(
-        log.iter().all(|(_, body)| !body.contains("gray ·")),
-        "no embed-style cards: {log:?}"
+        last.body
+            .starts_with("Let me check.\n-# 💻 Ran `cargo test` ("),
+        "{last:?}"
+    );
+    assert!(last.body.ends_with(")\nAll green."), "{last:?}");
+    assert!(
+        last.footer.ends_with(" · ran 1 command"),
+        "the footer tallies the turn: {last:?}"
     );
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
+}
+
+#[tokio::test]
+async fn the_stop_button_stops_the_turn_and_the_card_says_so() {
+    let stub = common::Stub::start().await;
+    let script = vec![
+        vec![text(0, "", "Working on", false)],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    ];
+    let (rt, store) = scripted!(json!({}), stub, script, "never");
+    store.enqueue("m1", "42", "long job", None, 1000).unwrap();
+    let rest = Rest::new(&stub.base, "TESTTOKEN");
+    let config = json!({});
+    let config_path = std::path::PathBuf::from("/nonexistent/config.json");
+    let press = async {
+        let stop = loop {
+            if let Some(stop) = traffic(&stub).first().and_then(|frame| frame.stop.clone()) {
+                break stop;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let ctx = gray_discord::command_dispatch::Ctx {
+            user_id: "777",
+            channel_id: "42",
+            is_dm: true,
+            int_id: "5",
+            int_token: "press",
+            app_id: "999",
+            rest: &rest,
+            store: &store,
+            config: &config,
+            config_path: &config_path,
+        };
+        gray_discord::command_dispatch::stop_button(&ctx, &stop).await;
+    };
+    let (generated, ()) = tokio::join!(rt.generate_one(), press);
+    assert!(generated.unwrap());
+
+    let callback = stub
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|sent| sent.path.ends_with("/callback"))
+        .cloned()
+        .expect("the press is acknowledged");
+    assert_eq!(
+        callback.body["type"], 6,
+        "deferred update: the card changes itself"
+    );
+    let last = traffic(&stub).last().cloned().unwrap();
+    assert_eq!(last.accent, STOPPED);
+    assert_eq!(last.body, "Working on", "cursor gone");
+    assert!(last.footer.starts_with("-# ⏹️ stopped after "), "{last:?}");
+    assert!(last.footer.ends_with("actions may already have happened"));
+    assert_eq!(last.stop, None);
+    let item = store.get("m1").unwrap().unwrap();
+    assert_eq!(item.error.as_deref(), Some("cancelled"));
+    assert!(
+        store.next_delivery(f64::MAX).unwrap().is_none(),
+        "the card is the notice; nothing else is posted"
+    );
 }
 
 #[tokio::test]
@@ -174,6 +292,8 @@ async fn a_gray_without_text_rows_still_gets_one_durable_post() {
     store.enqueue("m1", "42", "hi", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
+    let last = traffic(&stub).last().cloned().unwrap();
+    assert_eq!(last.accent, DONE, "the tool card still settles");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
     assert_eq!(part.content, "answer");
@@ -220,19 +340,19 @@ async fn media_streams_as_prose_and_only_the_files_wait_in_the_outbox() {
     assert!(rt.generate_one().await.unwrap());
 
     let log = traffic(&stub);
-    assert_eq!(log.last().unwrap().1, "Here it is:", "{log:?}");
+    assert_eq!(log.last().unwrap().body, "Here it is:", "{log:?}");
     assert!(
-        log.iter().all(|(_, body)| !body.contains("MEDIA:")),
+        log.iter().all(|frame| !frame.body.contains("MEDIA:")),
         "{log:?}"
     );
     assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
-    assert_eq!(part.part, 1, "the prose part is already delivered");
+    assert_eq!(part.part, 1, "the card part is already delivered");
     assert_eq!(part.content, format!("MEDIA:{}", canonical.display()));
 }
 
 #[tokio::test]
-async fn a_refused_preview_falls_back_to_one_durable_post() {
+async fn a_refused_card_falls_back_to_one_durable_post() {
     let stub = common::Stub::start().await;
     *stub.fail_send.lock().unwrap() = true;
     let script = vec![
@@ -245,9 +365,9 @@ async fn a_refused_preview_falls_back_to_one_durable_post() {
 
     let posts = traffic(&stub)
         .into_iter()
-        .filter(|(method, _)| method == "POST")
+        .filter(|frame| frame.method == "POST")
         .count();
-    assert_eq!(posts, 1, "a refused preview is not retried every frame");
+    assert_eq!(posts, 1, "a refused card is not retried every frame");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "delivery");
     let part = store.next_delivery(f64::MAX).unwrap().unwrap();
     assert_eq!(
