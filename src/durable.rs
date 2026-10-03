@@ -148,7 +148,7 @@ CREATE TABLE IF NOT EXISTS asks (
 );
 ";
 
-/// One question card (`discord_ask`): what was asked, what has been
+/// One question card (a plugin's `host/ask`): what was asked, what has been
 /// answered so far (question id -> answers), and whether it is still open.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskRow {

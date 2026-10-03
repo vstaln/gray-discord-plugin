@@ -648,7 +648,7 @@ pub async fn new_chat_button(ctx: &Ctx<'_>, custom_id: &str) {
     answer(ctx, &commands::embed("New chat", text, &[]), &[], false).await;
 }
 
-/// A press on a question card (`discord_ask`): an option button, the
+/// A press on a question card (a plugin's `host/ask`): an option button, the
 /// select menu, "Other…" (opens the text box), or the submitted text box
 /// (`typed`). The answer is recorded and the card redrawn in the same
 /// response; the asking sidecar picks it up from the store.

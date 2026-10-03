@@ -1,9 +1,10 @@
-//! Questions the agent asks the person on Discord (`discord_ask`).
+//! Questions on Discord: the bridge's surface for gray's `host/ask`.
 //!
-//! gray's own `host/ask` has no human on the other end in `-p` mode, so the
-//! Discord sidecar offers a tool instead: it posts a question card in the
-//! turn's channel and waits for the answer. The card is Components V2 and
-//! plain text:
+//! gray has no question tool of its own. When a questions plugin (such as
+//! gray-questions' `request_user_input`) asks through `host/ask`, gray in
+//! `--json` mode with `GRAY_JSON_ASK=1` hands the question to the bridge as
+//! an `ask` row and waits for the answer on stdin. The bridge posts a
+//! question card in the turn's channel, plain text, Components V2:
 //!
 //! ```text
 //! ┃ -# Question from gray
@@ -17,8 +18,8 @@
 //! menu. "Other…" (or "Answer…" when there are no options) opens a modal
 //! with a text box. A plain message in the channel answers every open
 //! question too. The gateway records presses in the store and redraws the
-//! card in the same interaction response; the sidecar polls the store and
-//! hands the answers back to the agent.
+//! card in the same interaction response; the runner's ask task polls the
+//! store and writes the answers back to gray.
 //!
 //! Button `custom_id`s are `ask:<ask id>:<question>:<choice>`. The ask id is
 //! 64 random bits; a press is honored only on an open card, in its own
@@ -27,8 +28,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// How long a card waits for an answer. Under gray's 300-second ask budget
-/// for a protocol-1.1 sidecar tool, so the tool reports its own timeout.
+/// How long a card waits for an answer: under gray's 300-second ask budget,
+/// so the card closes (and says so) before gray gives up on its own.
 pub const ASK_SECS: u64 = 280;
 const MAX_QUESTIONS: usize = 3;
 const MAX_OPTIONS: usize = 25;
@@ -59,45 +60,33 @@ pub struct Question {
     pub multiple: bool,
 }
 
-/// Validate the tool's `questions` argument (gray-questions' shape).
-pub fn parse(args: &Value) -> Result<Vec<Question>, String> {
-    let questions: Vec<Question> = serde_json::from_value(
-        args.get("questions")
-            .cloned()
-            .ok_or("questions is required")?,
-    )
-    .map_err(|e| format!("questions is malformed: {e}"))?;
-    if questions.is_empty() || questions.len() > MAX_QUESTIONS {
-        return Err(format!("ask 1-{MAX_QUESTIONS} questions"));
-    }
-    let mut seen = Vec::new();
-    for q in &questions {
-        if q.id.trim().is_empty() || q.id.len() > 40 || q.id.contains(':') {
-            return Err("each question needs an id of 1-40 characters, no ':'".into());
-        }
-        if seen.contains(&&q.id) {
-            return Err(format!("question id {} is used twice", q.id));
-        }
-        seen.push(&q.id);
-        if q.question.trim().is_empty() || q.question.chars().count() > 1000 {
-            return Err("each question needs text of 1-1000 characters".into());
-        }
-        if q.header.chars().count() > 45 {
-            return Err("a header is at most 45 characters".into());
-        }
-        if q.options.len() > MAX_OPTIONS {
-            return Err(format!("at most {MAX_OPTIONS} options per question"));
-        }
-        for option in &q.options {
-            if option.label.trim().is_empty() || option.label.chars().count() > 80 {
-                return Err("each option label is 1-80 characters".into());
-            }
-            if option.description.chars().count() > 100 {
-                return Err("an option description is at most 100 characters".into());
-            }
-        }
-    }
-    Ok(questions)
+/// The questions in an `ask` row, fitted to Discord's limits: at most 3
+/// questions and 25 options, labels and texts shortened rather than
+/// refused (the asking plugin already validated them), ids kept as sent.
+pub fn from_host(questions: &Value) -> Vec<Question> {
+    let parsed: Vec<Question> = serde_json::from_value(questions.clone()).unwrap_or_default();
+    let cut = |text: &str, max: usize| -> String { text.trim().chars().take(max).collect() };
+    parsed
+        .into_iter()
+        .filter(|q| !q.id.is_empty() && !q.question.trim().is_empty())
+        .take(MAX_QUESTIONS)
+        .map(|q| Question {
+            id: q.id,
+            header: cut(&q.header, 45),
+            question: cut(&q.question, 1000),
+            options: q
+                .options
+                .into_iter()
+                .filter(|option| !option.label.trim().is_empty())
+                .take(MAX_OPTIONS)
+                .map(|option| AskOption {
+                    label: cut(&option.label, 80),
+                    description: cut(&option.description, 100),
+                })
+                .collect(),
+            multiple: q.multiple,
+        })
+        .collect()
 }
 
 /// A press on a question card, from its `custom_id`.
@@ -309,33 +298,11 @@ pub fn note_modal(row: &crate::durable::AskRow, question: usize) -> Option<Value
     }))
 }
 
-/// The tool result for the agent: who answered what, in one JSON object
-/// keyed by question id (gray-questions' `answers` shape).
-pub fn result_text(row: &crate::durable::AskRow) -> String {
-    let answers: serde_json::Map<String, Value> = row
-        .answers
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(id, answers)| (id.clone(), json!({"answers": answers})))
-                .collect()
-        })
-        .unwrap_or_default();
-    let json = json!({"answers": answers});
-    match row.state.as_str() {
-        "answered" => format!("The person answered on Discord.\n{json}"),
-        "expired" => format!(
-            "No answer within {} minutes. Use your best judgement and say what you assumed.\n{json}",
-            ASK_SECS / 60
-        ),
-        _ => format!("The question was closed before an answer.\n{json}"),
-    }
-}
-
 /// Post the card in `channel` and wait for the answer: until every
 /// question has one, `wait` runs out (the card closes as expired), or the
-/// gray process that called us is gone (closed as cancelled). Returns the
-/// tool result for the agent.
+/// turn is over (`turn_over`, closed as cancelled). Returns what gray's
+/// `--json` ask wants back: answers by question id, `{"<id>": ["<label>"]}`
+/// (typed answers start with `user_note: `); empty when nobody answered.
 pub async fn ask(
     rest: &crate::transport::Rest,
     store: &crate::durable::Store,
@@ -343,26 +310,29 @@ pub async fn ask(
     questions: &[Question],
     wait: std::time::Duration,
     poll: std::time::Duration,
+    turn_over: &std::sync::atomic::AtomicBool,
 ) -> Value {
+    if questions.is_empty() {
+        return json!({});
+    }
     let ask_id = crate::durable::uuid_hex()[..16].to_string();
     let expires = crate::durable::now_secs() + wait.as_secs_f64();
-    let encoded = json!(questions);
     let row = match store
-        .ask_create(&ask_id, &channel.to_string(), &encoded, expires)
+        .ask_create(&ask_id, &channel.to_string(), &json!(questions), expires)
         .and_then(|()| store.ask_get(&ask_id))
     {
         Ok(Some(row)) => row,
-        _ => return failed("the question could not be stored"),
+        _ => return json!({}),
     };
     let message = match rest.send_v2(channel, &render(&row), None).await {
         Ok(id) => id,
         Err(error) => {
+            eprintln!("[discord] question card refused: {error}");
             let _ = store.ask_close(&ask_id, "cancelled");
-            return failed(&format!("Discord refused the question card: {error}"));
+            return json!({});
         }
     };
     let _ = store.ask_set_message(&ask_id, &message);
-    let parent = parent_pid();
     let deadline = tokio::time::Instant::now() + wait;
     let row = loop {
         tokio::time::sleep(poll).await;
@@ -370,10 +340,10 @@ pub async fn ask(
         if let Some(row) = current.as_ref().filter(|row| row.state != "open") {
             break row.clone();
         }
-        let closing = if tokio::time::Instant::now() >= deadline {
-            Some("expired")
-        } else if parent_pid() != parent {
+        let closing = if turn_over.load(std::sync::atomic::Ordering::Relaxed) {
             Some("cancelled")
+        } else if tokio::time::Instant::now() >= deadline {
+            Some("expired")
         } else {
             None
         };
@@ -386,19 +356,12 @@ pub async fn ask(
                 // Answered in the same instant: take the answer.
                 _ => match store.ask_get(&ask_id).ok().flatten() {
                     Some(row) => break row,
-                    None => return failed("the question disappeared"),
+                    None => return json!({}),
                 },
             }
         }
     };
-    json!({"content": result_text(&row)})
-}
-
-fn failed(detail: &str) -> Value {
-    json!({
-        "content": format!("Not asked: {detail}. Nothing is waiting on Discord; continue on your own judgement."),
-        "is_error": true
-    })
+    row.answers
 }
 
 /// A plain message in a channel with an open card answers every question
@@ -436,21 +399,6 @@ pub async fn answer_typed(
         let _ = rest.edit_v2(ch, message, &render(&updated)).await;
     }
     true
-}
-
-/// The sidecar's parent. When the gray process that spawned it exits (the
-/// turn was stopped or timed out) the sidecar is reparented, to init or a
-/// subreaper such as systemd's user manager: nobody waits for the answer.
-fn parent_pid() -> i64 {
-    #[cfg(unix)]
-    {
-        // SAFETY: getppid has no preconditions.
-        i64::from(unsafe { libc::getppid() })
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
 }
 
 #[cfg(test)]
@@ -552,18 +500,19 @@ mod tests {
     }
 
     #[test]
-    fn bad_questions_are_refused_before_anything_is_sent() {
-        assert!(parse(&json!({"questions": []})).is_err());
-        assert!(parse(&json!({"questions": [{"id": "a:b", "question": "x"}]})).is_err());
-        let dup =
-            json!({"questions": [{"id": "a", "question": "x"}, {"id": "a", "question": "y"}]});
-        assert!(parse(&dup).is_err());
-        assert!(parse(&json!({"questions": [{"id": "a", "question": "x"}]})).is_ok());
-    }
-
-    #[test]
-    fn the_result_carries_answers_by_question_id() {
-        let text = result_text(&row(branch(), json!({"branch": ["main"]}), "answered"));
-        assert!(text.contains("{\"answers\":{\"branch\":{\"answers\":[\"main\"]}}}"));
+    fn host_questions_are_fitted_to_discord_not_refused() {
+        let long = "x".repeat(200);
+        let qs = from_host(&json!([
+            {"id": "a", "header": long, "question": "Pick", "is_other": true,
+             "options": [{"label": long, "description": long}]},
+            {"id": "", "question": "dropped: no id"},
+            {"id": "b", "question": "two"}, {"id": "c", "question": "three"},
+            {"id": "d", "question": "a fourth is one too many"}
+        ]));
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0].header.chars().count(), 45);
+        assert_eq!(qs[0].options[0].label.chars().count(), 80);
+        assert_eq!(qs[0].options[0].description.chars().count(), 100);
+        assert!(from_host(&json!("garbage")).is_empty());
     }
 }

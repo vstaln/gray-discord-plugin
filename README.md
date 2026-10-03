@@ -366,9 +366,20 @@ restarting the service (`gray discord restart`).
 
 ## Questions from the agent
 
-gray's own `host/ask` has nobody to ask in the bridge's headless turns, so
-the Discord sidecar gives the agent a `discord_ask` tool ("Discord Ask"):
-it posts a question card in the turn's channel and waits for the answer.
+The bridge has no question tool of its own, and neither does gray. Questions
+come from a questions plugin, such as
+[gray-questions](https://github.com/vstaln/gray-questions)
+(`request_user_input`, shown as "Request User Input"). Without one, nothing
+ever asks. With one, its questions reach Discord: the bridge runs gray with
+`GRAY_JSON_ASK=1`, gray hands each `host/ask` over as an `ask` row on the
+`--json` wire, and the bridge posts a question card in the turn's channel
+and writes the answers back on gray's stdin.
+
+Give the bridge's turns the plugin with `gray discord share`, then restart:
+
+```sh
+gray discord share --plugin-argv '["/path/to/gray-questions"]'
+```
 
 ````markdown
 ┃ -# Question from gray
@@ -387,10 +398,10 @@ it posts a question card in the turn's channel and waits for the answer.
 - The card is redrawn in place as you answer: each question shows its
   answer, the accent turns green and the controls go away.
 - With no answer in about 4 minutes the card closes ("No answer in time")
-  and the agent goes ahead on its best judgement, saying what it assumed.
+  and the plugin gets no answer for it, the same as any headless run.
   Stopping the turn closes the card too.
-- The agent gets `{"answers": {question_id: {"answers": [...]}}}`, the same
-  shape as gray-questions; typed answers start with `user_note: `.
+- Answers go back by question id, `{"<id>": ["<label>"]}`; typed answers
+  start with `user_note: `, the convention gray-questions already reads.
 
 Anyone admitted to the bot in that channel may answer. Plain text
 throughout, no emojis.

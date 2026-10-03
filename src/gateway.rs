@@ -948,6 +948,49 @@ where
     }
 }
 
+/// Questions a plugin asks mid-turn (gray's `host/ask`), shown in the
+/// channel the turn came from. The channel is the route written just before
+/// the turn starts; a conversation without one (nothing to show it in)
+/// leaves questions unanswered, as in any headless run.
+fn ask_handler(
+    rest: &Rest,
+    store: &Store,
+    config_path: &Path,
+    conversation: &str,
+) -> Option<crate::runner::AskFn> {
+    let home = config_path
+        .parent()?
+        .join("conversations")
+        .join(crate::runner::hex_sha256(conversation.as_bytes()));
+    let rest = rest.clone();
+    let store = store.clone();
+    Some(std::sync::Arc::new(move |questions: Value, turn_over| {
+        let rest = rest.clone();
+        let store = store.clone();
+        let home = home.clone();
+        Box::pin(async move {
+            let channel = crate::cron::read_route(&home)
+                .and_then(|route| route.get("route")?.as_str()?.parse::<u64>().ok());
+            let questions = crate::ask::from_host(&questions);
+            match channel {
+                Some(channel) if !questions.is_empty() => {
+                    crate::ask::ask(
+                        &rest,
+                        &store,
+                        channel,
+                        &questions,
+                        std::time::Duration::from_secs(crate::ask::ASK_SECS),
+                        std::time::Duration::from_millis(500),
+                        &turn_over,
+                    )
+                    .await
+                }
+                _ => serde_json::json!({}),
+            }
+        })
+    }))
+}
+
 impl<R, D, FutR, FutD> Runtime<R, D>
 where
     R: Fn(&Value, &Path, &str, &RunInput) -> FutR + Send + Sync + Clone + 'static,
@@ -1272,15 +1315,19 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     // rows, the Runtime drains them into the channel's status bubble.
     let activity = crate::activity::sink();
     let runner_sink = activity.clone();
+    let ask_rest = rest.clone();
+    let ask_store = store.clone();
     let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
         let conv = conv.to_string();
         let input = input.clone();
         let sink = runner_sink.clone();
+        let ask = ask_handler(&ask_rest, &ask_store, &pth, &conv);
         Box::pin(async move {
             let opts = crate::runner::RunOpts {
                 progress: Some(crate::activity::callback_for(sink, conv.clone())),
+                ask,
                 ..crate::runner::default_opts()
             };
             crate::runner::run_gray_input(&cfg, &pth, &conv, input, opts).await

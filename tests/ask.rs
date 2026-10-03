@@ -1,18 +1,20 @@
-//! `discord_ask`: the agent asks on Discord and waits for the answer.
+//! Questions on Discord: a plugin asks through gray's `host/ask`, the
+//! bridge shows a card, and the answers go back by question id.
 
 mod common;
 
 use gray_discord::durable::Store;
 use gray_discord::transport::Rest;
 use serde_json::{json, Value};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+/// What an `ask` row carries: gray-questions' question shape.
 fn questions() -> Vec<gray_discord::ask::Question> {
-    gray_discord::ask::parse(&json!({"questions": [{
+    gray_discord::ask::from_host(&json!([{
         "id": "branch", "header": "Branch", "question": "Which branch should I deploy?",
         "options": [{"label": "main", "description": "production"}, {"label": "staging"}]
-    }]}))
-    .unwrap()
+    }]))
 }
 
 /// The question card's custom ids, from the stub's first POST.
@@ -95,6 +97,7 @@ async fn a_button_press_answers_and_the_agent_gets_it() {
     let (_tmp, store) = store();
     let rest = Rest::new(&stub.base, "TESTTOKEN");
     let qs = questions();
+    let over = AtomicBool::new(false);
     let asking = gray_discord::ask::ask(
         &rest,
         &store,
@@ -102,6 +105,7 @@ async fn a_button_press_answers_and_the_agent_gets_it() {
         &qs,
         Duration::from_secs(30),
         Duration::from_millis(20),
+        &over,
     );
     let answering = async {
         let card = posted_card(&stub).await;
@@ -113,12 +117,7 @@ async fn a_button_press_answers_and_the_agent_gets_it() {
     };
     let (result, ()) = tokio::join!(asking, answering);
 
-    let content = result["content"].as_str().unwrap();
-    assert!(
-        content.starts_with("The person answered on Discord."),
-        "{content}"
-    );
-    assert!(content.contains(r#"{"answers":{"branch":{"answers":["staging"]}}}"#));
+    assert_eq!(result, json!({"branch": ["staging"]}));
     let update = &callbacks(&stub)[0];
     assert_eq!(
         update["type"], 7,
@@ -136,6 +135,7 @@ async fn other_opens_a_text_box_whose_answer_comes_back_typed() {
     let (_tmp, store) = store();
     let rest = Rest::new(&stub.base, "TESTTOKEN");
     let qs = questions();
+    let over = AtomicBool::new(false);
     let asking = gray_discord::ask::ask(
         &rest,
         &store,
@@ -143,6 +143,7 @@ async fn other_opens_a_text_box_whose_answer_comes_back_typed() {
         &qs,
         Duration::from_secs(30),
         Duration::from_millis(20),
+        &over,
     );
     let answering = async {
         let card = posted_card(&stub).await;
@@ -158,11 +159,7 @@ async fn other_opens_a_text_box_whose_answer_comes_back_typed() {
         press!(stub, store, &note, &[], Some("the hotfix branch"));
     };
     let (result, ()) = tokio::join!(asking, answering);
-    let content = result["content"].as_str().unwrap();
-    assert!(
-        content.contains(r#""answers":["user_note: the hotfix branch"]"#),
-        "{content}"
-    );
+    assert_eq!(result, json!({"branch": ["user_note: the hotfix branch"]}));
 }
 
 #[tokio::test]
@@ -171,6 +168,7 @@ async fn a_plain_reply_in_the_channel_answers_too() {
     let (_tmp, store) = store();
     let rest = Rest::new(&stub.base, "TESTTOKEN");
     let qs = questions();
+    let over = AtomicBool::new(false);
     let asking = gray_discord::ask::ask(
         &rest,
         &store,
@@ -178,6 +176,7 @@ async fn a_plain_reply_in_the_channel_answers_too() {
         &qs,
         Duration::from_secs(30),
         Duration::from_millis(20),
+        &over,
     );
     let replying = async {
         posted_card(&stub).await;
@@ -188,10 +187,7 @@ async fn a_plain_reply_in_the_channel_answers_too() {
         );
     };
     let (result, ()) = tokio::join!(asking, replying);
-    assert!(result["content"]
-        .as_str()
-        .unwrap()
-        .contains("user_note: deploy main please"));
+    assert_eq!(result, json!({"branch": ["user_note: deploy main please"]}));
     let edited = stub
         .sent
         .lock()
@@ -215,12 +211,10 @@ async fn no_answer_in_time_closes_the_card() {
         &questions(),
         Duration::from_millis(300),
         Duration::from_millis(20),
+        &AtomicBool::new(false),
     )
     .await;
-    assert!(result["content"]
-        .as_str()
-        .unwrap()
-        .starts_with("No answer within"));
+    assert_eq!(result, json!({}), "no answers: the plugin decides");
     let closed = stub
         .sent
         .lock()
@@ -238,22 +232,54 @@ async fn no_answer_in_time_closes_the_card() {
 }
 
 #[tokio::test]
-async fn the_tool_is_in_the_manifest_with_a_proper_name() {
+async fn the_turn_ending_closes_an_open_card() {
+    let stub = common::Stub::start().await;
+    let (_tmp, store) = store();
+    let rest = Rest::new(&stub.base, "TESTTOKEN");
+    let over = AtomicBool::new(true);
+    let result = gray_discord::ask::ask(
+        &rest,
+        &store,
+        42,
+        &questions(),
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        &over,
+    )
+    .await;
+    assert_eq!(result, json!({}));
+    let closed = stub
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|sent| sent.method == "PATCH")
+        .map(|sent| sent.body["components"].to_string())
+        .unwrap();
+    assert!(!closed.contains("ask:"), "the buttons are gone");
+}
+
+#[test]
+fn malformed_questions_show_nothing() {
+    assert!(gray_discord::ask::from_host(&json!(null)).is_empty());
+    assert!(gray_discord::ask::from_host(&json!([{"id": "", "question": "q"}])).is_empty());
+    assert!(gray_discord::ask::from_host(&json!([{"id": "a", "question": "  "}])).is_empty());
+}
+
+#[tokio::test]
+async fn the_bridge_offers_no_question_tool_of_its_own() {
     let manifest = gray_discord::sidecar::dispatch(
         "plugin/manifest",
         &json!({}),
         std::path::Path::new("config.json"),
     )
     .await;
-    let ask = manifest["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "discord_ask")
-        .expect("discord_ask is offered");
-    assert_eq!(ask["label"], "Discord Ask");
-    assert_eq!(
-        manifest["protocol"], "1.1",
-        "1.1 grants the long ask budget"
+    let tools = manifest["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap_or_default().contains("ask")),
+        "questions come from a questions plugin, not the bridge"
     );
+    assert!(tools.iter().all(|tool| tool["label"].is_string()));
 }
