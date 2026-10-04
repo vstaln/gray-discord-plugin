@@ -421,5 +421,8 @@ async fn exhausted_request_cap_is_request_limit() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, RunError::RequestLimit(32)), "unexpected: {err}");
+    assert!(
+        matches!(err, RunError::RequestLimit(32)),
+        "unexpected: {err}"
+    );
 }
