@@ -26,6 +26,14 @@ async fn manifest_exposes_typed_ui_and_private_file_tools() {
         send["parameters"]["properties"]["document"]["type"],
         "object"
     );
+    // Agnostic transcript previews: gray core resolves the declared dot
+    // path against the call args; the plugin never teaches core its shape.
+    assert_eq!(send["preview"], "document.title");
+    let modal = tools
+        .iter()
+        .find(|tool| tool["name"] == "discord_open_modal")
+        .unwrap();
+    assert_eq!(modal["preview"], "document.title");
 }
 
 #[tokio::test]

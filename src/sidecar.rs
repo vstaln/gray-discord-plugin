@@ -78,6 +78,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         }, {
             "name": "discord_send_ui",
             "label": "Discord Send UI",
+            "preview": "document.title",
             "description": "Send a rich Discord Components V2 message (cards, galleries, sections, buttons, selects). Pass the document as a JSON object. For local files, prefer discord_file action=send, or import with discord_file and reference the returned file_id as media.",
             "parameters": {
                 "type": "object",
@@ -90,6 +91,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         }, {
             "name": "discord_open_modal",
             "label": "Discord Open Modal",
+            "preview": "document.title",
             "description": "Open a modal form in response to a Discord component interaction. Call discord_ui_schema surface=modal for the shape.",
             "parameters": {
                 "type": "object",
