@@ -3,14 +3,18 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// OAuth2 invite URL with the bridge's least-privilege message permissions,
-/// including the separate permission Discord requires for threads.
+use crate::discord_check::{self, BotCheck, CheckError};
+
+/// One-click OAuth2 invite (Hermes parity): the bridge's full permission
+/// set, bot + slash commands, server install.
 pub fn invite(app_id: &str) -> String {
-    format!(
-        "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot&permissions={}",
-        crate::transport::INVITE_PERMISSIONS
-    )
+    discord_check::invite_url(app_id)
 }
+
+/// Discord rejections the wizard re-asks before giving up.
+pub const TOKEN_TRIES: usize = 3;
+/// Intent re-checks before the wizard moves on with the link.
+pub const INTENT_RECHECKS: usize = 5;
 
 /// Terminal IO. The real implementation talks to stdin/stderr; tests inject
 /// a scripted fake. `print_line` goes to user-visible output (never logs).
@@ -31,8 +35,8 @@ pub type PairingFut = std::pin::Pin<Box<dyn std::future::Future<Output = Pairing
 /// code, returns `(owner_id, dm_channel_id)`. Tests inject a scripted fake
 /// (`&|_, _| Box::pin(async { .. })`); the CLI passes [`default_pairing`].
 pub type WaitForPairing = dyn Fn(&str, &str) -> PairingFut;
-/// Login step injected for tests (`default_login` in production).
-pub type LoginStep = dyn Fn(&str) -> LoginFut;
+/// Token check injected for tests (`default_check` in production).
+pub type CheckStep = dyn Fn(&str) -> CheckFut;
 
 /// Real terminal prompter (hidden input via `stty -echo`, no new deps).
 pub struct Tty;
@@ -120,7 +124,8 @@ fn is_executable(path: &Path) -> bool {
 /// owner's DM; it receives the bot token and the printed code and returns
 /// `(owner_id, dm_channel_id)`. Only used when the caller asks for pairing.
 pub struct Wiring {
-    pub login: &'static LoginStep,
+    /// Ask Discord about a token (`GET /applications/@me`).
+    pub check: &'static CheckStep,
     /// Open the DM channel with a user (setup's home channel).
     pub dm: &'static DmStep,
     /// The app's own doctor, run after the config is written.
@@ -141,7 +146,7 @@ pub type VerifyStep = dyn Fn(&Value) -> VerifyFut;
 impl Wiring {
     pub fn production() -> Self {
         Self {
-            login: &default_login,
+            check: &default_check,
             dm: &default_dm,
             verify: &default_verify,
             pairing: &default_pairing,
@@ -186,15 +191,33 @@ pub async fn run_wired(
         ))),
     };
 
-    let token = io.prompt_hidden("Discord bot token (hidden): ")?;
-    let token = token.trim().to_string();
-    let app_id = (wiring.login)(&token).await?;
-    io.print_line(&format!("Invite your bot: {}", invite(&app_id)));
-    io.print_line("Enable Message Content Intent in the Discord developer portal.");
+    // Whoever the old config allowed stays allowed: the wizard only adds.
+    let (prior_owner, prior_allowed) = prior_access(path);
 
-    // Who may talk to the bot: the owner (first ID) plus an optional
-    // allowlist. The home channel is then the DM with the owner — created,
-    // never asked for.
+    for line in [
+        "1. Open https://discord.com/developers/applications → New Application",
+        "2. Open the Bot page → Reset Token → copy the token",
+        "The token, the intents and the invite link are checked for you next.",
+    ] {
+        io.print_line(line);
+    }
+    let (token, bot) = prompt_checked_token(io, wiring).await?;
+    let bot = match bot {
+        Some(bot) => {
+            let bot = ensure_message_content(io, wiring, &token, bot).await?;
+            for line in discord_check::invite_lines(&bot) {
+                io.print_line(&line);
+            }
+            Some(bot)
+        }
+        None => {
+            io.print_line(OFFLINE_INTENT_NOTE);
+            None
+        }
+    };
+
+    // Who may talk to the bot: the owner plus an allowlist. The home channel
+    // is then the DM with the owner — created, never asked for.
     let (owner, mut allowed) = if pair {
         let pairing = crate::policy::Pairing::new(now_secs());
         io.print_line(&format!(
@@ -203,17 +226,17 @@ pub async fn run_wired(
         ));
         let (owner, dm) = (wiring.pairing)(&token, &pairing.code).await?;
         io.print_line(&format!("Owner ID: {owner} (home channel: your DM {dm})"));
-        (owner, Vec::new())
+        (owner, prior_allowed)
+    } else if let Some((owner, allowed)) =
+        offer_owner(io, bot.as_ref(), &prior_owner, &prior_allowed)?
+    {
+        (owner, allowed)
     } else {
         let answer = io.prompt("Your Discord user ID (comma-separated to also allow others): ")?;
-        let mut ids: Vec<String> = answer
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mut ids = discord_check::clean_user_ids(&answer);
         anyhow_ids(&ids)?;
         let owner = ids.remove(0);
-        (owner, ids)
+        (owner, discord_check::merge_allowed(&prior_allowed, &ids))
     };
     if !crate::config::snowflake(&Value::String(owner.clone())) {
         return Err("User IDs must be Discord snowflakes".to_string());
@@ -258,6 +281,162 @@ pub async fn run_wired(
         Err(e) => io.print_line(&format!("Doctor disagreed (fix and re-run): {e}")),
     }
     Ok(true)
+}
+
+pub const OFFLINE_INTENT_NOTE: &str = "Make sure Message Content Intent is on (Bot page → Privileged Gateway Intents), or Discord will refuse the bot's connection.";
+
+/// `owner_id` and `allowed_users` from the config being replaced, read raw
+/// (it may not validate any more). Missing or unreadable means nobody.
+fn prior_access(path: &Path) -> (Option<String>, Vec<String>) {
+    let Some(old) = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return (None, Vec::new());
+    };
+    let owner = old
+        .get("owner_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let allowed = old
+        .get("allowed_users")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (owner, allowed)
+}
+
+/// Ask for the token until Discord accepts one. A rejected token is never
+/// returned, so it can never be saved: three rejections end setup. A numeric
+/// app-ID paste is refused once with guidance. `Ok((token, None))` means
+/// Discord could not be asked: the token is kept, with a warning.
+async fn prompt_checked_token(
+    io: &mut dyn Prompter,
+    wiring: &Wiring,
+) -> Result<(String, Option<BotCheck>), String> {
+    let mut rejected = 0;
+    let mut numeric_warned = false;
+    loop {
+        let raw = io.prompt_hidden("Discord bot token (hidden): ")?;
+        if !raw.is_ascii() {
+            io.print_line(
+                "Stripped non-ASCII characters (curly quotes or lookalike glyphs) from the pasted token.",
+            );
+        }
+        let token = discord_check::clean_token(&raw);
+        if token.is_empty() {
+            return Err("A bot token is required".to_string());
+        }
+        if let Some(why) = discord_check::token_shape_error(&token) {
+            if !numeric_warned {
+                numeric_warned = true;
+                io.print_line(why);
+                continue;
+            }
+        }
+        let why = if discord_check::has_inner_break(&token) {
+            "That isn't a bot token (it contains a line break). Copy it again from the Bot page."
+        } else {
+            match (wiring.check)(&token).await {
+                Ok(bot) => {
+                    io.print_line(&format!("Token works: this is the bot \"{}\".", bot.bot_name));
+                    return Ok((token, Some(bot)));
+                }
+                Err(CheckError::Rejected) => {
+                    "Discord rejected that token. On the Bot page click Reset Token, copy the new token and paste it here."
+                }
+                Err(CheckError::Status(code)) => {
+                    io.print_line(&format!(
+                        "Couldn't verify the token (Discord answered {code}); keeping it anyway."
+                    ));
+                    return Ok((token, None));
+                }
+                Err(CheckError::Unreachable(e)) => {
+                    io.print_line(&format!(
+                        "Couldn't reach Discord to verify the token ({e}); keeping it anyway."
+                    ));
+                    return Ok((token, None));
+                }
+            }
+        };
+        rejected += 1;
+        if rejected >= TOKEN_TRIES {
+            return Err("Discord rejected three tokens in a row; nothing was saved.".to_string());
+        }
+        io.print_line(why);
+    }
+}
+
+/// Message Content Intent off: link straight to the toggle, Enter re-checks
+/// (up to five times), `skip` keeps going. The doctor still refuses a bot
+/// without it, so nothing claims success early.
+async fn ensure_message_content(
+    io: &mut dyn Prompter,
+    wiring: &Wiring,
+    token: &str,
+    mut bot: BotCheck,
+) -> Result<BotCheck, String> {
+    for _ in 0..INTENT_RECHECKS {
+        if bot.message_content {
+            break;
+        }
+        for line in discord_check::intent_lines(&bot) {
+            io.print_line(&line);
+        }
+        let answer = io.prompt("Press Enter once it's saved to re-check, or type 'skip': ")?;
+        if answer.trim().eq_ignore_ascii_case("skip") {
+            return Ok(bot);
+        }
+        match (wiring.check)(token).await {
+            Ok(fresh) => bot = fresh,
+            Err(_) => return Ok(bot),
+        }
+    }
+    if bot.message_content {
+        io.print_line("Message Content Intent is on.");
+    }
+    Ok(bot)
+}
+
+/// The owner Discord named, offered instead of a typed ID. Returns the owner
+/// and the allowlist (prior entries kept, owners and extras only added), or
+/// `None` when there is nobody to offer or the offer was declined.
+fn offer_owner(
+    io: &mut dyn Prompter,
+    bot: Option<&BotCheck>,
+    prior_owner: &Option<String>,
+    prior_allowed: &[String],
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let Some(bot) = bot.filter(|b| !b.owners.is_empty()) else {
+        return Ok(None);
+    };
+    let who = discord_check::owner_names(bot);
+    let question = if bot.owners.len() == 1 {
+        format!("Allow yourself ({who}) to talk to the bot? [Y/n] ")
+    } else {
+        format!("Allow your team ({who}) to talk to the bot? [Y/n] ")
+    };
+    let answer = io.prompt(&question)?;
+    if !matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ) {
+        return Ok(None);
+    }
+    let ids: Vec<String> = bot.owners.iter().map(|(id, _)| id.clone()).collect();
+    // An owner already set stays the owner; the detected one joins the list.
+    let owner = prior_owner.clone().unwrap_or_else(|| ids[0].clone());
+    let mut allowed = discord_check::merge_allowed(prior_allowed, &ids);
+    io.print_line(&format!(
+        "You are allowlisted ({who}): owner detected, no Developer Mode needed."
+    ));
+    let extra = io.prompt("Other allowed user IDs (comma-separated, Enter to skip): ")?;
+    allowed = discord_check::merge_allowed(&allowed, &discord_check::clean_user_ids(&extra));
+    Ok(Some((owner, allowed)))
 }
 
 /// Snowflake check for every comma-separated ID, with the same error text.
@@ -354,20 +533,16 @@ pub fn default_pairing(token: &str, code: &str) -> PairingFut {
     })
 }
 
-/// Boxed login future: `Send` so `run_with_login` stays `Send` for tokio.
-pub type LoginFut =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+/// Boxed check future: `Send` so the wizard stays `Send` for tokio.
+pub type CheckFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<BotCheck, CheckError>> + Send>>;
 
-/// Production login: REST `GET /users/@me` with a 30 s bound (Python parity:
-/// `asyncio.wait_for(bot.login(token), 30)`).
-pub fn default_login(token: &str) -> LoginFut {
+/// Production check: `GET /applications/@me` with the bot token, 10 s bound.
+pub fn default_check(token: &str) -> CheckFut {
     let token = token.to_string();
     Box::pin(async move {
         let rest = crate::transport::Rest::production(&token);
-        tokio::time::timeout(std::time::Duration::from_secs(30), rest.login())
-            .await
-            .map_err(|_| "Discord login timed out; check the token and connectivity".to_string())?
-            .map_err(|e| e.to_string())
+        discord_check::check_bot_token(&rest).await
     })
 }
 

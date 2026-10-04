@@ -1,5 +1,6 @@
+use gray_discord::discord_check::{BotCheck, CheckError};
 use gray_discord::setup::{
-    invite, run_wired, DmStep, LoginStep, PairingFut, Prompter, VerifyStep, Wiring,
+    invite, run_wired, CheckFut, CheckStep, DmStep, PairingFut, Prompter, VerifyStep, Wiring,
 };
 use std::collections::VecDeque;
 use std::path::Path;
@@ -53,8 +54,24 @@ impl Prompter for Fake {
     }
 }
 
-fn stub_login(_token: &str) -> gray_discord::setup::LoginFut {
-    Box::pin(async { Ok("999".to_string()) })
+/// A bot Discord accepts: intent on, no owner reported (so the wizard asks
+/// for the ID, as before the owner lookup existed).
+fn bot(owners: &[(&str, &str)], message_content: bool) -> BotCheck {
+    BotCheck {
+        app_id: "42".to_string(),
+        bot_name: "graybot".to_string(),
+        owners: owners
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect(),
+        message_content,
+        server_members: false,
+        server_count: Some(0),
+    }
+}
+
+fn stub_check(_token: &str) -> CheckFut {
+    Box::pin(async { Ok(bot(&[], true)) })
 }
 
 fn stub_dm(_token: &str, _owner: u64) -> gray_discord::setup::DmFut {
@@ -85,7 +102,7 @@ fn pairing_fail(_token: &str, _code: &str) -> PairingFut {
 
 fn wiring(pairing: &'static gray_discord::setup::WaitForPairing, home: &Path) -> Wiring {
     Wiring {
-        login: &stub_login as &LoginStep,
+        check: &stub_check as &CheckStep,
         dm: &stub_dm as &DmStep,
         verify: &verify_ok as &VerifyStep,
         pairing,
@@ -109,7 +126,7 @@ async fn run_offline(path: &Path, io: &mut Fake, w: &Wiring, pair: bool) -> Resu
 fn invite_url_is_exact() {
     assert_eq!(
         invite("999"),
-        "https://discord.com/oauth2/authorize?client_id=999&scope=bot&permissions=274877975552"
+        "https://discord.com/oauth2/authorize?client_id=999&scope=bot+applications.commands&permissions=309240908864&integration_type=0"
     );
 }
 
@@ -294,4 +311,224 @@ fn cli_setup_registers_and_optionally_installs() {
         .unwrap();
         assert_eq!(data["plugins"]["discord"]["adapter_version"], "1.1");
     }
+}
+
+// --- The token is checked with Discord before anything is written. ---
+
+fn with_check(check: &'static CheckStep, home: &Path) -> Wiring {
+    Wiring {
+        check,
+        ..wiring(&pairing_ok, home)
+    }
+}
+
+fn saved(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Only `good.token` is a real token; the owner is @alice (ID 1).
+fn alice_check(token: &str) -> CheckFut {
+    let ok = token == "good.token";
+    Box::pin(async move {
+        if ok {
+            Ok(bot(&[("1", "alice")], true))
+        } else {
+            Err(CheckError::Rejected)
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_rejected_token_is_reasked_and_the_owner_is_merged_into_the_allowlist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"allowed_users":["999"]}"#).unwrap();
+    // Replace? y · allow yourself? Enter · others? Enter.
+    let mut io = Fake::new(
+        true,
+        &["y", "", ""],
+        // A wrong token, then the real one wrapped in rich-text curly quotes.
+        &["not.the.token", "\u{201c}good.token\u{201d}"],
+    );
+    let w = with_check(&alice_check, tmp.path());
+    assert!(run_offline(&path, &mut io, &w, false).await.unwrap());
+    let data = saved(&path);
+    assert_eq!(data["token"], "good.token", "cleaned before the save");
+    assert_eq!(data["owner_id"], "1");
+    assert_eq!(data["allowed_users"], serde_json::json!(["999", "1"]));
+    let log = io.log.join("\n");
+    assert!(log.contains("Discord rejected that token"), "{log}");
+    assert!(log.contains("You are allowlisted (@alice)"), "{log}");
+    assert!(log.contains("permissions=309240908864"), "{log}");
+    assert!(log.contains("isn't in any server yet"), "{log}");
+    assert!(!log.contains("not.the.token") && !log.contains("good.token"));
+    // No Developer Mode hunt: the ID question never came.
+    assert!(!log.contains("Your Discord user ID"), "{log}");
+    gray_discord::config::load_config(&path).expect("saved config must validate");
+}
+
+fn always_reject(_token: &str) -> CheckFut {
+    Box::pin(async { Err(CheckError::Rejected) })
+}
+
+#[tokio::test]
+async fn three_rejected_tokens_save_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut io = Fake::new(true, &[], &["a.b.c", "d.e.f", "g.h.i"]);
+    let err = run_offline(
+        &path,
+        &mut io,
+        &with_check(&always_reject, tmp.path()),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Discord rejected three tokens in a row; nothing was saved."
+    );
+    assert!(!path.exists());
+}
+
+fn never_numeric(token: &str) -> CheckFut {
+    assert!(
+        !token.bytes().all(|b| b.is_ascii_digit()),
+        "an application ID must never be sent to Discord"
+    );
+    Box::pin(async { Ok(bot(&[], true)) })
+}
+
+#[tokio::test]
+async fn a_numeric_app_id_paste_is_refused_once_with_guidance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut io = Fake::new(true, &["111"], &["1234567890123456789", "real.bot.token"]);
+    assert!(run_offline(
+        &path,
+        &mut io,
+        &with_check(&never_numeric, tmp.path()),
+        false
+    )
+    .await
+    .unwrap());
+    assert_eq!(saved(&path)["token"], "real.bot.token");
+    assert!(io.log.iter().any(|l| l.contains("application ID")));
+}
+
+static INTENT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Intent off on the first look, on after the operator saves the toggle.
+fn intent_flips(_token: &str) -> CheckFut {
+    let n = INTENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Box::pin(async move { Ok(bot(&[], n >= 1)) })
+}
+
+#[tokio::test]
+async fn intent_off_links_the_toggle_and_enter_rechecks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    // Enter re-checks, then your ID.
+    let mut io = Fake::new(true, &["", "111"], &["good.token"]);
+    assert!(run_offline(
+        &path,
+        &mut io,
+        &with_check(&intent_flips, tmp.path()),
+        false
+    )
+    .await
+    .unwrap());
+    let log = io.log.join("\n");
+    assert!(
+        log.contains("https://discord.com/developers/applications/42/bot"),
+        "{log}"
+    );
+    assert!(log.contains("Privileged Gateway Intents"), "{log}");
+    assert!(log.contains("Message Content Intent is on."), "{log}");
+    assert_eq!(INTENT_CALLS.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+static SKIP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn intent_stays_off(_token: &str) -> CheckFut {
+    SKIP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Box::pin(async { Ok(bot(&[], false)) })
+}
+
+#[tokio::test]
+async fn skip_keeps_going_with_the_intent_still_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut io = Fake::new(true, &["skip", "111"], &["good.token"]);
+    assert!(run_offline(
+        &path,
+        &mut io,
+        &with_check(&intent_stays_off, tmp.path()),
+        false
+    )
+    .await
+    .unwrap());
+    assert_eq!(SKIP_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(path.exists());
+}
+
+fn offline(_token: &str) -> CheckFut {
+    Box::pin(async {
+        Err(CheckError::Unreachable(
+            "Discord request failed; check connectivity".into(),
+        ))
+    })
+}
+
+#[tokio::test]
+async fn offline_keeps_the_token_with_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut io = Fake::new(true, &["111"], &["good.token"]);
+    assert!(
+        run_offline(&path, &mut io, &with_check(&offline, tmp.path()), false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(saved(&path)["token"], "good.token");
+    let log = io.log.join("\n");
+    assert!(log.contains("keeping it anyway"), "{log}");
+    assert!(
+        log.contains("Message Content Intent is on (Bot page"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_owner_stays_and_the_detected_one_is_only_added() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"owner_id":"555","allowed_users":["999"]}"#).unwrap();
+    let mut io = Fake::new(true, &["y", "y", "<@!333>"], &["good.token"]);
+    assert!(
+        run_offline(&path, &mut io, &with_check(&alice_check, tmp.path()), false)
+            .await
+            .unwrap()
+    );
+    let data = saved(&path);
+    assert_eq!(data["owner_id"], "555");
+    assert_eq!(
+        data["allowed_users"],
+        serde_json::json!(["999", "1", "333"])
+    );
+}
+
+#[tokio::test]
+async fn declining_the_owner_offer_falls_back_to_typing_an_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let mut io = Fake::new(true, &["n", "111"], &["good.token"]);
+    assert!(
+        run_offline(&path, &mut io, &with_check(&alice_check, tmp.path()), false)
+            .await
+            .unwrap()
+    );
+    let data = saved(&path);
+    assert_eq!(data["owner_id"], "111");
+    assert!(data.get("allowed_users").is_none());
 }

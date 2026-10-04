@@ -45,24 +45,76 @@ gray discord setup
 gray discord status
 ```
 
-Setup is one command (Hermes parity — token plus your user ID, nothing else):
+Setup is one command, and it does the Developer Portal checks for you
+(Hermes parity):
 
 ```sh
 gray discord setup
 ```
 
 ```
+1. Open https://discord.com/developers/applications → New Application
+2. Open the Bot page → Reset Token → copy the token
 Discord bot token (hidden): ••••••••
-Your Discord user ID (comma-separated to also allow others): 1493623750858375228,1502…
+Token works: this is the bot "graybot".
+The bot isn't in any server yet. Open this link to add it to yours:
+   https://discord.com/oauth2/authorize?client_id=<app-id>&scope=bot+applications.commands&permissions=309240908864&integration_type=0
+Allow yourself (@you) to talk to the bot? [Y/n]
+You are allowlisted (@you): owner detected, no Developer Mode needed.
+Other allowed user IDs (comma-separated, Enter to skip):
 ```
 
-The wizard validates the token against Discord's own API, makes your DM the
-home channel (created, never asked for), writes the config privately, and
-runs the doctor. Your first ID is the owner; the rest join the allowlist.
-Enable Message Content Intent in the Developer Portal (the doctor checks it).
-Don't know your user ID? `gray discord setup --pair` instead prints a
-one-time code, you DM it to the bot, and the wizard discovers your ID and DM
-channel from that DM.
+What the wizard checks, before anything is written:
+
+- **The token, with Discord.** `GET /applications/@me` with
+  `Authorization: Bot <token>` (10 s timeout). A token Discord rejects (401)
+  is asked for again, up to three times, and never saved. A numeric paste is
+  the application ID from General Information, not the token, and is refused
+  with that guidance once. Curly quotes and other non-ASCII characters from a
+  rich-text paste are stripped before the check and before the save. If
+  Discord can't be reached, the token is kept with a warning.
+- **Message Content Intent.** If it is off, the wizard links straight to the
+  toggle (`https://discord.com/developers/applications/<app-id>/bot` →
+  Privileged Gateway Intents → Message Content Intent → Save Changes). Enter
+  re-checks (up to five times); `skip` keeps going, and the doctor still
+  refuses to pass until it is on.
+- **The invite link.** One click to add the bot with the right permissions.
+  `309240908864` is Add Reactions (6), View Channels (10), Send Messages
+  (11), Embed Links (14), Attach Files (15), Read Message History (16),
+  Connect (20), Speak (21), Create Public Threads (35) and Send Messages in
+  Threads (38) (`discord_check::INVITE_PERMISSION_BITS`).
+- **You, allowlisted.** The same answer names the application's owner (or
+  every accepted member of its team), so you never need Developer Mode for
+  your own ID. An owner already in the config stays the owner; the detected
+  one is added to `allowed_users`, which keeps every existing entry and only
+  adds.
+
+Then it makes your DM the home channel (created, never asked for), writes the
+config privately, and runs the doctor. Decline the owner offer and it asks
+for your user ID instead (first ID is the owner, the rest join the
+allowlist). `gray discord setup --pair` instead prints a one-time code, you
+DM it to the bot, and the wizard discovers your ID and DM channel from that
+DM.
+
+There is no `.env` template: everything lives in
+`~/.config/gray-discord/config.json` (directory `0700`, file `0600`). Written
+by hand, the setup-relevant part looks like this (paths must be absolute):
+
+```json
+{
+  "token": "<bot token: Bot page → Reset Token>",
+  "owner_id": "<your Discord user ID>",
+  "allowed_users": ["<another user ID>"],
+  "channel_id": "<home channel ID, or the DM channel with the owner>",
+  "gray_bin": "/home/you/.local/bin/gray",
+  "gray_home": "/home/you/.gray",
+  "workdir": "/home/you/.config/gray-discord"
+}
+```
+
+Other people's IDs still need Developer Mode (Settings → Advanced →
+Developer Mode, then right-click their name → Copy User ID), or they DM the
+bot and you approve the pairing code it gives them (below).
 
 **Pairing happens on Discord too.** Once the bot is running, anyone can DM
 it: an unconfigured human is told their own Discord ID and a pairing code,
