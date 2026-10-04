@@ -18,7 +18,7 @@
 //! ```
 //!
 //! The newest message carries the turn's status chip: a small Container
-//! whose accent tracks the turn (blurple while working, green when done, red
+//! whose accent tracks the turn (dark grey while working, green when done, red
 //! on failure, grey when stopped) with the Stop button while it runs and
 //! Retry / New chat once it has settled. Its clock is a Discord timestamp
 //! (`<t:…:R>`) that every client keeps current on its own, so a quiet turn
@@ -59,7 +59,7 @@ const STRIKES: u32 = 3;
 /// Times a deleted newest message is posted again.
 const REPOSTS: u32 = 2;
 
-const WORKING: u32 = 0x5865F2;
+const WORKING: u32 = 0x4E5058;
 const DONE: u32 = 0x57F287;
 const FAILED: u32 = 0xED4245;
 const STOPPED: u32 = 0x80848E;
