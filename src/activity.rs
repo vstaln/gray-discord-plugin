@@ -332,16 +332,20 @@ fn card_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>) -> Stri
 }
 
 fn shell_line(tool: &str, name: &str, detail: &str, elapsed: Option<u64>, done: bool) -> String {
-    let mut out = match tool {
-        "bash" | "shell" if done => "Ran".to_string(),
-        _ => label(tool, name),
-    };
     // A shell command earns cleaning (no redirections, no `;`-chain essay);
     // a file tool's detail is already a clean path.
     let arg = match tool {
         "bash" | "shell" => clean_command(detail),
         "" => String::new(),
         _ => one_line(detail),
+    };
+    let mut out = match tool {
+        // No command means a background-job call (`action: output`/`kill`),
+        // which would otherwise read as a bare, empty "Ran".
+        "bash" | "shell" if arg.is_empty() && done => "Checked background job".to_string(),
+        "bash" | "shell" if arg.is_empty() => "Checking background job".to_string(),
+        "bash" | "shell" if done => "Ran".to_string(),
+        _ => label(tool, name),
     };
     if !arg.is_empty() {
         out.push(' ');
