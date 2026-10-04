@@ -47,8 +47,8 @@ a typed user block, and continues the same session. Component state tokens and
 Discord interaction tokens stay in the plugin's SQLite rows; managed file IDs
 are metadata, not file contents.
 
-`gray discord limits --timeout-seconds 1800 --concurrency 4 --max-requests 32`
-sets runtime policy; restart to apply. Defaults: 600 seconds, 2 workers, 32
+`gray discord limits --timeout-seconds 1800 --concurrency 4 --max-requests 200`
+sets runtime policy; restart to apply. Defaults: 600 seconds, 2 workers, 200
 provider requests per turn. Workers serve both chat and scheduled jobs.
 `gray discord queue list` shows accepted IDs and states; `queue cancel ID`
 cancels queued work or signals its running process group. A cancellation may

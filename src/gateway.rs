@@ -949,6 +949,9 @@ where
             Ok(_) => crate::stream::Status::Done,
             Err(RunError::Budget(_)) => crate::stream::Status::Failed("hit the budget".to_string()),
             Err(RunError::Timeout) => crate::stream::Status::Failed("timed out".to_string()),
+            Err(RunError::RequestLimit(n)) => {
+                crate::stream::Status::Failed(format!("hit the {n}-request limit"))
+            }
             Err(_) => crate::stream::Status::Failed("failed".to_string()),
         };
         let loaded = crate::media_tags::load_pairs(&media);
