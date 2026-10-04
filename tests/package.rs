@@ -153,9 +153,91 @@ fn registration_preserves_other_plugins() {
     assert_eq!(data["plugins"]["discord"]["argv"][1], "sidecar");
     // Double-register is idempotent (same argv, same path).
     gray_discord::cli::register(&config, &home.join("config.json")).expect("re-register");
-    // A different config path targeting the same lock is refused.
-    assert!(
-        gray_discord::cli::register(&config, &home.join("different.json")).is_err(),
-        "conflicting path must be refused"
+    // Same exe with different args (another config path) is an update, not
+    // a conflict: registration only refuses a different executable.
+    gray_discord::cli::register(&config, &home.join("different.json")).expect("same exe merges");
+    let data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+    assert_eq!(
+        data["plugins"]["discord"]["argv"][3],
+        home.join("different.json").to_str().unwrap()
     );
+}
+
+#[test]
+fn registration_merges_into_an_existing_lock_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let lock = home.join("plugins/lock.json");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    // The row belongs to this same binary (argv[0] == current exe), so
+    // registration merges into it rather than refusing.
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        &lock,
+        serde_json::json!({"schema": 1, "plugins": {"discord": {
+            "granted_capabilities": ["tool"],
+            "capabilities_hash": "abc",
+            "cli_argv": ["/already/on/path"],
+            "enabled": false,
+            "hash": "sha256:existing",
+            "argv": [exe, "old", "args"]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let config = serde_json::json!({"gray_home": home.to_str().unwrap()});
+    gray_discord::cli::register(&config, &home.join("config.json")).expect("register");
+    let data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+    let entry = &data["plugins"]["discord"];
+    // Consent and gray's cli_argv survive the merge; the user's enabled flag too.
+    assert_eq!(entry["granted_capabilities"], serde_json::json!(["tool"]));
+    assert_eq!(entry["capabilities_hash"], "abc");
+    assert_eq!(entry["cli_argv"], serde_json::json!(["/already/on/path"]));
+    assert_eq!(entry["enabled"], false);
+    assert_eq!(entry["hash"], "sha256:existing");
+    // argv still updated to the sidecar invocation.
+    assert_eq!(entry["argv"][1], "sidecar");
+}
+
+#[test]
+fn a_fresh_lock_row_gets_cli_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let config = serde_json::json!({"gray_home": home.to_str().unwrap()});
+    gray_discord::cli::register(&config, &home.join("config.json")).expect("register");
+    let lock = home.join("plugins/lock.json");
+    let data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(data["plugins"]["discord"]["cli_argv"][0], exe);
+    assert_eq!(data["plugins"]["discord"]["argv"][0], exe);
+    // gray's LockEntry.hash has no serde default; a missing key breaks the
+    // whole lock load, so a fresh row always carries one.
+    assert_eq!(data["plugins"]["discord"]["hash"], "");
+}
+
+#[test]
+fn a_different_executable_in_the_row_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let lock = home.join("plugins/lock.json");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(
+        &lock,
+        serde_json::json!({"schema": 1, "plugins": {"discord": {
+            "argv": ["/usr/bin/other-discord", "sidecar"]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let config = serde_json::json!({"gray_home": home.to_str().unwrap()});
+    assert!(gray_discord::cli::register(&config, &home.join("config.json")).is_err());
 }
