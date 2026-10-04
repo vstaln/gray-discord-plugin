@@ -214,9 +214,9 @@ pub fn callback_for<'a>(s: Sink, scope: String) -> crate::runner::ProgressFn<'a>
     Box::new(move |row: &Value| push_for(&s, &scope, row.clone()))
 }
 
-/// Tools whose work is nobody's status: they are the bulk of a turn (read and
-/// search loops) and mean nothing to a reader. The card's tally still counts
-/// them.
+/// Tools whose work is nobody's receipt: they are the bulk of a turn (read and
+/// search loops). The end-of-turn card lists none of them, though its tally
+/// still counts them; the live feed shows every step.
 fn is_quiet(tool: &str) -> bool {
     matches!(tool, "read" | "cat" | "find" | "grep" | "glob" | "ls")
 }
@@ -435,7 +435,6 @@ struct BubbleLine {
     tool: String,
     /// The call it narrates, so parallel calls each find their placeholder.
     call_id: String,
-    quiet: bool,
 }
 
 /// Render one tool bubble's rows into its body: every distinct line, oldest
@@ -453,8 +452,6 @@ pub fn render(rows: &[Value]) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
-        let quiet = is_quiet_row(&tool, detail);
         let start = row.get("phase").and_then(Value::as_str) == Some("tool_started");
         let call_id = row
             .get("call_id")
@@ -471,7 +468,6 @@ pub fn render(rows: &[Value]) -> Option<String> {
             {
                 placeholder.text = text;
                 placeholder.start = false;
-                placeholder.quiet = quiet;
                 continue;
             }
         }
@@ -480,7 +476,6 @@ pub fn render(rows: &[Value]) -> Option<String> {
             Some(last) if !start && last.start && last.tool == tool => {
                 last.text = text;
                 last.start = false;
-                last.quiet = quiet;
             }
             // The same call reported twice (a tight loop) says nothing new.
             Some(last) if !start && !last.start && last.text == text => {}
@@ -489,22 +484,12 @@ pub fn render(rows: &[Value]) -> Option<String> {
                 start,
                 tool,
                 call_id,
-                quiet,
             }),
         }
     }
-    let shown: Vec<String> = lines
-        .iter()
-        .filter(|line| !line.quiet)
-        .map(|line| line.text.clone())
-        .collect();
-    // A pure research turn has nothing but quiet tools; showing those beats
-    // showing nothing.
-    let shown = if shown.is_empty() {
-        lines.into_iter().map(|line| line.text).collect()
-    } else {
-        shown
-    };
+    // Every step shows live, reads and searches included (Hermes' feed):
+    // a long turn of `cat`/`grep` must not look stalled.
+    let shown: Vec<String> = lines.into_iter().map(|line| line.text).collect();
     if shown.is_empty() {
         return None;
     }

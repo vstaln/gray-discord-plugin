@@ -109,26 +109,13 @@ fn a_long_command_is_capped_at_the_preview_length() {
 }
 
 #[test]
-fn quiet_tools_stay_off_the_bubble_until_they_are_all_there_is() {
+fn reads_and_searches_show_live_like_any_step() {
+    // Hermes' feed: a turn of `cat`/`grep` must not look stalled.
     let read = json!({"phase": "tool_ran", "tool": "read", "detail": "src/lib.rs"});
     let run = json!({"phase": "tool_ran", "tool": "bash", "detail": "cargo test"});
     assert_eq!(
-        activity::render(&[read.clone(), run]).as_deref(),
-        Some("Running `cargo test`"),
-        "a read must not crowd out an action"
-    );
-    // Shell introspection is quiet too: an all-quiet turn falls back to
-    // showing everything rather than going silent.
-    let ls = json!({"phase": "tool_ran", "tool": "bash", "detail": "ls"});
-    assert_eq!(
-        activity::render(&[read.clone(), ls]).as_deref(),
-        Some("Read `src/lib.rs`\nRunning `ls`"),
-        "all-quiet turns still narrate"
-    );
-    assert_eq!(
-        activity::render(&[read]).as_deref(),
-        Some("Read `src/lib.rs`"),
-        "a pure research turn still narrates"
+        activity::render(&[read, run]).as_deref(),
+        Some("Read `src/lib.rs`\nRunning `cargo test`"),
     );
 }
 
@@ -226,32 +213,6 @@ fn repeated_lines_collapse_and_every_line_is_kept() {
     assert_eq!(lines[0], "Running `cargo build`");
     assert_eq!(lines[1], "Running `git status`");
     assert_eq!(lines[3], "Running `cargo test`");
-}
-
-#[test]
-fn shell_introspection_is_quiet_like_its_tool_twin() {
-    // `ls` through the shell is nobody's status: a `gray view` turn narrates
-    // literally only the view, never its `ls` neighbor.
-    let ls = rows(json!({
-        "phase": "tool_ran", "tool": "bash",
-        "detail": "ls -la /home/u 2>/dev/null | head -50"
-    }));
-    let view = rows(json!({
-        "phase": "tool_ran", "tool": "bash",
-        "detail": "gray view /tmp/shot.png"
-    }));
-    let mut both = ls.clone();
-    both.extend(view.clone());
-    assert_eq!(
-        activity::render(&both).as_deref(),
-        Some("Running `gray view /tmp/shot.png`"),
-        "the ls neighbor must not crowd out the view"
-    );
-    // Alone, a quiet turn still narrates rather than going silent.
-    assert_eq!(
-        activity::render(&ls).as_deref(),
-        Some("Running `ls -la /home/u … +1`"),
-    );
 }
 
 #[test]
@@ -448,7 +409,7 @@ async fn the_second_line_edits_the_first_bubble() {
     assert_eq!(log[0], ("-# Running `ls`".to_string(), false), "first post");
     assert_eq!(
         log[1],
-        ("-# Running `cargo test`".to_string(), true),
+        ("-# Running `ls`\n-# Running `cargo test`".to_string(), true),
         "then an edit"
     );
 }
