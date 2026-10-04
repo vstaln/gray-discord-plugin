@@ -19,14 +19,10 @@ pub const MAX_CONTENT_LEN: usize = 2000;
 /// Legacy embed cap retained for pre-V2 queue compatibility. New messages do
 /// not use embeds; they use the V2 component budget instead.
 pub const MAX_EMBEDS: usize = 10;
-/// OAuth2 invite permissions: View Channels + Send Messages + Read History
-/// plus thread participation. Discord does not inherit SEND_MESSAGES into
-/// threads, so the bridge requests both explicitly.
+/// Discord does not inherit SEND_MESSAGES into threads, so the bridge needs
+/// this bit explicitly. The invite's full permission set lives in
+/// `discord_check::INVITE_PERMISSIONS`.
 pub const PERM_SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
-pub const INVITE_PERMISSIONS: u64 = PERM_VIEW_CHANNEL
-    | PERM_SEND_MESSAGES
-    | PERM_READ_MESSAGE_HISTORY
-    | PERM_SEND_MESSAGES_IN_THREADS;
 /// Gateway intent bits for the Task 9 connect (discord.py Intents values).
 pub const INTENT_GUILDS: u32 = 1 << 0;
 pub const INTENT_GUILD_MESSAGES: u32 = 1 << 9;
@@ -451,6 +447,12 @@ impl Rest {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| TransportError::Http(200, "bad response".into()))
+    }
+
+    /// GET /applications/@me, raw: setup's token check reads the owner,
+    /// intents and server count from it (`discord_check::parse_application`).
+    pub async fn application_info(&self) -> Result<Value, TransportError> {
+        self.get("/applications/@me").await
     }
 
     /// GET /applications/@me → (app id, message-content-intent flag).

@@ -25,9 +25,10 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Interactive setup. Default: Hermes parity — token plus your user ID,
-    /// home channel is your DM. `--pair` instead discovers your ID from a
-    /// DM you send the bot (the OpenClaw-style code dance).
+    /// Interactive setup. Default: Hermes parity, the token is checked with
+    /// Discord and the app's owner is offered as you; home channel is your
+    /// DM. `--pair` instead discovers your ID from a DM you send the bot
+    /// (the OpenClaw-style code dance).
     Setup {
         /// Discover the owner's ID by DMing a one-time code to the bot.
         #[arg(long)]
