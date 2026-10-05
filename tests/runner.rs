@@ -399,3 +399,30 @@ async fn without_a_handler_gray_is_not_asked_to_wait() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn exhausted_request_cap_is_request_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let exe = root.join("capped");
+    write_exe(
+        &exe,
+        "#!/bin/sh\necho '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"error\",\"code\":\"bad_request\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"accounting\":{\"requests\":32}}'\nexit 3\n",
+    );
+    let mut config = base_config(&exe, &home);
+    config["max_requests"] = serde_json::json!(32);
+    let err = run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:one",
+        "hello",
+        default_opts(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, RunError::RequestLimit(32)),
+        "unexpected: {err}"
+    );
+}

@@ -226,7 +226,7 @@ macro_rules! press {
     }};
 }
 
-const WORKING: u64 = 0x5865F2;
+const WORKING: u64 = 0x4E5058;
 const DONE: u64 = 0x57F287;
 const STOPPED: u64 = 0x80848E;
 

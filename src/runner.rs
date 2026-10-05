@@ -15,6 +15,8 @@ pub enum RunError {
     Busy,
     Budget(BudgetBlocked),
     Timeout,
+    /// The turn used all `max_requests` provider requests and was stopped.
+    RequestLimit(u64),
     Spawn(String),
     Protocol(String),
     Exit(Option<i32>),
@@ -29,6 +31,7 @@ impl std::fmt::Display for RunError {
             Self::Busy => f.write_str("This conversation is busy"),
             Self::Budget(e) => write!(f, "{e}"),
             Self::Timeout => f.write_str("gray turn timed out"),
+            Self::RequestLimit(n) => write!(f, "gray turn hit its {n}-request limit"),
             Self::Spawn(_) => f.write_str("cannot start gray agent"),
             Self::Protocol(_) => {
                 f.write_str("Invalid agent JSON output; upgrade gray to a compatible version")
@@ -314,7 +317,7 @@ pub async fn run_gray_input(
     let max_requests = config
         .get("max_requests")
         .and_then(Value::as_u64)
-        .unwrap_or(32);
+        .unwrap_or(200);
     let mut input_file = InputFileGuard::default();
     let mut args: Vec<String> = vec![gray_bin.to_string()];
     match &input {
@@ -510,6 +513,13 @@ pub async fn run_gray_input(
             if let Some(budget) = &ledger {
                 budget.settle(&reservation, &accounting);
             }
+        }
+    }
+    // gray reports its request cap as a generic error row; the accounting
+    // beside it says whether the cap is what stopped the turn.
+    if let Some(row) = consumed.terminal.as_ref().filter(|r| r["type"] == "error") {
+        if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
+            return Err(RunError::RequestLimit(max_requests));
         }
     }
     if !status.success() {

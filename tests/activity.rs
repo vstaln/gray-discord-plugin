@@ -690,3 +690,19 @@ async fn a_real_gray_turn_narrates_end_to_end() {
         "reasoning leaked: {card}"
     );
 }
+
+#[test]
+fn a_shell_call_without_a_command_names_the_background_job() {
+    let ran = rows(json!({"phase": "tool_ran", "call_id": "a", "tool": "bash"}));
+    assert_eq!(
+        activity::render(&ran).as_deref(),
+        Some("Checking background job")
+    );
+    let mut done = ran.clone();
+    done.push(json!({"phase": "tool_finished", "call_id": "a", "tool": "bash", "elapsed_ms": 20}));
+    assert_eq!(
+        activity::render(&done).as_deref(),
+        Some("Checked background job (0.0s)"),
+        "never a bare `Ran (0.0s)`"
+    );
+}
