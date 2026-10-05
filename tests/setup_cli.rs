@@ -282,7 +282,7 @@ async fn rerun_keeps_hand_tuned_keys() {
     let path = tmp.path().join("config.json");
     std::fs::write(
         &path,
-        r#"{"token":"OLD","channel_id":"9","budget":{"daily_usd":3},"session_reset":{"mode":"idle","idle_minutes":5}}"#,
+        r#"{"token":"OLD","channel_id":"9","budget":{"daily_usd":3,"turn_usd":1,"input_per_million":1,"output_per_million":2,"model":"fixture"},"session_reset":{"mode":"idle","idle_minutes":5}}"#,
     )
     .unwrap();
     let mut io = Fake::new(true, &["y", "111"], &["FIXTURETOKEN"]);
