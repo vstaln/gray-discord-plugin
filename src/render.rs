@@ -21,8 +21,8 @@ pub const MAX_COMPONENTS: usize = 40;
 /// Interactive component identifiers are limited to 100 characters.
 pub const MAX_CUSTOM_ID: usize = 100;
 
-const INFO_ACCENT: u32 = 0x0058_65F2;
-const DANGER_ACCENT: u32 = 0xED4245;
+pub const INFO_ACCENT: u32 = 0x0058_65F2;
+pub const DANGER_ACCENT: u32 = 0xED4245;
 const QUIET_ACCENT: u32 = 0x0057_4F6E;
 const MAX_DISPLAY_CHARS: usize = 3800;
 const MAX_TEXT_DISPLAY_CHARS: usize = 4000;

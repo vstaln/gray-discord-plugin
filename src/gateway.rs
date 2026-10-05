@@ -1467,8 +1467,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     let Ok(ch) = delivery.channel.parse::<u64>() else {
                         continue;
                     };
-                    let body = crate::text::sanitize(&delivery.text);
-                    let _ = cron_rest.send_text_v2(ch, &body, None).await;
+                    let _ = crate::cron::post_delivery(&cron_rest, ch, &delivery).await;
                 }
             }
         }

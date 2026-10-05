@@ -14,6 +14,7 @@ pub mod component_protocol;
 pub mod component_state;
 pub mod config;
 pub mod cron;
+pub mod cron_card;
 pub mod discord_check;
 pub mod doctor;
 pub mod durable;
