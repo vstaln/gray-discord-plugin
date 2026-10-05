@@ -387,6 +387,16 @@ pub fn uninstall(config_path: &Path) -> Result<String, String> {
     uninstall_with(detect(), config_path)
 }
 
+/// Is the daemon already set up under this box's supervisor? Setup re-runs
+/// restart it instead of asking to install again.
+pub fn installed(config_path: &Path) -> bool {
+    match detect() {
+        Supervisor::Runit { dir } => dir.join(SVC).join("run").is_file(),
+        Supervisor::SystemdUser { unit_dir } => unit_dir.join(NAME).exists(),
+        Supervisor::None => running_pid(&config_dir_of(config_path)).is_some(),
+    }
+}
+
 pub fn install_with(sup: Supervisor, config_path: &Path) -> Result<String, String> {
     let argv = daemon_argv(config_path)?;
     match sup {

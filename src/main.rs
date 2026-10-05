@@ -1,7 +1,10 @@
 fn main() {
     use clap::Parser;
     let cli = gray_discord::cli::Cli::parse();
+    // Absolute, so the service, the lock argv and the saved workdir agree
+    // no matter where setup was run from.
     let path = cli.config_path();
+    let path = std::path::absolute(&path).unwrap_or(path);
     match gray_discord::cli::run(&cli.command, &path) {
         Ok(()) => {}
         Err(e) => {
