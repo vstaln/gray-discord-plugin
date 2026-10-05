@@ -162,38 +162,51 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         .map(str::to_string)
         .unwrap_or_else(|| config_path.to_string_lossy().into_owned());
     let argv = vec![
-        Value::String(exe),
+        Value::String(exe.clone()),
         Value::String("sidecar".to_string()),
         Value::String("--config".to_string()),
         Value::String(resolved),
     ];
-    let previous = data
+    // Refuse only a *different* executable: a row gray installed itself
+    // (`gray plugin install`) owns the same binary and merges cleanly.
+    let prev_exe = data
         .get("plugins")
         .and_then(|p| p.get("discord"))
         .and_then(|d| d.get("argv"))
-        .cloned();
-    if let Some(prev) = previous {
-        if prev != Value::Array(argv.clone()) {
-            return Err(
-                "Another discord plugin is registered; refusing to overwrite it".to_string(),
-            );
-        }
+        .and_then(|a| a.as_array().and_then(|v| v.first()))
+        .and_then(Value::as_str);
+    if prev_exe.is_some_and(|p| p != exe) {
+        return Err("Another discord plugin is registered; refusing to overwrite it".to_string());
     }
     let installed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_default();
-    data["plugins"]["discord"] = json!({
-        "ecosystem": "gray-native",
-        "version": env!("CARGO_PKG_VERSION"),
-        "hash": "",
-        "source": "https://github.com/vstaln/gray-discord-plugin",
-        "argv": argv,
-        "adapter_version": "1.1",
-        "installed_at": installed_at,
-        "scope": "user",
-        "enabled": true
-    });
+    // Merge into any existing row: gray now keeps cli_argv and the consent
+    // record (granted_capabilities, capabilities_hash) in the same lock entry,
+    // so replacing the object would drop them.
+    let entry = &mut data["plugins"]["discord"];
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    entry["ecosystem"] = json!("gray-native");
+    entry["version"] = json!(env!("CARGO_PKG_VERSION"));
+    entry["source"] = json!("https://github.com/vstaln/gray-discord-plugin");
+    entry["argv"] = Value::Array(argv);
+    entry["adapter_version"] = json!("1.1");
+    entry["installed_at"] = json!(installed_at);
+    if entry.get("hash").is_none() {
+        entry["hash"] = json!("");
+    }
+    if entry.get("scope").is_none() {
+        entry["scope"] = json!("user");
+    }
+    if entry.get("enabled").is_none() {
+        entry["enabled"] = json!(true);
+    }
+    if entry.get("cli_argv").is_none() {
+        entry["cli_argv"] = json!([exe]);
+    }
     crate::config::atomic_json(&lock, &data)
 }
 
