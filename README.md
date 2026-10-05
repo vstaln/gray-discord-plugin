@@ -17,10 +17,21 @@ of assuming systemd.
 
 ## Installation
 
+### Quick start
+
+```sh
+gray gateway setup discord
+```
+
+One command, Hermes-style: installs the plugin if it is missing, runs the
+wizard, registers the outgoing tool and offers to start the service.
+Re-running it is safe: hand-tuned settings (limits, budget, shares) are
+kept, and a running service restarts on the new config.
+
 ### Via gray catalog
 
 ```sh
-gray install plugin discord
+gray plugin install discord
 ```
 
 Prebuilt binaries are published for:
@@ -32,7 +43,8 @@ Prebuilt binaries are published for:
 ### From source
 
 ```sh
-cargo build --release --locked
+cargo install --path . --locked   # puts gray-discord on PATH
+gray plugin install discord       # gray finds it there
 ```
 
 ## Setup and Service Lifecycle

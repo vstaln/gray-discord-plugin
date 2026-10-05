@@ -59,28 +59,50 @@ impl Prompter for Tty {
         use std::io::Write;
         let _ = std::io::stderr().write_all(text.as_bytes());
         let _ = std::io::stderr().flush();
-        stty_echo(false);
         let mut line = String::new();
-        let res = std::io::stdin().read_line(&mut line);
-        stty_echo(true);
+        let res = without_echo(|| std::io::stdin().read_line(&mut line));
         let _ = std::io::stderr().write_all(b"\n");
         res.map_err(|_| "cannot read terminal input".to_string())?;
         Ok(line.trim().to_string())
     }
     fn confirm(&mut self, text: &str) -> Result<bool, String> {
-        Ok(self.prompt(text)?.trim().eq_ignore_ascii_case("y"))
+        let answer = self.prompt(text)?.trim().to_ascii_lowercase();
+        Ok(answer == "y" || answer == "yes")
     }
     fn print_line(&mut self, text: &str) {
         eprintln!("{text}");
     }
 }
 
-fn stty_echo(on: bool) {
-    let arg = if on { "echo" } else { "-echo" };
-    let _ = std::process::Command::new("stty")
-        .arg(arg)
-        .stdin(std::process::Stdio::inherit())
-        .status();
+/// Echo off for one read. Ctrl-C would otherwise kill setup with the
+/// terminal still silent, so SIGINT restores it first (tcsetattr is
+/// async-signal-safe).
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    static SAVED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+    extern "C" fn restore_and_exit(_: libc::c_int) {
+        if let Some(t) = SAVED.get() {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
+        }
+        unsafe { libc::_exit(130) };
+    }
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut term) } != 0 {
+        return read();
+    }
+    let saved = *SAVED.get_or_init(|| term);
+    let mut quiet = saved;
+    quiet.c_lflag &= !libc::ECHO;
+    let handler = restore_and_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let old = unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, &quiet);
+        libc::signal(libc::SIGINT, handler)
+    };
+    let out = read();
+    unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, &saved);
+        libc::signal(libc::SIGINT, old);
+    }
+    out
 }
 
 /// Resolve the gray binary (`GRAY_BIN` env or `PATH` lookup).
@@ -192,7 +214,11 @@ pub async fn run_wired(
     };
 
     // Whoever the old config allowed stays allowed: the wizard only adds.
-    let (prior_owner, prior_allowed) = prior_access(path);
+    let prior = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .filter(Value::is_object);
+    let (prior_owner, prior_allowed) = prior_access(prior.as_ref());
 
     for line in [
         "1. Open https://discord.com/developers/applications → New Application",
@@ -271,15 +297,33 @@ pub async fn run_wired(
     if !allowed.is_empty() {
         saved["allowed_users"] = Value::Array(allowed.into_iter().map(Value::String).collect());
     }
+    // A re-run replaces only what the wizard asked about: limits, budget,
+    // shares and other hand-tuned keys survive (unless they no longer
+    // validate, then the fresh config stands alone).
+    if let Some(mut merged) = prior {
+        for (k, v) in saved.as_object().into_iter().flatten() {
+            if k != "session_reset" || merged.get(k).is_none() {
+                merged[k] = v.clone();
+            }
+        }
+        if saved.get("allowed_users").is_none() {
+            if let Some(m) = merged.as_object_mut() {
+                m.remove("allowed_users");
+            }
+        }
+        if crate::config::validate_config(&merged).is_ok() {
+            saved = merged;
+        }
+    }
     crate::config::save_config(path, &saved)?;
     io.print_line("Configuration saved privately.");
 
-    // Prove it with the app's own doctor before anyone is told it worked.
-    let report = (wiring.verify)(&saved).await;
-    match report {
-        Ok(()) => io.print_line("Doctor verified the configuration."),
-        Err(e) => io.print_line(&format!("Doctor disagreed (fix and re-run): {e}")),
-    }
+    // Prove it with the app's own doctor before anyone is told it worked;
+    // a failure stops here so no service is started on a broken config.
+    (wiring.verify)(&saved).await.map_err(|e| {
+        format!("Saved, but the doctor disagreed: {e}. Fix it, then run `gray discord doctor` and `gray discord install`.")
+    })?;
+    io.print_line("Doctor verified the configuration.");
     Ok(true)
 }
 
@@ -287,11 +331,8 @@ pub const OFFLINE_INTENT_NOTE: &str = "Make sure Message Content Intent is on (B
 
 /// `owner_id` and `allowed_users` from the config being replaced, read raw
 /// (it may not validate any more). Missing or unreadable means nobody.
-fn prior_access(path: &Path) -> (Option<String>, Vec<String>) {
-    let Some(old) = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-    else {
+fn prior_access(old: Option<&Value>) -> (Option<String>, Vec<String>) {
+    let Some(old) = old else {
         return (None, Vec::new());
     };
     let owner = old

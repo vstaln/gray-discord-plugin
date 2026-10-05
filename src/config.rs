@@ -29,7 +29,19 @@ pub fn atomic_json(path: &Path, data: &Value) -> Result<(), String> {
         serde_json::to_string_pretty(data).map_err(|_| "cannot encode config".to_string())?;
     text.push('\n');
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, text.as_bytes()).map_err(|_| "cannot write config".to_string())?;
+    // Born 0600: the token is never readable by others, not even briefly.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .map_err(|_| "cannot write config".to_string())?;
+    }
     fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
         .map_err(|_| "cannot protect config".to_string())?;
     fs::rename(&tmp_path, path).map_err(|_| "cannot replace config".to_string())?;

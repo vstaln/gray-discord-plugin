@@ -36,6 +36,9 @@ pub enum Command {
     },
     Run,
     Sidecar,
+    /// Print the plugin manifest (what `gray plugin install discord` reads).
+    #[command(hide = true)]
+    Manifest,
     Register,
     Install,
     Status,
@@ -167,15 +170,10 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         Value::String("--config".to_string()),
         Value::String(resolved),
     ];
-    // Refuse only a *different* executable: a row gray installed itself
-    // (`gray plugin install`) owns the same binary and merges cleanly.
     let prev_exe = data
-        .get("plugins")
-        .and_then(|p| p.get("discord"))
-        .and_then(|d| d.get("argv"))
-        .and_then(|a| a.as_array().and_then(|v| v.first()))
+        .pointer("/plugins/discord/argv/0")
         .and_then(Value::as_str);
-    if prev_exe.is_some_and(|p| p != exe) {
+    if prev_exe.is_some_and(|p| p != exe && Path::new(p).is_file()) {
         return Err("Another discord plugin is registered; refusing to overwrite it".to_string());
     }
     let installed_at = std::time::SystemTime::now()
@@ -204,7 +202,14 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
     if entry.get("enabled").is_none() {
         entry["enabled"] = json!(true);
     }
-    if entry.get("cli_argv").is_none() {
+    // Re-register heals a row whose CLI binary moved (reinstall, cargo
+    // install to a new prefix); a working custom cli_argv is kept.
+    let cli_ok = entry
+        .get("cli_argv")
+        .and_then(|a| a.get(0))
+        .and_then(Value::as_str)
+        .is_some_and(|p| Path::new(p).is_file());
+    if !cli_ok {
         entry["cli_argv"] = json!([exe]);
     }
     crate::config::atomic_json(&lock, &data)
@@ -223,6 +228,20 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
     use serde_json::Value;
     match cmd {
         Command::Sidecar => crate::sidecar::serve(config_path),
+        Command::Manifest => {
+            use clap::CommandFactory;
+            let mut m = crate::sidecar::MANIFEST.clone();
+            m["completion"] = Cli::command()
+                .get_subcommands()
+                .filter(|c| {
+                    !c.is_hide_set() && !["run", "sidecar", "register"].contains(&c.get_name())
+                })
+                .map(|c| Value::String(c.get_name().to_string()))
+                .collect();
+            m["sidecar_args"] = serde_json::json!(["sidecar"]);
+            println!("{m}");
+            Ok(())
+        }
         Command::Register => {
             let config: Value = crate::config::load_config(config_path)?;
             register(&config, config_path)
@@ -241,6 +260,11 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 let config: Value = crate::config::load_config(config_path)?;
                 register(&config, config_path)?;
                 println!("Outgoing tool registered with gray.");
+                if crate::service::installed(config_path) {
+                    // Hermes parity: a reconfigured bot takes effect now.
+                    println!("{}", crate::service::restart(config_path)?);
+                    return Ok(());
+                }
                 let answer = io.prompt("Enable and start the background service now? [Y/n] ")?;
                 if install_confirmed(&answer) {
                     let line = crate::service::install(config_path)?;

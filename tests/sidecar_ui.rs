@@ -228,6 +228,9 @@ async fn imported_file_id_reaches_the_model() {
             "token": "test-token",
             "channel_id": "1544925612823547987",
             "owner_id": "1509856035576483874",
+            "gray_bin": std::env::current_exe().unwrap(),
+            "gray_home": dir.path().join("gray-home"),
+            "workdir": &work,
         })
         .to_string(),
     )

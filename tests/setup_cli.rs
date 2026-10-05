@@ -257,26 +257,44 @@ async fn non_snowflake_id_is_refused() {
 }
 
 #[tokio::test]
-async fn doctor_disagreement_is_reported_but_the_config_stands() {
+async fn doctor_disagreement_stops_setup_but_the_config_stands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut io = Fake::new(true, &["111"], &["FIXTURETOKEN"]);
     let path = tmp.path().join("config.json");
-    assert!(run_offline(
+    let err = run_offline(
         &path,
         &mut io,
         &wiring_bad_doctor(&pairing_ok, tmp.path()),
-        false
+        false,
     )
     .await
-    .unwrap());
+    .unwrap_err();
     // The save is never rolled back — the operator fixes the intent and
-    // re-runs the doctor; but nothing claims success.
+    // re-runs the doctor; but setup fails, so no service starts on it.
     assert!(path.exists());
-    assert!(io
-        .log
-        .iter()
-        .any(|l| l.contains("Doctor disagreed") && l.contains("Message Content Intent")));
+    assert!(err.contains("doctor disagreed") && err.contains("Message Content Intent"));
     assert!(!io.log.iter().any(|l| l.contains("Doctor verified")));
+}
+
+#[tokio::test]
+async fn rerun_keeps_hand_tuned_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"token":"OLD","channel_id":"9","budget":{"daily_usd":3,"turn_usd":1,"input_per_million":1,"output_per_million":2,"model":"fixture"},"session_reset":{"mode":"idle","idle_minutes":5}}"#,
+    )
+    .unwrap();
+    let mut io = Fake::new(true, &["y", "111"], &["FIXTURETOKEN"]);
+    assert!(
+        run_offline(&path, &mut io, &wiring(&pairing_ok, tmp.path()), false)
+            .await
+            .unwrap()
+    );
+    let s = saved(&path);
+    assert_eq!(s["token"], "FIXTURETOKEN");
+    assert_eq!(s["budget"]["daily_usd"], 3);
+    assert_eq!(s["session_reset"]["mode"], "idle");
 }
 
 #[test]
