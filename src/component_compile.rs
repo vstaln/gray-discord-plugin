@@ -289,11 +289,15 @@ impl Compiler<'_, '_> {
                 let mut items = Vec::with_capacity(gallery.items.len());
                 for (index, item) in gallery.items.iter().enumerate() {
                     let item_path = format!("{path}.items[{index}]");
+                    let media_path = format!("{item_path}.media");
+                    // Gallery cells only draw image/video; refuse the rest
+                    // before resolving it so nothing half-posts.
+                    self.require_renderable(&item.media, &media_path)?;
                     let (description, spoiler) =
                         media_extras(&item.media, &item.description, item.spoiler);
                     validate_media_description(description.as_deref(), &item_path)?;
                     items.push(json!({
-                        "media": self.media(&item.media, &format!("{item_path}.media"))?,
+                        "media": self.media(&item.media, &media_path)?,
                         "description": description,
                         "spoiler": spoiler
                     }));
@@ -705,6 +709,43 @@ impl Compiler<'_, '_> {
         }
     }
 
+    /// Discord renders images and video inside a media gallery. A managed file
+    /// of any other type arrives as a broken "Image failed to load" card, so
+    /// it is refused here, where the author can still read the path and fix
+    /// the document. A remote URL is judged only by a known-bad extension: an
+    /// odd or missing extension is let through, because guessing wrong would
+    /// break a URL that does render.
+    fn require_renderable(&self, media: &MediaSource, path: &str) -> Result<(), CompileError> {
+        let label = match media {
+            MediaSource::File { file_id } => {
+                let file = self
+                    .context
+                    .allocator
+                    .resolve_file(file_id)
+                    .map_err(|error| prefix_path(error, path))?;
+                if RENDERABLE_TYPES
+                    .iter()
+                    .any(|kind| file.media_type.starts_with(kind))
+                {
+                    return Ok(());
+                }
+                format!("{} is {}", file.name, file.media_type)
+            }
+            MediaSource::Remote { url, .. } => match unrenderable_extension(url) {
+                Some(extension) => extension,
+                None => return Ok(()),
+            },
+        };
+        Err(CompileError::new(
+            "invalid_gallery",
+            path,
+            format!(
+                "a media gallery item must be image/* or video/* ({label}); \
+                 use a file component instead"
+            ),
+        ))
+    }
+
     fn media_url(&self, media: &MediaSource, path: &str) -> Result<String, CompileError> {
         match media {
             MediaSource::Remote { url, .. } => {
@@ -909,6 +950,27 @@ fn validate_option(option: &SelectOption, path: &str) -> Result<(), CompileError
     Ok(())
 }
 
+/// Media types a Discord media gallery will actually draw.
+const RENDERABLE_TYPES: &[&str] = &["image/", "video/"];
+
+/// Extensions that are certainly not an image or a video. Deliberately a
+/// short deny-list: anything unknown is allowed through to Discord.
+const UNRENDERABLE_EXTENSIONS: &[&str] = &[
+    "pdf", "txt", "log", "md", "csv", "json", "zip", "gz", "bz2", "xz", "tar", "7z", "bin", "exe",
+    "mp3", "ogg", "wav", "epub",
+];
+
+/// The lowercased extension when it is one Discord cannot draw, else `None`.
+fn unrenderable_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    let (_, extension) = last.rsplit_once('.')?;
+    let extension = extension.to_ascii_lowercase();
+    UNRENDERABLE_EXTENSIONS
+        .contains(&extension.as_str())
+        .then_some(extension)
+}
+
 fn validate_url(url: &str, path: &str) -> Result<(), CompileError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| CompileError::new("invalid_url", path, "URL is invalid"))?;
@@ -988,7 +1050,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn allocator() -> DeterministicAllocator {
+    pub(super) fn allocator() -> DeterministicAllocator {
         DeterministicAllocator::default().with_file(FileRef {
             id: "file-1".into(),
             name: "diagram.png".into(),
@@ -1090,7 +1152,7 @@ mod tests {
         }
     }
 
-    fn message_document() -> MessageDocument {
+    pub(super) fn message_document() -> MessageDocument {
         MessageDocument {
             version: 1,
             document_id: LogicalId::new("message"),
@@ -1324,6 +1386,7 @@ mod tests {
 
 #[cfg(test)]
 mod negative_tests {
+    use super::tests::{allocator, message_document};
     use super::*;
 
     fn button(id: &str) -> MessageNode {
@@ -1444,5 +1507,111 @@ mod negative_tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "invalid_text");
+    }
+
+    /// Discord draws images and video in a media gallery; every other media
+    /// type arrives as a broken "Image failed to load" card, so the gallery
+    /// arm refuses it while the author can still read the path.
+    #[test]
+    fn gallery_refuses_media_it_cannot_draw() {
+        let mut allocator = DeterministicAllocator::default()
+            .with_file(FileRef {
+                id: "pdf-1".into(),
+                name: "deck.pdf".into(),
+                media_type: "application/pdf".into(),
+                size: 10,
+                sha256: "hash".into(),
+            })
+            .with_file(FileRef {
+                id: "zip-1".into(),
+                name: "bundle.zip".into(),
+                media_type: "application/octet-stream".into(),
+                size: 10,
+                sha256: "hash".into(),
+            });
+        for file_id in ["pdf-1", "zip-1"] {
+            let mut context = CompileContext::new(Origin::Agent, &mut allocator);
+            let document = MessageDocument {
+                components: vec![MessageNode::MediaGallery(MediaGallery {
+                    items: vec![GalleryItem {
+                        media: MediaSource::File {
+                            file_id: file_id.into(),
+                        },
+                        description: None,
+                        spoiler: false,
+                    }],
+                })],
+                ..message_document()
+            };
+            let error = compile_message(&document, &mut context).unwrap_err();
+            assert_eq!(error.code, "invalid_gallery");
+            assert_eq!(error.path, "$.components[0].items[0].media");
+            assert!(
+                error.message.contains("use a file component"),
+                "message should name the fix: {}",
+                error.message
+            );
+        }
+
+        // a remote URL is judged only by a known-bad extension
+        let mut context = CompileContext::new(Origin::Agent, &mut allocator);
+        let document = MessageDocument {
+            components: vec![MessageNode::MediaGallery(MediaGallery {
+                items: vec![GalleryItem {
+                    media: MediaSource::Remote {
+                        url: "https://example.com/deck.pdf?v=2".into(),
+                        description: None,
+                        spoiler: false,
+                    },
+                    description: None,
+                    spoiler: false,
+                }],
+            })],
+            ..message_document()
+        };
+        assert_eq!(
+            compile_message(&document, &mut context).unwrap_err().code,
+            "invalid_gallery"
+        );
+    }
+
+    #[test]
+    fn gallery_accepts_images_video_and_unknown_urls() {
+        let mut allocator = allocator();
+        let mut context = CompileContext::new(Origin::Agent, &mut allocator);
+        let remote = |url: &str| GalleryItem {
+            media: MediaSource::Remote {
+                url: url.into(),
+                description: None,
+                spoiler: false,
+            },
+            description: None,
+            spoiler: false,
+        };
+        let document = MessageDocument {
+            components: vec![MessageNode::MediaGallery(MediaGallery {
+                items: vec![
+                    GalleryItem {
+                        media: MediaSource::File {
+                            file_id: "file-1".into(),
+                        },
+                        description: None,
+                        spoiler: false,
+                    },
+                    remote("https://example.com/clip.mp4"),
+                    // no extension: unknown, so Discord gets to decide
+                    remote("https://example.com/render/9f2a"),
+                ],
+            })],
+            ..message_document()
+        };
+        let compiled = compile_message(&document, &mut context)
+            .expect("images, video and extension-less URLs still compile");
+        let gallery = compiled
+            .components
+            .iter()
+            .find(|component| component.get("type").and_then(Value::as_u64) == Some(12))
+            .expect("gallery compiled");
+        assert_eq!(gallery["items"].as_array().map(Vec::len), Some(3));
     }
 }

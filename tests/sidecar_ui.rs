@@ -161,6 +161,9 @@ async fn invalid_documents_name_the_path_and_never_touch_discord() {
         "{content}"
     );
     assert!(content.contains("colour"), "{content}");
+    // The refusal must never send the model to doctor or echo config.
+    assert!(!content.contains("doctor"), "{content}");
+    assert!(!content.contains("test-token"), "{content}");
 }
 
 #[tokio::test]
@@ -191,4 +194,58 @@ async fn every_tool_reply_carries_content() {
         .await;
         assert!(result["content"].is_string());
     }
+}
+
+/// The schema must teach the names the parser accepts, never Discord's codes.
+#[tokio::test]
+async fn message_schema_lists_only_named_types() {
+    let result = sidecar::dispatch(
+        "tool/call",
+        &json!({"name": "discord_ui_schema", "args": {"surface": "message"}}),
+        std::path::Path::new("config.json"),
+    )
+    .await;
+    let components = result["document"]["components"]
+        .as_array()
+        .expect("components");
+    assert!(
+        components.iter().all(|c| c["type"].is_string()),
+        "{components:?}"
+    );
+}
+
+/// Regression: a file import used to hide the managed id in a field the model
+/// never reads, so no document could reference it. The id rides `content`.
+#[tokio::test]
+async fn imported_file_id_reaches_the_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).expect("workdir");
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "token": "test-token",
+            "channel_id": "1544925612823547987",
+            "owner_id": "1509856035576483874",
+        })
+        .to_string(),
+    )
+    .expect("config");
+    std::fs::write(work.join("slide.png"), b"\x89PNG\r\n\x1a\n").expect("png");
+
+    // The import root is the process cwd — save and restore it.
+    let previous = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&work).expect("chdir");
+    let result = sidecar::dispatch(
+        "tool/call",
+        &json!({"name": "discord_file", "args": {"action": "import", "path": "slide.png"}}),
+        &config,
+    )
+    .await;
+    std::env::set_current_dir(previous).expect("restore cwd");
+
+    let content = result["content"].as_str().expect("import reports content");
+    assert!(content.contains("file_id"), "content: {content}");
+    assert_eq!(result["file"]["name"], "slide.png");
 }
