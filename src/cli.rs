@@ -170,6 +170,12 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         Value::String("--config".to_string()),
         Value::String(resolved),
     ];
+    let prev_exe = data
+        .pointer("/plugins/discord/argv/0")
+        .and_then(Value::as_str);
+    if prev_exe.is_some_and(|p| p != exe && Path::new(p).is_file()) {
+        return Err("Another discord plugin is registered; refusing to overwrite it".to_string());
+    }
     let installed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())

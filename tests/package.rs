@@ -172,6 +172,8 @@ fn registration_merges_into_an_existing_lock_row() {
     std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
     // The row belongs to this same binary (argv[0] == current exe), so
     // registration merges into it rather than refusing.
+    let custom_cli = home.join("custom-cli");
+    std::fs::write(&custom_cli, "fixture").unwrap();
     let exe = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
@@ -181,7 +183,7 @@ fn registration_merges_into_an_existing_lock_row() {
         serde_json::json!({"schema": 1, "plugins": {"discord": {
             "granted_capabilities": ["tool"],
             "capabilities_hash": "abc",
-            "cli_argv": ["/already/on/path"],
+            "cli_argv": [custom_cli],
             "enabled": false,
             "hash": "sha256:existing",
             "argv": [exe, "old", "args"]
@@ -197,7 +199,7 @@ fn registration_merges_into_an_existing_lock_row() {
     // Consent and gray's cli_argv survive the merge; the user's enabled flag too.
     assert_eq!(entry["granted_capabilities"], serde_json::json!(["tool"]));
     assert_eq!(entry["capabilities_hash"], "abc");
-    assert_eq!(entry["cli_argv"], serde_json::json!(["/already/on/path"]));
+    assert_eq!(entry["cli_argv"], serde_json::json!([custom_cli]));
     assert_eq!(entry["enabled"], false);
     assert_eq!(entry["hash"], "sha256:existing");
     // argv still updated to the sidecar invocation.
@@ -228,16 +230,49 @@ fn a_fresh_lock_row_gets_cli_argv() {
 fn a_different_executable_in_the_row_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
+    let other = home.join("other-discord");
+    std::fs::write(&other, "fixture").unwrap();
     let lock = home.join("plugins/lock.json");
     std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
     std::fs::write(
         &lock,
         serde_json::json!({"schema": 1, "plugins": {"discord": {
-            "argv": ["/usr/bin/other-discord", "sidecar"]
+            "argv": [other, "sidecar"]
         }}})
         .to_string(),
     )
     .unwrap();
     let config = serde_json::json!({"gray_home": home.to_str().unwrap()});
     assert!(gray_discord::cli::register(&config, &home.join("config.json")).is_err());
+}
+
+#[test]
+fn registration_heals_missing_binary_paths_without_losing_consent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let missing = home.join("removed-binary");
+    let lock = home.join("plugins/lock.json");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(
+        &lock,
+        serde_json::json!({"schema": 1, "plugins": {"discord": {
+            "argv": [missing, "sidecar"],
+            "cli_argv": [missing],
+            "granted_capabilities": ["tool"],
+            "capabilities_hash": "existing-consent",
+            "enabled": false
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let config = serde_json::json!({"gray_home": home.to_str().unwrap()});
+    gray_discord::cli::register(&config, &home.join("config.json")).unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
+    let entry = &data["plugins"]["discord"];
+    let exe = std::env::current_exe().unwrap();
+    assert_eq!(entry["argv"][0], exe.to_string_lossy().as_ref());
+    assert_eq!(entry["cli_argv"][0], exe.to_string_lossy().as_ref());
+    assert_eq!(entry["granted_capabilities"], serde_json::json!(["tool"]));
+    assert_eq!(entry["capabilities_hash"], "existing-consent");
+    assert_eq!(entry["enabled"], false);
 }
