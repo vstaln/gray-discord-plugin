@@ -1292,7 +1292,7 @@ impl<T> OptionalStr<T> for Result<T, rusqlite::Error> {
         match self {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(_) => Err("queue query failed".to_string()),
+            Err(e) => Err(format!("queue query failed: {e}")),
         }
     }
 }

@@ -597,9 +597,9 @@ carry short-lived, opaque, single-use state tokens rather than schedule IDs, and
 successful presses update the original V2 message.
 
 `/cron` fronts the plugin's own schedule store rather than gray's cron CLI.
-gray's cron is file-only and needs a ticker per home; this daemon ticks only
-its own table, so a `gray cron add` issued from Discord would never fire.
-Schedules therefore carry the channel and conversation they belong to, and a
+(A `gray cron add` issued by the model in a turn is separate: it lands in that
+conversation's gray store, which this daemon ticks via `gray cron tick --json`;
+see "Cron that comes back to the chat".) Plugin schedules carry the channel and conversation they belong to, and a
 job created in one channel delivers to that channel — a job added by
 `gray discord schedule add` targets the configured home channel.
 
