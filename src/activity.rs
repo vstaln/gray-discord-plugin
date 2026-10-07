@@ -297,10 +297,11 @@ fn line(row: &Value, elapsed: Option<u64>) -> Option<String> {
     let detail = row.get("detail").and_then(Value::as_str).unwrap_or("");
     let name = name_of(row);
     match phase {
-        // The call has begun but has not reported its arguments yet. The
-        // matching `tool_ran` overwrites this line rather than stacking a
-        // second one for the same call.
-        "tool_started" => Some(label(tool, &name)),
+        // The call has begun but has not reported its arguments yet: a bare
+        // "Running" says nothing the status chip doesn't, and reads as a
+        // duplicate beside the finished calls above it. The call appears
+        // once its `tool_ran` lands, already carrying its command.
+        "tool_started" => None,
         "tool_ran" => Some(ran_line(tool, &name, detail, elapsed)),
         "tool_finished" if row.get("error").and_then(Value::as_bool) == Some(true) => Some(
             format!("{} failed", if tool.is_empty() { "Tool" } else { &name }),
@@ -431,73 +432,28 @@ fn elapsed_of(row: &Value, by_call: &HashMap<String, u64>) -> Option<u64> {
         .and_then(|id| by_call.get(id).copied())
 }
 
-struct BubbleLine {
-    text: String,
-    /// A `tool_started` placeholder: the matching `tool_ran` overwrites it
-    /// instead of adding a second line for the same call.
-    start: bool,
-    tool: String,
-    /// The call it narrates, so parallel calls each find their placeholder.
-    call_id: String,
-}
-
 /// Render one tool bubble's rows into its body: every distinct line, oldest
 /// first (Hermes' accumulating progress bubble). `None` when nothing is
 /// worth showing.
 pub fn render(rows: &[Value]) -> Option<String> {
     let by_call = elapsed_by_call(rows);
-    let mut lines: Vec<BubbleLine> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     for row in rows {
         let Some(text) = line(row, elapsed_of(row, &by_call)) else {
             continue;
         };
-        let tool = row
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let start = row.get("phase").and_then(Value::as_str) == Some("tool_started");
-        let call_id = row
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // Parallel calls start together and report later: each `tool_ran`
-        // replaces its own call's placeholder, wherever it sits.
-        if !start && !call_id.is_empty() {
-            if let Some(placeholder) = lines
-                .iter_mut()
-                .rev()
-                .find(|line| line.start && line.call_id == call_id)
-            {
-                placeholder.text = text;
-                placeholder.start = false;
-                continue;
-            }
+        // The same call reported twice (a tight loop) says nothing new.
+        if lines.last() == Some(&text) {
+            continue;
         }
-        match lines.last_mut() {
-            // One call, one line: its `tool_ran` overwrites the placeholder.
-            Some(last) if !start && last.start && last.tool == tool => {
-                last.text = text;
-                last.start = false;
-            }
-            // The same call reported twice (a tight loop) says nothing new.
-            Some(last) if !start && !last.start && last.text == text => {}
-            _ => lines.push(BubbleLine {
-                text,
-                start,
-                tool,
-                call_id,
-            }),
-        }
+        lines.push(text);
     }
     // Every step shows live, reads and searches included (Hermes' feed):
     // a long turn of `cat`/`grep` must not look stalled.
-    let shown: Vec<String> = lines.into_iter().map(|line| line.text).collect();
-    if shown.is_empty() {
+    if lines.is_empty() {
         return None;
     }
-    Some(shown.join("\n"))
+    Some(lines.join("\n"))
 }
 
 #[derive(Default)]

@@ -359,12 +359,12 @@ Let me check what's running on the box.                    ← message 1
 ````
 
 - A message is posted as soon as its step has something to show. Prose
-  streams into its message about once a second with a ` ▉` cursor; a tool
-  line reads `Running` until the call returns, then `Ran` with its duration.
+  streams into its message about once a second with a ` ▉` cursor. Each tool
+  call is one line: `Running` while it is in flight, `Ran` with its
+  duration once it returns — never a bare `Running` placeholder.
 - A group of more than 6 tool lines folds to a count plus its latest 2
   lines; the full list sits in a spoiler box below them (tap to show).
-- Everything is plain text: no emojis in tool lines, the status chip or
-  buttons.
+- Everything is plain text: no emojis in tool lines or the status chip.
 - The newest message carries the turn's **status chip**: a small box whose
   clock is a Discord timestamp (`<t:…:R>`), so every client keeps "Working ·
   started 20 seconds ago" current on its own and a quiet turn (a long
@@ -373,20 +373,17 @@ Let me check what's running on the box.                    ← message 1
 - **Stop** (danger button) stops the turn, like `/stop`. The pressed message
   flips to "Stopping…" in the same interaction response, then settles.
   Any admitted user in the channel can press it once.
-- The chip's accent tracks the turn: blurple while working, green when done
-  (`Done in 7.2s · ran 1 command`), red on failure, grey when stopped
-  (`Stopped after 12s · actions may already have happened`). A failed or
-  stopped turn's chip is its notice, so nothing extra is posted.
+- The chip's accent tracks the turn: blurple while working, red on failure,
+  grey when stopped (`Stopped after 12s · actions may already have
+  happened`). A finished turn drops the chip outright — the answer stands
+  alone, no `Done in …` box and no buttons. A failed or stopped turn's chip
+  is its notice, so nothing extra is posted.
 - The answer is the last message. When the agent's last step was prose, that
   message becomes the answer in place; otherwise the answer is posted as a
   new message below the tool lines.
 - Files the answer names with `MEDIA:` tags land **inside** the answer's
   message: images and videos in a Media Gallery, anything else as File cards
   (up to 10; more go out as a separate post).
-- The settled chip offers **Retry** (run the same message again as a new
-  turn) and **New chat** (same as `/new`). Only the latest turn keeps them;
-  starting the next turn removes them from the previous one. Buttons expire
-  after a day.
 - A message too long for Discord (4000 characters) continues in the next
   one, cut at a newline, with code fences closed and reopened at the cut, up
   to 8. A turn opens at most 30 messages; past that, later steps share the

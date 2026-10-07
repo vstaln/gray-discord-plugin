@@ -218,15 +218,10 @@ pub struct Settled {
     pub media_shown: usize,
 }
 
-/// A settled card's message id and its components without the buttons.
-type RetiredCard = (String, Vec<Value>);
-
-/// The `custom_id`s of a turn card's buttons, minted per turn.
+/// The `custom_id` of a turn card's Stop button, minted per turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnButtons {
     pub stop: Option<String>,
-    pub retry: Option<String>,
-    pub new_chat: Option<String>,
 }
 
 /// What a failed turn-message request means for the turn (Hermes' edit
@@ -280,9 +275,6 @@ pub struct Runtime<R, D> {
     timelines: std::sync::Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, crate::stream::Timeline>>,
     >,
-    /// The last settled card per channel/conversation, as it should look
-    /// once the next turn starts (its Retry / New chat buttons gone).
-    retired: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, RetiredCard>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -305,7 +297,6 @@ impl<R, D> Runtime<R, D> {
             timelines: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            retired: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -441,9 +432,7 @@ impl<R, D> Runtime<R, D> {
         .await
     }
 
-    /// `buttons` are the card's Stop, Retry and New chat `custom_id`s, when
-    /// they were minted. Only the latest turn offers Retry / New chat: the
-    /// previous card in this conversation loses them now.
+    /// `buttons` carries the card's Stop `custom_id`, when one was minted.
     pub async fn begin_turn(
         &self,
         channel: &str,
@@ -455,14 +444,7 @@ impl<R, D> Runtime<R, D> {
             crate::activity::begin(sink, conversation);
         }
         let key = activity_key(channel, conversation);
-        let previous = self.retired.lock().await.remove(&key);
-        if let (Some((id, components)), Some(rest), Ok(ch)) =
-            (previous, self.rest.as_ref(), channel.parse::<u64>())
-        {
-            let _ = rest.edit_v2(ch, &id, &components).await;
-        }
-        let mut timeline = crate::stream::Timeline::new(text, self.now_secs())
-            .with_actions(buttons.retry, buttons.new_chat);
+        let mut timeline = crate::stream::Timeline::new(text, self.now_secs());
         if let Some(stop) = buttons.stop {
             timeline = timeline.with_stop(stop);
         }
@@ -568,9 +550,6 @@ impl<R, D> Runtime<R, D> {
             tokio::time::sleep(std::time::Duration::from_secs_f64(wait.clamp(0.5, 5.0))).await;
         }
         let timeline = self.timelines.lock().await.remove(&key);
-        if let Some(retired) = timeline.as_ref().and_then(crate::stream::Timeline::retired) {
-            self.retired.lock().await.insert(key.clone(), retired);
-        }
         if let Some(ref sink) = self.activity {
             let history = crate::activity::finish(sink, conversation);
             if crate::activity::enabled(&self.config) && crate::activity::card_enabled(&self.config)
@@ -843,18 +822,8 @@ where
                 .ok()
                 .map(|token| format!("turn:{kind}:{token}"))
         };
-        // Retry and New chat outlive the turn by a day. A slash command's
-        // card is not the answer, and a component event cannot be replayed
-        // as text, so those get Stop only.
-        let ordinary = item.interaction_token.is_none();
         let buttons = TurnButtons {
             stop: mint("stop", &item.id, ttl),
-            retry: (ordinary && item.input_json.is_none())
-                .then(|| mint("retry", &item.id, 86_400))
-                .flatten(),
-            new_chat: ordinary
-                .then(|| mint("new", &item.conversation, 86_400))
-                .flatten(),
         };
         self.begin_turn(&item.channel, &item.conversation, stream_text, buttons)
             .await;
@@ -1719,9 +1688,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             )
                         );
                         let is_autocomplete = interaction.kind == InteractionType::ApplicationCommandAutocomplete;
-                        // The turn card's Stop / Retry / New chat buttons are
-                        // plugin-owned, not typed agent components: handle
-                        // them before that router.
+                        // The turn card's Stop button is plugin-owned, not a
+                        // typed agent component: handle it before that router.
                         if let Some(twilight_model::application::interaction::InteractionData::MessageComponent(component)) = &interaction.data {
                             let id = component.custom_id.as_str();
                             if id.starts_with("turn:stop:") {
@@ -1730,14 +1698,6 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     .as_ref()
                                     .and_then(|message| serde_json::to_value(&message.components).ok());
                                 crate::command_dispatch::stop_button(&ctx, id, pressed.as_ref()).await;
-                                continue;
-                            }
-                            if id.starts_with("turn:retry:") {
-                                crate::command_dispatch::retry_button(&ctx, id).await;
-                                continue;
-                            }
-                            if id.starts_with("turn:new:") {
-                                crate::command_dispatch::new_chat_button(&ctx, id).await;
                                 continue;
                             }
                             if id.starts_with("ask:") {

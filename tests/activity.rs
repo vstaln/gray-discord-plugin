@@ -34,9 +34,13 @@ fn bash_line_matches_hermes_format() {
 }
 
 #[test]
-fn a_start_line_is_replaced_by_its_own_ran_line() {
+fn a_start_line_says_nothing_until_the_call_reports() {
     let started = rows(json!({"phase": "tool_started", "call_id": "a", "tool": "bash"}));
-    assert_eq!(activity::render(&started).as_deref(), Some("Running"));
+    assert_eq!(
+        activity::render(&started),
+        None,
+        "a bare 'Running' is noise: the status chip already says the turn works"
+    );
     let ran =
         rows(json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "sleep 30"}));
     assert_eq!(
@@ -53,7 +57,7 @@ fn a_start_line_is_replaced_by_its_own_ran_line() {
 }
 
 #[test]
-fn parallel_calls_each_replace_their_own_placeholder() {
+fn parallel_calls_each_get_their_own_line() {
     let mut batch: Vec<serde_json::Value> = ["a", "b", "c"]
         .iter()
         .map(|id| json!({"phase": "tool_started", "call_id": id, "tool": "bash"}))
@@ -64,7 +68,7 @@ fn parallel_calls_each_replace_their_own_placeholder() {
     assert_eq!(
         activity::render(&batch).as_deref(),
         Some("Running `uptime`\nRunning `date -u`\nRunning `nproc`"),
-        "three calls, three lines, no stale placeholders"
+        "three calls, three lines, no bare 'Running' placeholders"
     );
 }
 
@@ -185,7 +189,7 @@ fn quiet_rows_render_to_nothing() {
     let ok = rows(json!({"phase": "tool_finished", "tool": "bash"}));
     assert!(activity::render(&ok).is_none());
     let started = rows(json!({"phase": "tool_started", "tool": "bash"}));
-    assert_eq!(activity::render(&started).as_deref(), Some("Running"));
+    assert!(activity::render(&started).is_none());
     let thinking_empty = rows(json!({"phase": "thinking", "detail": ""}));
     assert!(activity::render(&thinking_empty).is_none());
 }
@@ -416,10 +420,8 @@ async fn the_second_line_edits_the_first_bubble() {
 
 #[tokio::test]
 async fn gated_rows_are_kept_until_the_gap_passes() {
-    // The stuck-bubble repro: `tool_started` posts a bare "Running" line and
-    // the `tool_ran` with the command arrives inside the edit gap. Dropping
-    // the gated rows sticks the bubble bare until the turn ends; keeping
-    // them updates it on the next tick.
+    // Rows that land inside the edit gap are not dropped: the next tick
+    // edits the bubble with the follow-up line.
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
@@ -427,12 +429,12 @@ async fn gated_rows_are_kept_until_the_gap_passes() {
 
     activity::push(
         &sink,
-        json!({"phase": "tool_started", "call_id": "a", "tool": "bash"}),
+        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo build"}),
     );
     rt.report_activity("42").await;
     activity::push(
         &sink,
-        json!({"phase": "tool_ran", "call_id": "a", "tool": "bash", "detail": "cargo test"}),
+        json!({"phase": "tool_ran", "call_id": "b", "tool": "bash", "detail": "cargo test"}),
     );
     rt.report_activity("42").await;
     *clock.lock().unwrap() = 5.0;
@@ -440,18 +442,25 @@ async fn gated_rows_are_kept_until_the_gap_passes() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], ("-# Running".to_string(), false), "first post");
+    assert_eq!(
+        log[0],
+        ("-# Running `cargo build`".to_string(), false),
+        "first post"
+    );
     assert_eq!(
         log[1],
-        ("-# Running `cargo test`".to_string(), true),
-        "the command must follow, not stick bare"
+        (
+            "-# Running `cargo build`\n-# Running `cargo test`".to_string(),
+            true
+        ),
+        "the gated row joins the bubble on the next tick"
     );
 }
 
 #[tokio::test]
 async fn final_flush_settles_the_card_and_next_turn_gets_a_new_one() {
-    // No separate tally card: the turn's own card settles (green, done
-    // footer) and stays as the record.
+    // No separate tally card: the turn's own card settles (its chip drops)
+    // and stays as the record.
     let sink = activity::sink();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let clock = std::sync::Arc::new(std::sync::Mutex::new(0.0));
@@ -568,7 +577,7 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
     assert_eq!(
         turn.last().unwrap()["type"],
         17,
-        "the status chip is a V2 Container"
+        "the live status chip is a V2 Container"
     );
     let card = component_text(&sent[1].body["components"]);
     assert!(card.contains("gray · done"), "{card}");

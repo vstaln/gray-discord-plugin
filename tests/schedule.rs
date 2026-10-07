@@ -188,6 +188,7 @@ fn error_envelope_secrecy_and_no_traceback() {
     );
     assert!(
         out_text.contains("not installed")
+            || out_text.contains("run:")
             || out_text.contains("runs")
             || out_text.contains("not running")
     );

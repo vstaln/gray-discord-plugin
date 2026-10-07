@@ -100,8 +100,6 @@ struct Frame {
     status: Option<String>,
     accent: Option<u64>,
     stop: Option<String>,
-    /// The chip's action-row buttons: (label, custom_id).
-    buttons: Vec<(String, String)>,
     /// Gallery and File components in the message.
     media: Vec<Value>,
     /// The upload list a multipart request carried.
@@ -126,31 +124,18 @@ fn traffic(stub: &common::Stub) -> Vec<Frame> {
         .map(|sent| {
             let components = sent.body["components"].as_array().cloned().unwrap();
             let chip = chip_of(&components).cloned();
-            let (status, stop, buttons) = match &chip {
+            let (status, stop) = match &chip {
                 Some(chip) => {
-                    let children = chip["components"].as_array().unwrap();
-                    let first = &children[0];
-                    let (line, stop) = match first["type"].as_u64() {
+                    let first = &chip["components"][0];
+                    match first["type"].as_u64() {
                         Some(9) => (
-                            component_text(&first["components"]),
+                            Some(component_text(&first["components"])),
                             first["accessory"]["custom_id"].as_str().map(str::to_string),
                         ),
-                        _ => (component_text(first), None),
-                    };
-                    let buttons = children[1..]
-                        .iter()
-                        .filter(|child| child["type"] == 1)
-                        .flat_map(|row| row["components"].as_array().cloned().unwrap_or_default())
-                        .map(|button| {
-                            (
-                                button["label"].as_str().unwrap_or("").to_string(),
-                                button["custom_id"].as_str().unwrap_or("").to_string(),
-                            )
-                        })
-                        .collect();
-                    (Some(line), stop, buttons)
+                        _ => (Some(component_text(first)), None),
+                    }
                 }
-                None => (None, None, Vec::new()),
+                None => (None, None),
             };
             Frame {
                 method: sent.method.clone(),
@@ -168,7 +153,6 @@ fn traffic(stub: &common::Stub) -> Vec<Frame> {
                 status,
                 accent: chip.as_ref().and_then(|chip| chip["accent_color"].as_u64()),
                 stop,
-                buttons,
                 media: components
                     .iter()
                     .filter(|child| child["type"] == 12 || child["type"] == 13)
@@ -227,7 +211,6 @@ macro_rules! press {
 }
 
 const WORKING: u64 = 0x4E5058;
-const DONE: u64 = 0x57F287;
 const STOPPED: u64 = 0x80848E;
 
 #[tokio::test]
@@ -265,18 +248,12 @@ async fn a_reply_streams_into_its_own_message_and_lands_as_the_answer() {
     let last = log.last().unwrap();
     assert_eq!(last.method, "PATCH");
     assert_eq!(last.body, "Hello there,\nhow are you?", "cursor gone");
-    assert!(
-        last.status.as_deref().unwrap().starts_with("-# Done in "),
-        "{last:?}"
+    assert_eq!(
+        last.status, None,
+        "a finished turn leaves no chip behind: {last:?}"
     );
-    assert_eq!(last.accent, Some(DONE));
+    assert_eq!(last.accent, None);
     assert_eq!(last.stop, None, "Stop goes away once the turn is over");
-    let labels: Vec<&str> = last
-        .buttons
-        .iter()
-        .map(|(label, _)| label.as_str())
-        .collect();
-    assert_eq!(labels, vec!["Retry", "New chat"], "the settled actions");
     assert_eq!(
         posts(&log).len(),
         1,
@@ -340,13 +317,7 @@ async fn each_step_of_the_turn_is_a_new_message() {
     assert_eq!(tools.status, None, "{tools:?}");
     let last = log.last().unwrap();
     assert_eq!(last.body, "All green.");
-    assert!(
-        last.status
-            .as_deref()
-            .unwrap()
-            .ends_with(" · ran 1 command"),
-        "the chip tallies the turn: {last:?}"
-    );
+    assert_eq!(last.status, None, "the answer stands alone: {last:?}");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
 }
 
@@ -415,73 +386,6 @@ async fn the_stop_button_flips_the_message_at_once_and_the_turn_stops() {
 }
 
 #[tokio::test]
-async fn retry_queues_the_same_prompt_again() {
-    let stub = common::Stub::start().await;
-    let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store, _) = scripted!(json!({}), stub, script, "Hi there");
-    store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
-    assert!(rt.generate_one().await.unwrap());
-    let (_, retry) = traffic(&stub).last().unwrap().buttons[0].clone();
-    assert!(retry.starts_with("turn:retry:"));
-
-    press!(stub, store, retry_button, &retry);
-    assert_eq!(
-        callbacks(&stub)[0]["type"],
-        6,
-        "the new turn is the feedback"
-    );
-    let again = store.claim().unwrap().expect("a new turn is queued");
-    assert_eq!(again.prompt, "say hi");
-    assert!(again.id.starts_with("m1-retry-"));
-
-    press!(stub, store, retry_button, &retry);
-    assert_eq!(
-        callbacks(&stub)[1]["type"],
-        4,
-        "a second press says it expired"
-    );
-}
-
-#[tokio::test]
-async fn new_chat_resets_the_conversation_the_turn_belongs_to() {
-    let stub = common::Stub::start().await;
-    let script = vec![vec![text(0, "", "Hi", false)]];
-    let (rt, store, _) = scripted!(json!({}), stub, script, "Hi there");
-    store.enqueue("m1", "42", "say hi", None, 1000).unwrap();
-    assert!(rt.generate_one().await.unwrap());
-    let (label, new_chat) = traffic(&stub).last().unwrap().buttons[1].clone();
-    assert_eq!(label, "New chat");
-
-    press!(stub, store, new_chat_button, &new_chat);
-    let reply = &callbacks(&stub)[0];
-    assert_eq!(reply["type"], 4);
-    assert!(
-        reply["data"].to_string().contains("starts fresh"),
-        "{reply}"
-    );
-}
-
-#[tokio::test]
-async fn the_next_turn_retires_the_previous_buttons() {
-    let stub = common::Stub::start().await;
-    let script = vec![vec![text(0, "", "One", false)]];
-    let (rt, store, _) = scripted!(json!({}), stub, script, "One");
-    store.enqueue("m1", "42", "first", None, 1000).unwrap();
-    assert!(rt.generate_one().await.unwrap());
-    store.enqueue("m2", "42", "second", None, 1000).unwrap();
-    assert!(rt.generate_one().await.unwrap());
-
-    let log = traffic(&stub);
-    let retired = log
-        .iter()
-        .find(|frame| frame.method == "PATCH" && frame.buttons.is_empty() && frame.body == "One")
-        .expect("the first turn's last message is edited once more");
-    assert_eq!(retired.accent, Some(DONE), "only the buttons go");
-    let newest = log.last().unwrap();
-    assert_eq!(newest.buttons.len(), 2, "the latest turn keeps its actions");
-}
-
-#[tokio::test]
 async fn a_gray_without_text_rows_posts_the_answer_below_its_tool_lines() {
     let stub = common::Stub::start().await;
     let script = vec![vec![tool("tool_ran", "a", "cargo test")]];
@@ -496,7 +400,7 @@ async fn a_gray_without_text_rows_posts_the_answer_below_its_tool_lines() {
         .collect();
     assert_eq!(posted, vec!["-# Running `cargo test`", "answer"], "{log:?}");
     let last = log.last().unwrap();
-    assert_eq!(last.accent, Some(DONE), "the chip moved to the answer");
+    assert_eq!(last.status, None, "the answer stands alone");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
     assert!(store.next_delivery(f64::MAX).unwrap().is_none());
 }
