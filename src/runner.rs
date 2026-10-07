@@ -278,7 +278,7 @@ pub async fn run_gray_input(
         .get("session_id")
         .and_then(Value::as_str)
         .is_some_and(|sid| !sid.is_empty())
-        || files.len() == 1;
+        || !files.is_empty();
     if crate::session::ResetPolicy::from_config(config)
         .reset_reason(&state, has_session, now)
         .is_some()
@@ -304,11 +304,7 @@ pub async fn run_gray_input(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if files.len() > 1 {
-        return Err(RunError::Protocol(
-            "Ambiguous conversation store; refusing to select a session".to_string(),
-        ));
-    }
+    files.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).ok()));
 
     let gray_bin = config.get("gray_bin").and_then(Value::as_str).unwrap_or("");
     if gray_bin.is_empty() {
@@ -411,6 +407,14 @@ pub async fn run_gray_input(
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    cmd.env(
+        "PATH",
+        child_path(
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(PathBuf::from),
+            Path::new(gray_bin),
+        ),
+    );
     // A job the model adds with a plain `gray cron add` inherits this
     // conversation's binding, so it comes back to the channel it was added
     // from. Absent outside a chat: the job is just local.
@@ -564,6 +568,48 @@ impl Drop for InputFileGuard {
     }
 }
 
+/// A supervisor (runit, systemd) hands the daemon a bare PATH. gray's
+/// provider plugins and their CLIs live beside the gray binary and in the
+/// user's bin dirs, so put those first or every turn dies as `agent_failed`.
+fn child_path(
+    existing: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    gray_bin: &Path,
+) -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = gray_bin.parent() {
+        dirs.push(dir.to_path_buf());
+    }
+    if let Some(home) = home {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    if let Some(existing) = existing {
+        dirs.extend(std::env::split_paths(&existing));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod child_path_tests {
+    use super::*;
+
+    #[test]
+    fn bare_supervisor_path_gains_user_bins() {
+        let got = child_path(
+            Some("/usr/bin:/bin".into()),
+            Some(PathBuf::from("/home/u")),
+            Path::new("/home/u/.local/bin/gray"),
+        );
+        assert_eq!(
+            got.to_str().unwrap(),
+            "/home/u/.local/bin:/home/u/.cargo/bin:/usr/bin:/bin"
+        );
+    }
+}
+
 fn set_private_file(path: &Path) -> Result<(), RunError> {
     #[cfg(unix)]
     {
@@ -672,7 +718,7 @@ async fn consume_ndjson(
             continue;
         }
         if let Some(sid) = row.get("session_id").and_then(Value::as_str) {
-            if uuid_valid(sid) {
+            if session_id_valid(sid) {
                 // `/new` advances the on-disk generation while an old child
                 // may still be finishing. Never let that child resurrect its
                 // predecessor's pointer.
@@ -743,23 +789,52 @@ fn answer_ask(asks: &AskWire, row: &Value) {
     });
 }
 
-fn uuid_valid(s: &str) -> bool {
-    // Cheap structural check (8-4-4-4-12 lowercase hex); the Python parses
-    // with uuid.UUID, which also accepts braces/uppercase — pinned session
-    // ids written by gray are always canonical, so strict is fine here.
+fn session_id_valid(s: &str) -> bool {
+    // gray >= 0.1.11 names sessions with readable lowercase words
+    // (`ionic-nickel-supernova`); older releases emitted canonical UUIDs.
+    // Both are dash-separated lowercase [a-z0-9] runs; keep the check
+    // structural so a word id never trips a protocol error.
     let b = s.as_bytes();
-    if b.len() != 36 {
+    if b.is_empty() || b.len() > 64 || b[0] == b'-' || b[b.len() - 1] == b'-' {
         return false;
     }
-    for (i, c) in b.iter().enumerate() {
-        let hex = c.is_ascii_hexdigit();
+    let mut prev_dash = false;
+    for c in b {
         let dash = *c == b'-';
-        let want_dash = matches!(i, 8 | 13 | 18 | 23);
-        if want_dash != dash || (!want_dash && !hex) {
+        if (dash && prev_dash) || !(dash || c.is_ascii_lowercase() || c.is_ascii_digit()) {
             return false;
         }
+        prev_dash = dash;
     }
     true
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::session_id_valid;
+
+    #[test]
+    fn accepts_uuid_and_word_ids() {
+        assert!(session_id_valid("cff0d620-d17c-456a-bb6c-d24af7ddf859"));
+        assert!(session_id_valid("ionic-nickel-supernova"));
+        assert!(session_id_valid("abc"));
+    }
+
+    #[test]
+    fn rejects_junk() {
+        for bad in [
+            "",
+            "-leading",
+            "trailing-",
+            "double--dash",
+            "Upper-Case",
+            "has space",
+            "semi;colon",
+        ] {
+            assert!(!session_id_valid(bad), "{bad:?}");
+        }
+        assert!(!session_id_valid(&"a".repeat(65)));
+    }
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
