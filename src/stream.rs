@@ -18,11 +18,13 @@
 //! ```
 //!
 //! The newest message carries the turn's status chip: a small Container
-//! whose accent tracks the turn (dark grey while working, green when done, red
-//! on failure, grey when stopped) with the Stop button while it runs and
-//! Retry / New chat once it has settled. Its clock is a Discord timestamp
-//! (`<t:…:R>`) that every client keeps current on its own, so a quiet turn
-//! costs no edits. When a newer message appears the chip moves down to it.
+//! whose accent tracks the turn (dark grey while working, red on failure,
+//! grey when stopped) with the Stop button while it runs. Its clock is a
+//! Discord timestamp (`<t:…:R>`) that every client keeps current on its own,
+//! so a quiet turn costs no edits. When a newer message appears the chip
+//! moves down to it. A turn that finishes drops the chip outright — the
+//! answer stands alone, the way Hermes leaves it — while a failed or
+//! stopped turn keeps its line as the notice.
 //!
 //! The finished answer is the last message; the files it named (`MEDIA:`)
 //! sit inside it. A tool group of more than a handful of lines folds to a
@@ -60,7 +62,6 @@ const STRIKES: u32 = 3;
 const REPOSTS: u32 = 2;
 
 const WORKING: u32 = 0x4E5058;
-const DONE: u32 = 0x57F287;
 const FAILED: u32 = 0xED4245;
 const STOPPED: u32 = 0x80848E;
 
@@ -199,9 +200,6 @@ pub struct Timeline {
     status: Option<(Status, f64)>,
     /// `custom_id` of the status chip's Stop button while the turn runs.
     stop: Option<String>,
-    /// `custom_id`s of the settled chip's Retry and New chat buttons.
-    retry: Option<String>,
-    new_chat: Option<String>,
     media: Vec<Media>,
 }
 
@@ -217,13 +215,6 @@ impl Timeline {
     /// Offer a Stop button in the status chip while the turn runs.
     pub fn with_stop(mut self, custom_id: String) -> Self {
         self.stop = Some(custom_id);
-        self
-    }
-
-    /// Offer Retry and New chat buttons once the turn has settled.
-    pub fn with_actions(mut self, retry: Option<String>, new_chat: Option<String>) -> Self {
-        self.retry = retry;
-        self.new_chat = new_chat;
         self
     }
 
@@ -341,10 +332,6 @@ impl Timeline {
 
     /// The messages this turn should show at `now`.
     pub fn render(&self, now: f64) -> Vec<Card> {
-        self.render_with(now, true)
-    }
-
-    fn render_with(&self, now: f64, buttons: bool) -> Vec<Card> {
         let (status, now) = self.status.clone().unwrap_or((Status::Working, now));
         let live = status == Status::Working;
         let mut units: Vec<Unit> = Vec::new();
@@ -404,13 +391,9 @@ impl Timeline {
                 block,
             });
         }
-        let settled = status != Status::Working;
-        let chip = self.chip(
-            &status,
-            &crate::activity::summary(&tool_rows),
-            now,
-            buttons && settled,
-        );
+        // A finished turn drops the chip: the answer stands alone.
+        let chip = (status != Status::Done)
+            .then(|| self.chip(&status, &crate::activity::summary(&tool_rows), now));
         let mut cards: Vec<Card> = Vec::new();
         for unit in units {
             let log_size = unit.log.as_ref().map_or(0, |(_, size)| *size);
@@ -432,7 +415,7 @@ impl Timeline {
         if let Some(last) = cards.last_mut() {
             last.components.extend(self.media_components());
             last.files = self.media.iter().map(|media| media.name.clone()).collect();
-            last.components.push(chip);
+            last.components.extend(chip);
         }
         cards
     }
@@ -456,24 +439,10 @@ impl Timeline {
         out
     }
 
-    fn action_row(&self) -> Option<Value> {
-        let mut buttons = Vec::new();
-        if let Some(custom_id) = &self.retry {
-            buttons.push(json!({
-                "type": 2, "style": 2, "label": "Retry", "custom_id": custom_id,
-            }));
-        }
-        if let Some(custom_id) = &self.new_chat {
-            buttons.push(json!({
-                "type": 2, "style": 2, "label": "New chat", "custom_id": custom_id,
-            }));
-        }
-        (!buttons.is_empty()).then(|| json!({"type": 1, "components": buttons}))
-    }
-
-    /// The status chip: an accented Container with the status line, Stop
-    /// while the turn runs, and Retry / New chat once it has settled.
-    fn chip(&self, status: &Status, summary: &str, now: f64, actions: bool) -> Value {
+    /// The status chip: an accented Container with the status line and the
+    /// Stop button while the turn runs. Never called for `Status::Done` —
+    /// a finished turn leaves no chip behind.
+    fn chip(&self, status: &Status, summary: &str, now: f64) -> Value {
         let elapsed = (now - self.started).max(0.0);
         let mut line = match status {
             // A Discord timestamp: "started 20 seconds ago", kept current by
@@ -481,11 +450,11 @@ impl Timeline {
             Status::Working => {
                 format!("Working · started <t:{}:R>", self.started.max(0.0) as i64)
             }
-            Status::Done => format!("Done in {}", duration(elapsed)),
             Status::Failed(reason) => {
                 format!("{} after {}", capitalized(reason), duration(elapsed))
             }
             Status::Stopped => format!("Stopped after {}", duration(elapsed)),
+            Status::Done => unreachable!("a finished turn has no chip"),
         };
         if !summary.is_empty() {
             line.push_str(" · ");
@@ -508,17 +477,13 @@ impl Timeline {
             }),
             _ => text,
         };
-        let mut children = vec![first];
-        if actions {
-            children.extend(self.action_row());
-        }
         let accent = match status {
             Status::Working => WORKING,
-            Status::Done => DONE,
             Status::Failed(_) => FAILED,
             Status::Stopped => STOPPED,
+            Status::Done => unreachable!(),
         };
-        json!({"type": 17, "accent_color": accent, "components": children})
+        json!({"type": 17, "accent_color": accent, "components": [first]})
     }
 
     /// The requests due now. Posts go strictly in message order; an edit
@@ -693,24 +658,12 @@ impl Timeline {
 
     /// The message whose status chip shows how the turn ended, if it is on
     /// screen: a failed or stopped turn needs no separate notice when its
-    /// chip says so.
+    /// chip says so. A finished turn has no chip, so `None`.
     pub fn status_card(&self, now: f64) -> Option<String> {
-        self.status.as_ref()?;
-        self.newest_shown(now).map(|(_, id)| id)
-    }
-
-    /// The settled newest message without its Retry / New chat buttons, for
-    /// when the next turn starts: only the latest turn offers them. `None`
-    /// when there is nothing to retire, or the message carries uploads (an
-    /// edit would have to resend them).
-    pub fn retired(&self) -> Option<(String, Vec<Value>)> {
-        self.status.as_ref()?;
-        if (self.retry.is_none() && self.new_chat.is_none()) || !self.media.is_empty() {
-            return None;
+        match self.status.as_ref()?.0 {
+            Status::Done => None,
+            _ => self.newest_shown(now).map(|(_, id)| id),
         }
-        let (_, id) = self.newest_shown(0.0)?;
-        let last = self.render_with(0.0, false).pop()?;
-        Some((id, last.components))
     }
 
     /// The answer's messages on screen, for retracting a preview whose
@@ -1072,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_recolors_the_chip_and_drops_the_stop_button() {
+    fn a_finished_turn_drops_the_chip_and_the_answer_stands_alone() {
         let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:t".into());
         t.absorb(&ran("a", "cargo test"));
         t.absorb(&text(0, "", "Draft", false));
@@ -1084,9 +1037,13 @@ mod tests {
         let [Op::Edit { card: 1, body, .. }] = &ops[..] else {
             panic!("{ops:?}")
         };
-        assert_eq!(chip(body)["accent_color"], json!(DONE));
-        assert_eq!(status_line(body), "-# Done in 4.1s · ran 1 command");
-        assert!(!body.key().contains("turn:stop"));
+        assert!(
+            body.components.iter().all(|c| c["type"] == 10),
+            "no chip, no actions: {:?}",
+            body.components
+        );
+        assert!(!body.key().contains("turn:"));
+        assert_eq!(t.status_card(9.0), None, "a done turn keeps no notice");
         let landed = t.landed(30.0).unwrap();
         assert_eq!(
             landed.parts,
@@ -1115,34 +1072,17 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_turn_offers_retry_and_new_chat_and_retires_them_later() {
-        let mut t = Timeline::new(true, 0.0)
-            .with_stop("turn:stop:s".into())
-            .with_actions(Some("turn:retry:r".into()), Some("turn:new:n".into()));
+    fn a_finished_turn_never_carries_buttons() {
+        let mut t = Timeline::new(true, 0.0).with_stop("turn:stop:s".into());
         t.absorb(&text(0, "", "Hi", false));
         land(&mut t, 0.0, false);
-        let live = t.render(0.0);
-        assert!(!live[0].key().contains("turn:retry"));
         t.adopt("Hi there");
         t.settle(Status::Done, 2.0);
         land(&mut t, 2.0, true);
         let done = t.render(2.0);
         crate::render::validate_components(&done[0].components).unwrap();
-        let row = chip(&done[0])["components"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap();
-        assert_eq!(row["type"], 1, "an action row closes the settled chip");
-        assert_eq!(row["components"][0]["custom_id"], "turn:retry:r");
-        assert_eq!(row["components"][1]["custom_id"], "turn:new:n");
-        assert_eq!(row["components"][1]["label"], "New chat");
-
-        let (id, components) = t.retired().unwrap();
-        assert_eq!(id, "m0");
-        let flat = serde_json::to_string(&components).unwrap();
-        assert!(!flat.contains("turn:retry") && !flat.contains("turn:new"));
-        assert!(flat.contains("Done in 2.0s"), "only the buttons go");
+        let flat = serde_json::to_string(&done[0].components).unwrap();
+        assert!(!flat.contains("custom_id"), "nothing to press: {flat}");
     }
 
     #[test]
@@ -1174,11 +1114,8 @@ mod tests {
             "attachment://chart.png"
         );
         assert_eq!(body.components[2]["type"], 13, "then the file card");
+        assert_eq!(body.components.len(), 3, "no chip after the files");
         assert!(t.landed(1.0).is_some());
-        assert!(
-            t.retired().is_none(),
-            "a message with uploads is left as is"
-        );
     }
 
     #[test]
