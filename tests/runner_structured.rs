@@ -13,7 +13,7 @@ async fn structured_runner_uses_private_file_and_continues_the_session() {
     let executable = root.join("gray-fixture");
     let capture_literal = capture.to_string_lossy().replace('\'', "'\\''");
     let script = format!(
-        "#!/bin/sh\ncapture='{capture_literal}'\nprintf '%s\\n' \"$@\" >> \"$capture\"\ninput=''\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--input-json' ]; then input=\"$arg\"; fi\n  prev=\"$arg\"\ndone\nif [ -n \"$input\" ]; then stat -c '%a' \"$input\" >> \"$capture\"; cat \"$input\" >> \"$capture\"; fi\nprintf '%s\\n' '{{\"protocol\":1,\"turn_id\":\"turn-1\",\"session_id\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"result\",\"text\":\"ok\"}}'\n",
+        "#!/bin/sh\ncapture='{capture_literal}'\nprintf '%s\\n' \"$@\" >> \"$capture\"\ninput=''\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--input-json' ]; then input=\"$arg\"; fi\n  prev=\"$arg\"\ndone\nif [ -n \"$input\" ]; then (stat -c '%a' \"$input\" 2>/dev/null || stat -f '%Lp' \"$input\") >> \"$capture\"; cat \"$input\" >> \"$capture\"; fi\nprintf '%s\\n' '{{\"protocol\":1,\"turn_id\":\"turn-1\",\"session_id\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"result\",\"text\":\"ok\"}}'\n",
     );
     std::fs::write(&executable, script).unwrap();
     #[cfg(unix)]
