@@ -17,10 +17,15 @@ fn config() -> serde_json::Value {
     .unwrap();
     let home_path = home.path().to_string_lossy().into_owned();
     std::mem::forget(home); // the test process outlives the check
+                            // An executable that exists on every CI image — the test binary itself.
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     serde_json::json!({
         "token": "TESTTOKEN",
         "channel_id": "42",
-        "gray_bin": "/bin/true",
+        "gray_bin": exe,
         "gray_home": home_path,
         "workdir": "/tmp",
     })
