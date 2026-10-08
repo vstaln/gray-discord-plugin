@@ -205,6 +205,10 @@ pub async fn run_gray_input(
         _file: lock_file,
         fd: lock_fd,
     };
+    let input = match input {
+        RunInput::Text(prompt) => RunInput::Text(crate::always_on::with_posted(&home, prompt)),
+        other => other,
+    };
 
     // Snapshot the provider config into the isolated home.
     let gray_home = config

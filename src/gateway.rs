@@ -1442,6 +1442,23 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         }
     };
     tokio::pin!(cron_task);
+    // Always-on: what gray's gateway produced on its own reaches Discord.
+    let pump_task = crate::always_on::pump(
+        std::path::PathBuf::from(
+            config
+                .get("gray_home")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.gray")))
+                .unwrap_or_default(),
+        ),
+        config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("conversations"),
+        rest.clone(),
+    );
+    tokio::pin!(pump_task);
 
     #[cfg(unix)]
     let mut sigterm =
@@ -1464,6 +1481,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         tokio::select! {
             res = &mut runtime_task => {
                 return res;
+            }
+            _ = &mut pump_task => {
+                return Err("always-on pump stopped".to_string());
             }
             _ = &mut cron_task => {
                 // The cron task never returns; if it does, the daemon is
