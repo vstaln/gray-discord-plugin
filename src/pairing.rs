@@ -1,4 +1,4 @@
-//! Discord-side pairing: the OpenClaw pattern. A user who DMs an unconfigured
+//! Discord-side pairing. A user who DMs an unconfigured
 //! bot is told their own Discord ID and a one-shot code; the owner approves
 //! the code with `gray discord pairing approve discord <code>` and that user
 //! joins the allowlist. No terminal wizard, no 5-minute timer, nothing to
@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// A fresh code: 8 uppercase alphanumerics (OpenClaw's shape — short enough
+/// A fresh code: 8 uppercase alphanumerics (short enough
 /// to read off a phone, 36^8 space, single-use).
 pub fn gen_code() -> String {
     const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -37,7 +37,7 @@ pub fn unconfigured_reply(user_id: &str, code: &str) -> String {
     )
 }
 
-/// The OpenClaw notice, as an embed: their own ID and the code as fields,
+/// The notice, as an embed: their own ID and the code as fields,
 /// the approve command in a code block. Everything the plain text carried,
 /// none of the ragged line breaks.
 pub fn unconfigured_embed(user_id: &str, code: &str) -> Value {

@@ -1,4 +1,4 @@
-//! Port of gray_discord/transport.py + hermes-rs discord_tool.rs constants:
+//! Discord transport: REST/gateway calls and shared constants.
 //! Discord REST client with safe-mention defaults and bounded sends.
 use reqwest::multipart::Form;
 use serde_json::{json, Value};
@@ -1512,7 +1512,7 @@ impl Rest {
             .to_string())
     }
 
-    /// Port of `rest_send`: login → channel → send. REST only.
+    /// Login → channel → send. REST only.
     pub async fn rest_send(
         &self,
         channel_id: &str,

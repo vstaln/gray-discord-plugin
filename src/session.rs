@@ -1,8 +1,8 @@
-//! Discord conversation identity and Hermes-style session reset policy.
+//! Discord conversation identity and session reset policy.
 //!
 //! A Discord channel is already a separate session when the message arrives in
 //! one of its threads: Discord sends the thread's channel id. Guild messages
-//! additionally use a per-user key, matching Hermes' secure group default; DMs
+//! additionally use a per-user key, a secure group default; DMs
 //! stay keyed by their one-to-one channel.
 
 use chrono::{DateTime, Local, TimeZone, Timelike};

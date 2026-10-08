@@ -387,7 +387,7 @@ async fn reactions_disabled_when_config_flag_false() {
 
 #[tokio::test]
 async fn typing_indicator_disabled_when_config_flag_false() {
-    // Port of Hermes' `discord.typing_indicator: false`. The gate sits in
+    // `typing_indicator: false` gate behavior. The gate sits in
     // the adapter before the typing RPC, so disabling it stops both the
     // REST poke and the host hook — the whole path, not one loop of it.
     let tmp = tempfile::tempdir().unwrap();

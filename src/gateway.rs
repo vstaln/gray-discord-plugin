@@ -1,6 +1,6 @@
 //! Owner-only gateway with durable generation and delivery workers.
 //!
-//! Port of gray_discord/gateway.py — see implementation plan Task 9.
+//! Discord gateway loop.
 
 use crate::component_input::{normalize, normalize_autocomplete, NormalizedInteraction};
 use crate::component_media::FileStore;
@@ -224,7 +224,7 @@ pub struct TurnButtons {
     pub stop: Option<String>,
 }
 
-/// What a failed turn-message request means for the turn (Hermes' edit
+/// What a failed turn-message request means for the turn (the edit
 /// failure classes): rate limits, 5xx, timeouts and dropped connections are
 /// waited out; a refused payload is retried with the next frame; a missing
 /// message or a forbidden channel is final.
@@ -341,7 +341,7 @@ impl<R, D> Runtime<R, D> {
 
     /// The Discord typing indicator, on by default.
     ///
-    /// Ported 1:1 from Hermes' platform `typing_indicator` flag: same key
+    /// Same key
     /// name, same default (on), same gate placement (the adapter refuses
     /// before any typing RPC, so turning it off kills the whole path rather
     /// than one loop of it). Set `"typing_indicator": false` in config.json
@@ -480,7 +480,7 @@ impl<R, D> Runtime<R, D> {
 
     /// Keep one turn's messages current until `stop` is signalled: gray's
     /// rows in, sends and edits out, about four frames a second. Runs beside
-    /// the gray child rather than between reads of its output (Hermes'
+    /// the gray child rather than between reads of its output (the bridge's
     /// stream consumer is its own task for the same reason): a slow or
     /// rate-limited Discord request must never stall the agent or the rows
     /// queued behind it. Returns after the request in flight has finished,
@@ -672,7 +672,7 @@ impl<R, D> Runtime<R, D> {
                     }
                     drop(timelines);
                     // Discord drops the typing bubble when the bot posts;
-                    // the next frame pokes it again (Hermes restores it the
+                    // the next frame pokes it again (the bridge restores it the
                     // same way after each progress message).
                     if !finishing {
                         self.last_typing.lock().await.remove(channel);
@@ -903,7 +903,7 @@ where
         };
 
         // Settle the turn. The answer is its last message: the streamed
-        // prose becomes it in place (Hermes' final edit), or it is posted
+        // prose becomes it in place (the bridge's final edit), or it is posted
         // below the tool lines, with the files its `MEDIA:` tags named shown
         // inside it; any it cannot hold go through the outbox.
         let (prose, media) = match &result {
@@ -1203,7 +1203,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "token missing".to_string())?
         .to_string();
-    // Ownerless is a legal bootstrap state (OpenClaw parity): nobody is
+    // Ownerless is a legal bootstrap state (ownerless bootstrap): nobody is
     // admitted, and every human DM draws a pairing reply until the operator
     // approves a code. An empty owner admits nobody — never someone else.
     let owner_id = config
@@ -1223,7 +1223,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         })
         .unwrap_or_default();
 
-    // Sliding-window burst guard per user, from grayai_legacy's rate_limiter:
+    // Sliding-window burst guard per user:
     // without it one eager DMer is twenty concurrent gray processes.
     let limiter = std::sync::Arc::new(std::sync::Mutex::new(crate::ratelimit::RateLimiter::new(
         config
@@ -1256,7 +1256,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let media_root = media_root.clone();
         let media_roots = media_roots.clone();
         Box::pin(async move {
-            // Hermes-style `MEDIA:<path>` tags: strip them from the prose and
+            // `MEDIA:<path>` tags: strip them from the prose and
             // upload the files as a V2 gallery/file message after the text.
             let (prose, media) = if part.document_json.is_none() {
                 crate::media_tags::extract(&part.content, &media_root, &media_roots)

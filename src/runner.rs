@@ -1,4 +1,4 @@
-//! Port of gray_discord/runner.py: isolated `gray -p --json` child per turn.
+//! Isolated `gray -p --json` child per turn.
 //! One conversation home per sha256(conversation); explicit session pointers
 //! only — never guess a shared session id.
 use serde_json::Value;
@@ -427,9 +427,9 @@ pub async fn run_gray_input(
     }
     cmd.env("GRAY_SKILLS_ONLY", "1");
     // Tool narration is safe to show; raw model reasoning is not. Keep the
-    // wire quiet even when the activity bubble is enabled, matching Hermes.
+    // wire quiet even when the activity bubble is enabled, matching the bridge.
     cmd.env("GRAY_SHOW_REASONING", "0");
-    // Hermes-style live replies: gray streams the prose as `text` rows and
+    // Live replies: gray streams the prose as `text` rows and
     // the gateway edits the reply in place. A gray without the flag just
     // ignores it, and the answer is posted whole at the end as before.
     if crate::stream::enabled(config) {

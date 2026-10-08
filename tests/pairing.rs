@@ -1,4 +1,4 @@
-//! Discord-side pairing (the OpenClaw pattern): an unconfigured DMer is told
+//! Discord-side pairing: an unconfigured DMer is told
 //! their own ID and a code; `gray discord pairing approve discord <code>`
 //! admits them once.
 

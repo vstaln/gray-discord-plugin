@@ -161,7 +161,7 @@ async fn existing_config_decline_keeps_old_file() {
 }
 
 #[tokio::test]
-async fn hermes_path_is_token_plus_your_id() {
+async fn default_path_is_token_plus_your_id() {
     let tmp = tempfile::tempdir().unwrap();
     let mut io = Fake::new(true, &["111,333,444"], &["FIXTURETOKEN"]);
     let path = tmp.path().join("config.json");

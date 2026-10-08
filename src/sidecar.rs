@@ -1,4 +1,4 @@
-//! Port of gray_discord/sidecar.py: NDJSON protocol 1.1 sidecar.
+//! NDJSON protocol 1.1 sidecar.
 //! Manifest answers without config; delivery failures never echo secrets.
 use serde_json::{json, Value};
 use std::path::Path;

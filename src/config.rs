@@ -1,4 +1,4 @@
-//! Port of gray_discord/config.py: private config load/save/validate.
+//! Private config load/save/validate.
 //! Errors never contain config values.
 use serde_json::Value;
 use std::fs;

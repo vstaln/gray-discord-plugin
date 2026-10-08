@@ -1,4 +1,4 @@
-//! Port of gray_discord/budget.py: persistent conservative reservations.
+//! Persistent conservative reservations.
 //! Unknown/crashed/cancelled usage keeps the reservation — never freed as if
 //! it were unused. This is client accounting, not a provider invoice cap.
 use rusqlite::{params, Connection};

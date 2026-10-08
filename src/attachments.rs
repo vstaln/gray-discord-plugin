@@ -1,4 +1,4 @@
-//! Port of grayai_legacy's attachment handling, lite: a user DMing an image
+//! Attachment handling, lite: a user DMing an image
 //! or a .txt is talking to a relay that used to drop it on the floor. We
 //! save the file under workdir and name it in the prompt — gray reads it
 //! with its own tools (`cat <image>` is its vision path, cat for text),

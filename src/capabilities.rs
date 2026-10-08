@@ -1,4 +1,4 @@
-//! Port of gray_discord/capabilities.py: opt-in capability sharing.
+//! Opt-in capability sharing.
 //! Session/work state stays separate; this is not a sandbox.
 use serde_json::Value;
 use sha2::{Digest, Sha256};

@@ -1,4 +1,4 @@
-//! Live replies, Hermes-style: gray's streamed rows -> a new Discord message
+//! Live replies: gray's streamed rows -> a new Discord message
 //! per step of the turn (prose, then its tool lines, then the next prose),
 //! each edited in place while it is live, the last settled as the durable
 //! answer.

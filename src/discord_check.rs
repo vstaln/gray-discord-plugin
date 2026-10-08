@@ -2,8 +2,7 @@
 //! written. One `GET /applications/@me` with `Authorization: Bot <token>`
 //! answers it all: the token works, whether Message Content Intent is on,
 //! how many servers the bot is in, and who owns the application (so the
-//! owner is allowlisted without Developer Mode). Hermes parity:
-//! hermes-agent plugins/platforms/discord/onboarding.py.
+//! owner is allowlisted without Developer Mode).
 //!
 //! The parsers are pure and tested with fixture JSON; only
 //! [`check_bot_token`] touches the network. No error ever carries the token.

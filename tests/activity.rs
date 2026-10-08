@@ -21,14 +21,14 @@ fn component_text(value: &serde_json::Value) -> String {
     }
 }
 
-// ── rendering (Hermes parity) ──
+// ── rendering ──
 
 fn rows(v: serde_json::Value) -> Vec<serde_json::Value> {
     vec![v]
 }
 
 #[test]
-fn bash_line_matches_hermes_format() {
+fn bash_line_matches_feed_format() {
     let r = rows(json!({"phase": "tool_ran", "tool": "bash", "detail": "ls -la"}));
     assert_eq!(activity::render(&r).as_deref(), Some("Running `ls -la`"));
 }
@@ -114,7 +114,7 @@ fn a_long_command_is_capped_at_the_preview_length() {
 
 #[test]
 fn reads_and_searches_show_live_like_any_step() {
-    // Hermes' feed: a turn of `cat`/`grep` must not look stalled.
+    // The feed: a turn of `cat`/`grep` must not look stalled.
     let read = json!({"phase": "tool_ran", "tool": "read", "detail": "src/lib.rs"});
     let run = json!({"phase": "tool_ran", "tool": "bash", "detail": "cargo test"});
     assert_eq!(
@@ -208,7 +208,7 @@ fn repeated_lines_collapse_and_every_line_is_kept() {
     .collect();
     let text = activity::render(&batch).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    // Hermes' accumulating bubble: the whole feed, not a sliding window.
+    // The accumulating bubble: the whole feed, not a sliding window.
     assert_eq!(
         lines.len(),
         4,

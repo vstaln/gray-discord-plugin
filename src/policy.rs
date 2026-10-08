@@ -1,4 +1,4 @@
-//! Port of gray_discord/policy.py: owner/allowlist admission + one-shot pairing.
+//! Owner/allowlist admission + one-shot pairing.
 use std::hint::black_box;
 
 /// Admit one inbound message. Returns the cleaned prompt, or `None` to drop:
@@ -72,7 +72,7 @@ pub fn slash_admission(
     }
 }
 
-/// One-shot local pairing code (Hermes-inspired). Single-use, 300 s expiry.
+/// One-shot local pairing code. Single-use, 300 s expiry.
 pub struct Pairing {
     pub code: String,
     pub expires: f64,

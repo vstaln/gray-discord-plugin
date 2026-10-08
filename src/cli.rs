@@ -1,4 +1,4 @@
-//! CLI tree: `gray-discord --config <path> <subcommand>`. Mirrors gray_discord/cli.py parser().
+//! CLI tree: `gray-discord --config <path> <subcommand>`.
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -25,10 +25,10 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Interactive setup. Default: Hermes parity, the token is checked with
+    /// Interactive setup. Default: the token is checked with
     /// Discord and the app's owner is offered as you; home channel is your
     /// DM. `--pair` instead discovers your ID from a DM you send the bot
-    /// (the OpenClaw-style code dance).
+    /// (a one-time code dance).
     Setup {
         /// Discover the owner's ID by DMing a one-time code to the bot.
         #[arg(long)]
@@ -261,7 +261,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 register(&config, config_path)?;
                 println!("Outgoing tool registered with gray.");
                 if crate::service::installed(config_path) {
-                    // Hermes parity: a reconfigured bot takes effect now.
+                    // A reconfigured bot takes effect now.
                     println!("{}", crate::service::restart(config_path)?);
                     return Ok(());
                 }

@@ -1,4 +1,4 @@
-//! Port of gray_discord/cli.py doctor: preflight checks with safe errors.
+//! Doctor preflight checks with safe errors.
 //! Every failure is a category string; transport/config bodies never surface.
 use serde_json::Value;
 

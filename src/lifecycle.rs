@@ -1,5 +1,4 @@
-//! Restart and shutdown notices (Hermes `gateway_restart_notification`
-//! parity): chats with a turn in flight hear that it is about to be cut
+//! Restart and shutdown notices: chats with a turn in flight hear that it is about to be cut
 //! short, and the home channel hears when the gateway is back, including
 //! after a crash, kill, or reboot that gave it no chance to say goodbye.
 //!
@@ -14,7 +13,7 @@
 //!   clean exit. Still `running` at the next boot means the last run died.
 //! - `restart_pending`: written by `gray discord restart` before it signals
 //!   the daemon, so a SIGTERM reads as "restarting" instead of "shutting
-//!   down" (Hermes' `.restart_pending.json`). The next boot removes it.
+//!   down" (a `.restart_pending.json` marker). The next boot removes it.
 use serde_json::{json, Value};
 use std::path::Path;
 

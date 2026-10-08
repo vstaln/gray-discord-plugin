@@ -7,14 +7,14 @@
 //! sink plus pure renderers for the live status bubble and the persistent
 //! tool-activity card.
 //!
-//! Both renderers follow Hermes' tool-progress feed: one line per call —
+//! Both renderers follow the chat-bridge tool-progress feed: one line per call —
 //! icon, tool, a bounded preview of the arguments, how long it took — and
 //! **never the tool's output**. A chat surface is a status feed, not a
 //! transcript; echoing results dumps file contents, memory snapshots and
 //! credentials into the channel.
 //!
 //! The sink also carries gray's streamed `text` rows, in order with the tool
-//! rows, so [`crate::stream`] can lay the turn out as Hermes does. Text rows
+//! rows, so [`crate::stream`] can lay the turn out the way the bridge does. Text rows
 //! stay out of the bounded history: they would crowd the tool rows the
 //! optional end-of-turn card is built from.
 
@@ -39,7 +39,7 @@ const MAX_CARD_ROWS: usize = 5;
 /// stays well under.
 const MAX_CARD_CHARS: usize = 3600;
 
-/// Hermes' suggested cap for a tool preview line
+/// Suggested cap for a tool preview line
 /// (`display.tool_preview_length: 80`).
 const MAX_PREVIEW_CHARS: usize = 80;
 
@@ -78,7 +78,7 @@ pub fn enabled(config: &Value) -> bool {
 }
 
 /// The end-of-turn tally card (`⋯ 12.4s · ran 3 commands`). Off by default:
-/// Hermes posts none, and the progress bubbles already stay in the channel
+/// The bridge posts none, and the progress bubbles already stay in the channel
 /// as the turn's record. `"activity_card": true` brings it back.
 pub fn card_enabled(config: &Value) -> bool {
     config
@@ -131,7 +131,7 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
     scope.history.push_back(row);
 }
 
-/// Hermes parity: a narrated line carries how long the call took and the
+/// A narrated line carries how long the call took and the
 /// card's tally carries how long the turn took. gray's rows have no clock,
 /// so the sink measures between `tool_ran` and `tool_finished` for the same
 /// internal call id.
@@ -433,7 +433,7 @@ fn elapsed_of(row: &Value, by_call: &HashMap<String, u64>) -> Option<u64> {
 }
 
 /// Render one tool bubble's rows into its body: every distinct line, oldest
-/// first (Hermes' accumulating progress bubble). `None` when nothing is
+/// first (the accumulating progress bubble). `None` when nothing is
 /// worth showing.
 pub fn render(rows: &[Value]) -> Option<String> {
     let by_call = elapsed_by_call(rows);
@@ -448,7 +448,7 @@ pub fn render(rows: &[Value]) -> Option<String> {
         }
         lines.push(text);
     }
-    // Every step shows live, reads and searches included (Hermes' feed):
+    // Every step shows live, reads and searches included (the feed):
     // a long turn of `cat`/`grep` must not look stalled.
     if lines.is_empty() {
         return None;
@@ -466,7 +466,7 @@ struct CardEntry {
     failed: bool,
 }
 
-/// Render the persistent end-of-turn card. Hermes shape: a one-line tally of
+/// Render the persistent end-of-turn card. The shape: a one-line tally of
 /// what the turn did, then the actions themselves — never their output.
 pub fn render_card(rows: &[Value]) -> Option<String> {
     let by_call = elapsed_by_call(rows);
@@ -569,7 +569,7 @@ pub fn render_card(rows: &[Value]) -> Option<String> {
     })
 }
 
-/// Hermes' post-turn accounting line: `⋯ 12.4s · edited 2 files · read 4
+/// The post-turn accounting line: `⋯ 12.4s · edited 2 files · read 4
 /// files · ran 3 commands`. Counted from the same rows, so it is free.
 fn tally(entries: &[CardEntry], turn_ms: Option<u64>) -> String {
     let parts = counts(entries.iter().map(|entry| entry.tool.as_str()));

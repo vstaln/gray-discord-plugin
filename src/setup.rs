@@ -1,11 +1,11 @@
-//! Port of gray_discord/setup.py: interactive owner pairing.
+//! Interactive owner pairing.
 //! Credentials stay in the wizard; the model never receives the token.
 use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::discord_check::{self, BotCheck, CheckError};
 
-/// One-click OAuth2 invite (Hermes parity): the bridge's full permission
+/// One-click OAuth2 invite : the bridge's full permission
 /// set, bot + slash commands, server install.
 pub fn invite(app_id: &str) -> String {
     discord_check::invite_url(app_id)
@@ -179,7 +179,7 @@ impl Wiring {
 }
 
 /// The wizard. `pair` selects the DM-code dance for discovering the owner's
-/// ID; the default path just asks for the ID (Hermes parity: token + your
+/// ID; the default path just asks for the ID (token + your
 /// user ID, done).
 pub async fn run(path: &Path, io: &mut dyn Prompter, pair: bool) -> Result<bool, String> {
     let wiring = Wiring::production();
@@ -198,7 +198,7 @@ pub async fn run_wired(
     if path.exists() && !io.confirm("Replace existing configuration? [y/N] ")? {
         return Ok(false);
     }
-    // Hermes parity: one secret, one identity. Gray's binary and home are
+    // One secret, one identity. Gray's binary and home are
     // resolved silently (env, then the conventional defaults) — they are
     // derived facts, not questions.
     let gray = match &wiring.gray_bin {
@@ -532,7 +532,7 @@ pub fn default_verify(config: &Value) -> VerifyFut {
 
 /// The production pairing wait: one bare gateway connection that accepts
 /// exactly one DM carrying the printed code, then disconnects. Mirrors
-/// gray_discord/setup.py's wait, which polled the live gateway for the
+/// The earlier wait loop, which polled the live gateway for the
 /// owner's DM; the code expires after 300 s (`policy::Pairing`).
 pub fn default_pairing(token: &str, code: &str) -> PairingFut {
     use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};

@@ -1,9 +1,19 @@
-# gray-discord-plugin
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+  <img src="assets/discord.svg" alt="discord" width="96">
+</p>
+<h1 align="center">gray-discord-plugin</h1>
+<p align="center">A standalone Discord gateway and bridge for gray — typed Components V2, pairing, and a background service.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-discord-plugin/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 A standalone Discord plugin for [gray](https://github.com/vstaln/gray), with
 its own setup wizard and background service. Public source, no Discord code
-added to gray. Standalone compiled Rust binary using twilight and SQLite durable
-queue; ports selected Hermes helpers and behavior; see [attribution](THIRD_PARTY_NOTICES.md).
+added to gray. A compiled Rust binary using twilight and a SQLite durable
+queue; see [attribution](THIRD_PARTY_NOTICES.md).
 
 **Status: standalone Rust binary (0.1.0).** Requires matching
 gray core `--json` implementation.
@@ -23,7 +33,7 @@ of assuming systemd.
 gray gateway setup discord
 ```
 
-One command, Hermes-style: installs the plugin if it is missing, runs the
+One command: installs the plugin if it is missing, runs the
 wizard, registers the outgoing tool and offers to start the service.
 Re-running it is safe: hand-tuned settings (limits, budget, shares) are
 kept, and a running service restarts on the new config.
@@ -57,8 +67,7 @@ gray discord setup
 gray discord status
 ```
 
-Setup is one command, and it does the Developer Portal checks for you
-(Hermes parity):
+Setup is one command, and it does the Developer Portal checks for you:
 
 ```sh
 gray discord setup
@@ -221,9 +230,9 @@ before any request is made. If Discord itself rejects a payload, its
 validation paths are returned too, e.g.
 `Discord rejected the request (HTTP 400): Invalid Form Body: components[0].spacing: ...`.
 
-### Hermes-style `MEDIA:` tags
+### `MEDIA:` attachment tags
 
-Like Hermes, the agent can attach files to any reply by writing
+The agent can attach files to any reply by writing
 `MEDIA:/absolute/path/to/file.png` in its answer (or in `discord_send`). The tag
 is stripped, and the files are uploaded after the text as a Components V2
 message: images and videos in one media gallery, everything else as file
@@ -313,8 +322,7 @@ Discord token or file body.
 
 ## Burst guard and attachments
 
-Two ports from the grayai_legacy bot (Python, `vstaln/grayai_legacy`), kept
-minimal:
+Two safeguards, kept minimal:
 
 - `rate_limit_capacity` + `rate_limit_window_secs` (8 / 60s defaults) — a
   sliding-window guard per user. Without it one eager DMer is twenty
@@ -326,7 +334,7 @@ minimal:
   `cat <image>` for vision. Nothing is decoded here.
 - Outbound text is sanitized before Discord renders it (bare links wrapped
   so they do not become embed cards, `:fire:` names replaced, doubled
-  heading hashes collapsed) — a port of `services/text_sanitizer.py`.
+  heading hashes collapsed).
 
 ## Typing indicator
 
@@ -338,14 +346,13 @@ it off in `config.json`:
 {"typing_indicator": false}
 ```
 
-Same key, default, and gate placement as Hermes' `discord.typing_indicator`:
-the check happens in the adapter before any typing call, so `false` stops
+The check happens in the adapter before any typing call, so `false` stops
 the whole path (the REST poke and the host hook) rather than one loop of it.
 Reload by restarting the service (`gray discord restart`).
 
 ## Live replies and activity narration
 
-A turn is a stream of messages, the way Hermes posts it: every run of prose
+A turn is a stream of messages: every run of prose
 is a new message, every group of tool calls is a tool bubble below it, and
 the next prose after a tool call starts a fresh message. The channel grows as
 the agent works; each message is edited in place only while it is live:
@@ -490,7 +497,7 @@ A DM is one conversation. A native Discord thread is already a separate
 conversation because Discord sends that thread's channel ID. Guild messages
 are isolated per user, so two people in one channel do not share a transcript.
 
-By default Gray follows the local Hermes policy: a session is replaced after
+By default a session is replaced after
 24 hours idle or at the next 04:00 local boundary, whichever comes first.
 The policy is configurable:
 
@@ -524,8 +531,7 @@ the deploy is green
 To stop or manage this job, send me a new message (e.g. "stop reminder check the deploy").
 ```
 
-The frame is gray core's, byte-for-byte Hermes' `_deliver_result`; this
-plugin only carries it. How it fits together:
+The frame is gray core's; this plugin only carries it. How it fits together:
 
 - Each turn runs in its own gray home, so a job added from a conversation
   lives in that conversation's store and fires with its credentials,
@@ -627,8 +633,7 @@ Use `gray discord share` for explicitly selected skills, non-secret context and
 memory sidecars. Conversation histories remain isolated. Large compacted histories
 are archived without removing the original. See [runtime details](docs/RUNTIME.md)
 for exactly-once delivery limitations, unbounded archive retention, and the
-still-separate native cron scheduler. Voice, attachments and full Hermes parity
-are not included.
+still-separate native cron scheduler. Voice and attachments are not included.
 
 `doctor` checks token, intent, effective channel/parent overwrite permissions
 (including the thread send bit), and local gray configuration; it does not test
@@ -650,3 +655,8 @@ In CI or headless environments:
 ```sh
 cargo test --locked --all-targets
 ```
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
+

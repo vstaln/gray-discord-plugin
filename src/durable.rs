@@ -1,4 +1,4 @@
-//! Port of gray_discord/durable.py: transactional inbox/outbox queue.
+//! Transactional inbox/outbox queue.
 //! Generation and delivery are separate: a failed delivery retries the same
 //! chunks, never the agent turn. Interrupted work is marked uncertain.
 use rusqlite::{params, Connection};
@@ -1030,7 +1030,7 @@ impl Store {
     }
 
     /// Delete terminal inbox rows (sent/cancelled/uncertain) older than
-    /// `retention_secs`, plus their outbox parts. Hermes recovery parity.
+    /// `retention_secs`, plus their outbox parts.
     pub fn prune_terminal(&self, retention_secs: u64, now: f64) -> Result<usize, String> {
         with_conn(&self.path, |db| {
             let cutoff = now - retention_secs as f64;
@@ -1052,7 +1052,7 @@ impl Store {
     }
 }
 
-/// Hermes anti-flood (MAX_SPLIT_MESSAGES = 8): keep the first 7 chunks,
+/// Anti-flood (MAX_SPLIT_MESSAGES = 8): keep the first 7 chunks,
 /// replace the rest with a notice carrying the dropped character count.
 pub(crate) fn cap_chunks(chunks: Vec<String>, dropped_chars: usize) -> Vec<String> {
     const MAX: usize = 8;

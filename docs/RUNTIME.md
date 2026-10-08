@@ -14,7 +14,7 @@ pairing parallel results). With `GRAY_STREAM_TEXT=1` the stream also carries
 the assistant's prose as `text` rows: per segment (a run of prose between tool
 calls), append-only `delta` lines plus a provisional `tail`, closed by a
 `done` row. Discord drains rows per conversation into a stream of Components
-V2 messages, Hermes-style: each run of prose is a new message, each group of
+V2 messages stream like a chat feed: each run of prose is a new message, each group of
 tool calls a new tool bubble below it, with a status chip (Stop button, an
 accent that tracks the outcome) on the newest. The turn's messages are driven
 beside the gray child, never between reads of its output, so a slow Discord
@@ -74,7 +74,7 @@ blindly retried. Shared plugins can also have their own side effects.
 
 ### Restart and shutdown notices
 
-Ported from Hermes' `gateway_restart_notification`, owned by gray core:
+Owned by gray core:
 `gray gateway lifecycle boot|stop --dir <config dir>` decides how the last run
 ended and words every notice, so Telegram or Slack adapters get the same
 behaviour; this plugin only posts the text. Against a gray that predates the
@@ -171,8 +171,8 @@ and restart, a budget overage blocking the next run, cancellation, online schedu
 edits, and selected capabilities. No user token/provider key is read by tests.
 `owner_id` in the config is optional: absent means nobody is admitted yet,
 and every human DM draws a pairing reply (their own ID plus a single-use
-code) until `gray discord pairing approve discord <code>` lands — the
-OpenClaw bootstrap. A running gateway re-reads approvals on restart.
+code) until `gray discord pairing approve discord <code>` lands — the bootstrap
+pairing step. A running gateway re-reads approvals on restart.
 Live Discord pairing now runs in setup itself: one short-lived gateway
 connection waits for the owner's DM (see `setup::default_pairing`). The
 service lifecycle runs under runit, systemd --user, or gray's own detached

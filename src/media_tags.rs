@@ -1,4 +1,4 @@
-//! Hermes-style `MEDIA:<path>` delivery for ordinary replies.
+//! `MEDIA:<path>` delivery for ordinary replies.
 //!
 //! The agent writes `MEDIA:/abs/path/chart.png` anywhere in its answer; the
 //! gateway strips the tag, uploads the file, and posts it as a Components V2
@@ -30,7 +30,7 @@ impl Upload {
 }
 
 /// Optional `media_roots` config: when set, files may only come from those
-/// directories. Unset (the default) allows any non-secret file, like Hermes.
+/// directories. Unset (the default) allows any non-secret file, matching the reference bot.
 pub fn roots_from_config(config: &Value) -> Vec<PathBuf> {
     config
         .get("media_roots")
@@ -83,7 +83,7 @@ pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBu
     (tidy(&out), paths)
 }
 
-/// Hide `MEDIA:` tags from a reply that is still streaming (Hermes'
+/// Hide `MEDIA:` tags from a reply that is still streaming (the bridge's
 /// `strip_media_directives_for_display`): the files go out after the turn,
 /// and a half-typed path flickering in the preview is noise. A line that held
 /// only a tag disappears with it.

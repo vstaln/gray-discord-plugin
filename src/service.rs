@@ -1,4 +1,4 @@
-//! Port of gray_discord/service.py: service lifecycle + unit quoting, split
+//! Service lifecycle + unit quoting, split
 //! by what this box actually supervises with. Python's `service.py` only ever
 //! spoke to systemd; gray's own gateway service probes runit/systemd/none
 //! (crates/gray/src/gateway/service.rs), and this plugin follows that path so
@@ -149,7 +149,7 @@ pub fn runit_script(argv: &[String]) -> String {
 }
 
 /// Render the user unit. Argv uses the current Rust binary — replaces the
-/// Python's `sys.executable -m gray_discord`.
+/// Re-exec equivalent of `python -m <module>`.
 pub fn unit(config_path: &Path) -> Result<String, String> {
     let argv = daemon_argv(config_path)?;
     let mut exec: Vec<String> = Vec::with_capacity(argv.len());

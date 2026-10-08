@@ -1,4 +1,4 @@
-//! Port of gray_discord/hermes_text.py: UTF-16-safe message splitting.
+//! UTF-16-safe message splitting.
 //! Discord counts message length in UTF-16 code units, not code points.
 /// Count UTF-16 code units in `s` (surrogate pairs count as two).
 pub fn utf16_len(s: &str) -> usize {
@@ -43,7 +43,7 @@ pub fn prefix_within_limit(s: &str, limit: usize) -> &str {
     &s[..end]
 }
 
-/// Port of grayai_legacy's `services/text_sanitizer.py`: what model output
+/// What model output
 /// needs before Discord renders it. Three transforms, no regex crate.
 pub fn sanitize(text: &str) -> String {
     text.split('\n')

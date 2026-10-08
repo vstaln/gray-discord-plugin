@@ -1,4 +1,4 @@
-//! Port of grayai_legacy's `services/rate_limiter.py`: a sliding-window
+//! A sliding-window
 //! guard per key. A relay without one turns one eager user into twenty
 //! concurrent `gray` processes; with one, message 21 inside the window
 //! gets a short "slow down" instead of a fork.

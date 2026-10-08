@@ -1,9 +1,9 @@
-//! A turn as a stream of Discord messages, Hermes-style.
+//! A turn as a stream of Discord messages.
 //!
 //! With `GRAY_STREAM_TEXT=1`, gray's `--json` wire interleaves `text` rows
 //! (the assistant's prose, numbered by segment, one segment per run of prose
 //! between tool calls) with the tool progress rows. This module lays a turn
-//! out the way Hermes' gateway does: every run of prose is its own message,
+//! out the way a chat bridge does: every run of prose is its own message,
 //! streamed in place, and every group of tool calls is its own progress
 //! bubble below it. The next prose after a tool call starts a fresh message,
 //! so the channel grows as the agent works instead of one message changing
@@ -23,7 +23,7 @@
 //! Discord timestamp (`<t:…:R>`) that every client keeps current on its own,
 //! so a quiet turn costs no edits. When a newer message appears the chip
 //! moves down to it. A turn that finishes drops the chip outright — the
-//! answer stands alone, the way Hermes leaves it — while a failed or
+//! answer stands alone, the way the bridge leaves it — while a failed or
 //! stopped turn keeps its line as the notice.
 //!
 //! The finished answer is the last message; the files it named (`MEDIA:`)
@@ -38,12 +38,12 @@
 
 use serde_json::{json, Value};
 
-/// Hermes' streaming cursor (`DEFAULT_STREAMING_CURSOR`).
+/// The streaming cursor (`DEFAULT_STREAMING_CURSOR`).
 pub const CURSOR: &str = " ▉";
 /// Body text per message, in UTF-16 units. Discord allows 4000 across a V2
 /// message; the rest is the status chip's and the tool log's.
 pub const CARD_TEXT: usize = 3600;
-/// Hermes' `MAX_SPLIT_MESSAGES`: one runaway run of prose never floods the
+/// `MAX_SPLIT_MESSAGES`: one runaway run of prose never floods the
 /// channel.
 pub const MAX_SPLIT: usize = 8;
 /// Messages one turn may open. Past it, later steps share the last one.
@@ -820,7 +820,7 @@ fn strip_nulls(value: &mut Value) {
 }
 
 /// Cut one block's text into messages of at most `budget` UTF-16 units
-/// (Hermes seals an overflowing preview the same way), so text never moves
+/// (an overflowing preview is sealed the same way), so text never moves
 /// between messages as it grows: a cut lands on the last newline that keeps
 /// at least half the room, and a code fence open at the cut is closed there
 /// and reopened in the next message. At most [`MAX_SPLIT`] messages.

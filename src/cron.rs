@@ -8,7 +8,7 @@
 //! `gray cron add` inherits the binding), ticks each conversation's store,
 //! and posts what comes back.
 //!
-//! Deliberately not Hermes' "cron lives in the gateway daemon" layout:
+//! Deliberately not a "cron lives in the gateway daemon" layout:
 //! every turn here runs in its own gray home, so the jobs live beside the
 //! conversation they belong to and are fired with that conversation's
 //! credentials, workdir, and skills.
