@@ -62,7 +62,7 @@ fn message_document_schema() -> Value {
 pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "name": "discord",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "commands": [],
         "hooks": ["prompt/context"],
