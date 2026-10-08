@@ -1,5 +1,5 @@
 //! Always-on delivery pump: posts what gray's gateway produced on its own
-//! (heartbeat findings, trigger results, recovered turns) to Discord.
+//! (trigger results, recovered turns) to Discord.
 //!
 //! Gray's gateway keeps an outbox of delivery intents; this adapter `pull`s
 //! the ones for `discord` over `$GRAY_HOME/gateway.sock` (which leases them),
@@ -49,11 +49,10 @@ pub fn channel_for(intent: &Value) -> Option<u64> {
 }
 
 /// What is posted: autonomous output gets a small provenance line so a
-/// heartbeat finding never reads like a reply to something the owner said.
+/// trigger result never reads like a reply to something the owner said.
 pub fn render(intent: &Value) -> String {
     let text = intent.get("text").and_then(Value::as_str).unwrap_or("").trim();
     match intent.get("kind").and_then(Value::as_str) {
-        Some("heartbeat") => format!("-# ⏱ heartbeat\n{text}"),
         Some("trigger") => format!("-# ⚡ trigger\n{text}"),
         Some("system") => format!("-# ⚙ gray\n{text}"),
         _ => text.to_string(),
@@ -101,7 +100,7 @@ pub fn with_posted(home: &Path, prompt: String) -> String {
     let cut = posted.char_indices().rev().nth(POSTED_KEEP).map_or(0, |(i, _)| i);
     format!(
         "[Since your last reply here, you posted this to the owner on your own \
-         (heartbeat/trigger); they may be replying to it:]\n{}\n[end]\n\n{prompt}",
+         (trigger/wake); they may be replying to it:]\n{}\n[end]\n\n{prompt}",
         &posted[cut..]
     )
 }
@@ -175,8 +174,8 @@ mod tests {
 
     #[test]
     fn autonomous_output_is_labelled() {
-        let hb = json!({"kind": "heartbeat", "text": "PR #12 is red"});
-        assert!(render(&hb).starts_with("-# ⏱ heartbeat\nPR #12 is red"));
+        let t = json!({"kind": "trigger", "text": "PR #12 is red"});
+        assert!(render(&t).starts_with("-# ⚡ trigger\nPR #12 is red"));
         assert_eq!(render(&json!({"kind": "user", "text": " hi "})), "hi");
     }
 
