@@ -1651,7 +1651,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         {
                             // Unknown human DMing the bot: tell them their own
                             // ID and mint a code — the owner approves it with
-                            // `gray discord pairing approve discord <code>`.
+                            // `gray discord pairing approve discord <code> --as <user_id>`.
                             if let Ok(ch) = channel_id.parse::<u64>() {
                                 let embed =
                                     crate::pairing::unconfigured_embed(&author_id, &paired.code);

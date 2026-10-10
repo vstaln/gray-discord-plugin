@@ -146,7 +146,7 @@ access not configured.
 Your Discord user id: 1493623750858375228
 Pairing code: SNU3ZQ37
 Ask the bot owner to approve with:
-gray discord pairing approve discord SNU3ZQ37
+gray discord pairing approve discord SNU3ZQ37 --as <user_id>
 ```
 
 Codes are single-use; approving before an owner exists makes that user the

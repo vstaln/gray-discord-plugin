@@ -171,7 +171,7 @@ and restart, a budget overage blocking the next run, cancellation, online schedu
 edits, and selected capabilities. No user token/provider key is read by tests.
 `owner_id` in the config is optional: absent means nobody is admitted yet,
 and every human DM draws a pairing reply (their own ID plus a single-use
-code) until `gray discord pairing approve discord <code>` lands — the bootstrap
+code) until `gray discord pairing approve discord <code> --as <user_id>` lands — the bootstrap
 pairing step. A running gateway re-reads approvals on restart.
 Live Discord pairing now runs in setup itself: one short-lived gateway
 connection waits for the owner's DM (see `setup::default_pairing`). The

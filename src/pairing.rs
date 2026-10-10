@@ -1,6 +1,6 @@
 //! Discord-side pairing. A user who DMs an unconfigured
 //! bot is told their own Discord ID and a one-shot code; the owner approves
-//! the code with `gray discord pairing approve discord <code>` and that user
+//! the code with `gray discord pairing approve discord <code> --as <user_id>` and that user
 //! joins the allowlist. No terminal wizard, no 5-minute timer, nothing to
 //! hunt — the discovery happens where the user already is.
 
@@ -33,7 +33,7 @@ pub fn unconfigured_reply(user_id: &str, code: &str) -> String {
          Your Discord user id: {user_id}\n\
          Pairing code: {code}\n\
          Ask the bot owner to approve with:\n\
-         gray discord pairing approve discord {code}"
+         gray discord pairing approve discord {code} --as {user_id}"
     )
 }
 
@@ -94,15 +94,35 @@ pub fn reply_for(
 /// Consume a code and admit its user: they become `owner_id` if the config
 /// has none, otherwise they join `allowed_users`. Config is rewritten
 /// privately (0600) exactly as the wizard would.
-pub fn approve(config_path: &Path, platform: &str, code: &str) -> Result<String, String> {
+///
+/// `expect_user` must be the Discord ID the code was issued to, as the
+/// requester saw it in their DM. A code alone admits nobody: whoever is handed
+/// a code still has to state the ID it belongs to, and a mismatch is refused
+/// without consuming the code.
+pub fn approve(
+    config_path: &Path,
+    platform: &str,
+    code: &str,
+    expect_user: &str,
+) -> Result<String, String> {
     if platform != "discord" {
         return Err(format!(
             "unknown platform '{platform}'; the only one is discord"
         ));
     }
     let store = crate::gateway::open_store(config_path)?;
+    let code = code.trim();
+    let issued_to = store
+        .pairing_peek(code)?
+        .ok_or_else(|| "unknown or already-used pairing code".to_string())?;
+    if issued_to != expect_user.trim() {
+        return Err(
+            "that code was issued to a different user; check the Discord ID in their DM (nothing was approved)"
+                .to_string(),
+        );
+    }
     let user = store
-        .pairing_take(code.trim())?
+        .pairing_take(code)?
         .ok_or_else(|| "unknown or already-used pairing code".to_string())?;
     let mut config = crate::config::load_config(config_path)?;
     let owner_missing = config

@@ -136,6 +136,10 @@ pub enum PairingAction {
         platform: String,
         /// The code from the bot's DM reply.
         code: String,
+        /// The Discord user ID shown in that same DM. Approval is refused
+        /// unless it matches, so a code passed along by someone else is not enough.
+        #[arg(long = "as")]
+        as_user: String,
     },
 }
 
@@ -533,8 +537,12 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             }
         }
         Command::Pairing { action } => match action {
-            PairingAction::Approve { platform, code } => {
-                let line = crate::pairing::approve(config_path, platform, code)?;
+            PairingAction::Approve {
+                platform,
+                code,
+                as_user,
+            } => {
+                let line = crate::pairing::approve(config_path, platform, code, as_user)?;
                 println!("{line}");
                 Ok(())
             }

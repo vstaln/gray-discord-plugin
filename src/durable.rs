@@ -841,6 +841,19 @@ impl Store {
         })
     }
 
+    /// The user a pending code was issued to, without consuming the code.
+    pub fn pairing_peek(&self, code: &str) -> Result<Option<String>, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                "SELECT user_id FROM pairings WHERE code=?1",
+                params![code],
+                |r| r.get::<_, String>(0),
+            )
+            .optional_str()
+            .map_err(|_| "cannot read pairings".to_string())
+        })
+    }
+
     /// Consume a code exactly once. A replay finds nothing.
     pub fn pairing_take(&self, code: &str) -> Result<Option<String>, String> {
         with_conn(&self.path, |db| {

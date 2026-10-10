@@ -45,7 +45,7 @@ fn reply_names_the_command_with_the_code() {
     let text = unconfigured_reply("1493623750858375228", "SNU3ZQ37");
     assert!(text.contains("Your Discord user id: 1493623750858375228"));
     assert!(text.contains("Pairing code: SNU3ZQ37"));
-    assert!(text.contains("gray discord pairing approve discord SNU3ZQ37"));
+    assert!(text.contains("gray discord pairing approve discord SNU3ZQ37 --as 1493623750858375228"));
 }
 
 #[test]
@@ -105,13 +105,13 @@ fn approve_adds_to_the_allowlist_once() {
     let path = config_with_home(&tmp, valid_config(&tmp, Some("111")));
     let store = open_store(&path).unwrap();
     store.pairing_insert("SNU3ZQ37", "333").unwrap();
-    let note = approve(&path, "discord", "SNU3ZQ37").unwrap();
+    let note = approve(&path, "discord", "SNU3ZQ37", "333").unwrap();
     assert!(note.contains("333"), "{note}");
     let saved: serde_json::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     assert_eq!(saved["allowed_users"][0], "333");
     assert_eq!(saved["owner_id"], "111");
     // Single use: a replay finds nothing.
-    let err = approve(&path, "discord", "SNU3ZQ37").unwrap_err();
+    let err = approve(&path, "discord", "SNU3ZQ37", "333").unwrap_err();
     assert_eq!(err, "unknown or already-used pairing code");
 }
 
@@ -124,7 +124,7 @@ fn approve_on_an_ownerless_bot_makes_them_owner() {
     gray_discord::config::atomic_json(&path, &cfg).unwrap();
     let store = open_store(&path).unwrap();
     store.pairing_insert("SNU3ZQ37", "444").unwrap();
-    let note = approve(&path, "discord", "SNU3ZQ37").unwrap();
+    let note = approve(&path, "discord", "SNU3ZQ37", "444").unwrap();
     assert!(note.contains("444") && note.contains("owner"), "{note}");
     let saved: serde_json::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     assert_eq!(saved["owner_id"], "444");
@@ -134,7 +134,7 @@ fn approve_on_an_ownerless_bot_makes_them_owner() {
 fn approve_refuses_other_platforms() {
     let tmp = tempfile::tempdir().unwrap();
     let path = config_with_home(&tmp, valid_config(&tmp, Some("111")));
-    assert!(approve(&path, "slack", "SNU3ZQ37")
+    assert!(approve(&path, "slack", "SNU3ZQ37", "333")
         .unwrap_err()
         .contains("unknown platform"));
 }
@@ -147,7 +147,7 @@ fn the_config_written_by_the_wizard_survives_pairing_approval() {
     let path = config_with_home(&tmp, valid_config(&tmp, Some("111")));
     let store = open_store(&path).unwrap();
     let reply = reply_for(&store, "555", true, false).unwrap();
-    approve(&path, "discord", &reply.code).unwrap();
+    approve(&path, "discord", &reply.code, "555").unwrap();
     let saved: serde_json::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     assert_eq!(saved["allowed_users"][0], "555");
     gray_discord::config::load_config(&path).expect("config still validates");
@@ -156,3 +156,17 @@ fn the_config_written_by_the_wizard_survives_pairing_approval() {
 /// The Fake prompter is in the setup tests; silence the unused import here.
 #[allow(dead_code)]
 fn _assert_prompter_in_scope(_p: &dyn Prompter) {}
+
+#[test]
+fn a_code_for_someone_else_approves_nobody_and_is_not_consumed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = config_with_home(&tmp, valid_config(&tmp, Some("111")));
+    let store = open_store(&path).unwrap();
+    store.pairing_insert("SNU3ZQ37", "333").unwrap();
+    let err = approve(&path, "discord", "SNU3ZQ37", "999").unwrap_err();
+    assert!(err.contains("different user"), "{err}");
+    let saved: serde_json::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(saved.get("allowed_users").is_none(), "{saved}");
+    // The rightful requester can still be approved with the right ID.
+    approve(&path, "discord", "SNU3ZQ37", "333").unwrap();
+}
