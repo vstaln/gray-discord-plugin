@@ -186,6 +186,40 @@ pub type ClockFn = std::sync::Arc<dyn Fn() -> f64 + Send + Sync>;
 /// A final card uses the same hook with `false` because it is a new message.
 pub type ActivityHook = std::sync::Arc<dyn Fn(&str, bool) + Send + Sync>;
 
+const BUSY_BACKOFF_SECS: f64 = 3.0;
+const QUEUED_ACK_SECS: f64 = 30.0;
+
+pub fn steer_command(text: &str) -> Option<String> {
+    let rest = text.trim_start().strip_prefix("/steer")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim().to_string())
+}
+
+pub fn busy_input_steer(config: &Value) -> bool {
+    config.get("busy_input_mode").and_then(Value::as_str) == Some("steer")
+}
+
+pub fn queued_notice(
+    store: &Store,
+    acks: &mut std::collections::HashMap<String, f64>,
+    conversation: &str,
+    id: &str,
+) -> Option<String> {
+    let ahead = store.ahead_in_conversation(conversation, id).ok()?;
+    if ahead <= 0 {
+        return None;
+    }
+    let now = crate::durable::now_secs();
+    if acks
+        .get(conversation)
+        .is_some_and(|at| now - at < QUEUED_ACK_SECS)
+    {
+        return None;
+    }
+    acks.retain(|_, at| now - *at < QUEUED_ACK_SECS);
+    acks.insert(conversation.to_string(), now);
+    Some(format!("Queued — {ahead} ahead."))
+}
+
 fn activity_key(channel: &str, conversation: &str) -> String {
     format!("{channel}\u{0}{conversation}")
 }
@@ -276,6 +310,7 @@ pub struct Runtime<R, D> {
     timelines: std::sync::Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, crate::stream::Timeline>>,
     >,
+    busy_backoff: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -298,6 +333,7 @@ impl<R, D> Runtime<R, D> {
             timelines: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            busy_backoff: Default::default(),
         }
     }
 
@@ -605,7 +641,12 @@ impl<R, D> Runtime<R, D> {
             .or_insert_with(|| crate::stream::Timeline::new(false, now));
         for row in rows {
             // Narration off hides tool lines, never the reply.
-            if !narrate && row.get("phase").and_then(Value::as_str) != Some("text") {
+            if !narrate
+                && !matches!(
+                    row.get("phase").and_then(Value::as_str),
+                    Some("text") | Some("retract")
+                )
+            {
                 continue;
             }
             timeline.absorb(&row);
@@ -811,7 +852,13 @@ where
     FutD: std::future::Future<Output = Result<String, String>>,
 {
     pub async fn generate_one(&self) -> Result<bool, String> {
-        let item = match self.store.claim()? {
+        let skip: Vec<String> = {
+            let now = self.now_secs();
+            let mut backoff = self.busy_backoff.lock().unwrap_or_else(|e| e.into_inner());
+            backoff.retain(|_, until| *until > now);
+            backoff.keys().cloned().collect()
+        };
+        let item = match self.store.claim_except(&skip)? {
             Some(it) => it,
             None => return Ok(false),
         };
@@ -916,6 +963,22 @@ where
             self.add_reaction(&item.channel, &item.id, "❌").await;
             return Ok(true);
         };
+        if matches!(result, Err(RunError::Busy)) {
+            self.timelines
+                .lock()
+                .await
+                .remove(&activity_key(&item.channel, &item.conversation));
+            if let Some(ref sink) = self.activity {
+                crate::activity::discard(sink, &item.conversation);
+            }
+            self.store.requeue(&item.id)?;
+            let until = self.now_secs() + BUSY_BACKOFF_SECS;
+            self.busy_backoff
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(item.conversation.clone(), until);
+            return Ok(true);
+        }
 
         // Settle the turn. The answer is its last message: the streamed
         // prose becomes it in place (the bridge's final edit), or it is posted
@@ -1488,6 +1551,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
     let mut app_id = initial_app;
+    let mut queued_acks: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
     let sigterm_recv = async {
         #[cfg(unix)]
@@ -1670,19 +1734,27 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     );
                                 }
                             }
-                            if store
-                                .enqueue(&msg_id, &channel_id, &prompt, Some(&conv), capacity)
-                                .is_err()
+                            let steer_text = steer_command(&prompt);
+                            let explicit = steer_text.is_some();
+                            if let Some(text) = steer_text {
+                                prompt = text;
+                            }
+                            let notice = if explicit && prompt.trim().is_empty() {
+                                Some("Usage: /steer <text>".to_string())
+                            } else if (explicit || busy_input_steer(&config))
+                                && crate::runner::steer(&conv, &prompt).await
                             {
-                                if let Ok(ch) = channel_id.parse::<u64>() {
-                                    let _ = rest
-                                        .send_text_v2(
-                                            ch,
-                                            "Queue full or message invalid; this message was not accepted.",
-                                            None,
-                                        )
-                                        .await;
+                                Some("Steering the current turn.".to_string())
+                            } else {
+                                match store.enqueue(&msg_id, &channel_id, &prompt, Some(&conv), capacity) {
+                                    Err(_) => Some("Queue full or message invalid; this message was not accepted.".to_string()),
+                                    Ok(true) if explicit => Some("Nothing running — sent as a new message.".to_string()),
+                                    Ok(true) => queued_notice(&store, &mut queued_acks, &conv, &msg_id),
+                                    Ok(false) => None,
                                 }
+                            };
+                            if let (Some(notice), Ok(ch)) = (notice, channel_id.parse::<u64>()) {
+                                let _ = rest.send_text_v2(ch, &notice, None).await;
                             }
                         } else if let Some(paired) =
                             crate::pairing::reply_for(&store, &author_id, is_dm, m.author.bot)

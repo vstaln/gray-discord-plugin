@@ -193,7 +193,20 @@ pub const COMMANDS: &[Command] = &[
         subcommands: &[],
         options: &[],
     },
+    Command {
+        name: "steer",
+        description: "Add guidance to the running turn",
+        subcommands: &[],
+        options: &[Opt {
+            name: "text",
+            description: "What gray should take into account now",
+            required: true,
+        }],
+    },
 ];
+
+pub const STEER_HELP: &str =
+    "`/steer <text>` — add guidance to the running turn (when idle it is sent as a new message)";
 
 /// Discord's global-command registration array, derived from [`COMMANDS`].
 pub fn registration_json() -> Value {
@@ -264,6 +277,9 @@ pub enum Request {
     },
     Reset,
     Stop,
+    Steer {
+        text: String,
+    },
     /// A registry command `gray cmd` answers; built by `graycmd::route`.
     CmdRun {
         name: String,
@@ -318,6 +334,7 @@ pub fn parse(command: &str, subcommand: Option<&str>, values: &[(&str, &str)]) -
         ("status", _) => Some(Request::Status),
         ("new", _) | ("reset", _) => Some(Request::Reset),
         ("stop", _) => Some(Request::Stop),
+        ("steer", _) => needed("text").map(|text| Request::Steer { text }),
         _ => None,
     }
 }

@@ -34,7 +34,9 @@ use crate::durable::{now_secs, Store};
 
 /// Commands the bridge keeps even when `cmd list` advertises them:
 /// behavior stays exactly what the static table already does.
-pub const BRIDGE_OWNED: &[&str] = &["ask", "stop", "reset", "new", "status", "cron", "memory"];
+pub const BRIDGE_OWNED: &[&str] = &[
+    "ask", "stop", "steer", "reset", "new", "status", "cron", "memory",
+];
 
 /// `meta` key holding the cached registry JSON: {"at": secs, "commands": [...]}.
 const REGISTRY_KEY: &str = "gray_cmd_registry";
@@ -581,6 +583,11 @@ pub async fn run(
         Ok(CmdResult::Text { text, .. }) => {
             let text = if text.trim().is_empty() {
                 "Done.".to_string()
+            } else {
+                text
+            };
+            let text = if name == "help" && !text.contains("/steer") {
+                format!("{text}\n\n{}", commands::STEER_HELP)
             } else {
                 text
             };

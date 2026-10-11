@@ -510,9 +510,29 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
             let text = if stopped {
                 "Stopping the running turn."
             } else {
-                "No running turn to stop."
+                "Nothing running."
             };
             answer(ctx, &commands::embed("Stop", text, &[]), &[], false).await;
+        }
+        Request::Steer { text } => {
+            let conv = ctx.conversation();
+            let reply = if crate::runner::steer(&conv, &text).await {
+                "Steering the current turn.".to_string()
+            } else {
+                let capacity = ctx
+                    .config
+                    .get("queue_capacity")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1000);
+                match ctx
+                    .store
+                    .enqueue(ctx.int_id, ctx.channel_id, &text, Some(&conv), capacity)
+                {
+                    Ok(_) => "Nothing running — sent as a new message.".to_string(),
+                    Err(e) => format!("Cannot queue that: {e}"),
+                }
+            };
+            answer(ctx, &commands::embed("Steer", reply, &[]), &[], false).await;
         }
     }
 }

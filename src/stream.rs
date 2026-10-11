@@ -206,6 +206,7 @@ pub struct Timeline {
     /// `custom_id` of the status chip's Stop button while the turn runs.
     stop: Option<String>,
     media: Vec<Media>,
+    retracted: bool,
 }
 
 impl Timeline {
@@ -230,6 +231,12 @@ impl Timeline {
 
     /// Fold one progress row into the layout.
     pub fn absorb(&mut self, row: &Value) {
+        if row.get("phase").and_then(Value::as_str) == Some("retract") {
+            if let Some(segment) = row.get("segment").and_then(Value::as_u64) {
+                self.retract(segment);
+            }
+            return;
+        }
         if row.get("phase").and_then(Value::as_str) == Some("text") {
             if self.text {
                 self.absorb_text(row);
@@ -281,6 +288,25 @@ impl Timeline {
             *tail = new_tail.to_string();
             *done |= closes;
         }
+    }
+
+    fn retract(&mut self, segment: u64) {
+        let before = self.blocks.len();
+        self.blocks.retain(
+            |block| !matches!(block, Block::Text { segment: s, answer: None, .. } if *s == segment),
+        );
+        if self.blocks.len() == before {
+            return;
+        }
+        self.retracted = true;
+        let mut merged: Vec<Block> = Vec::with_capacity(self.blocks.len());
+        for block in std::mem::take(&mut self.blocks) {
+            match (merged.last_mut(), block) {
+                (Some(Block::Tools { rows }), Block::Tools { rows: more }) => rows.extend(more),
+                (_, block) => merged.push(block),
+            }
+        }
+        self.blocks = merged;
     }
 
     fn close_text(&mut self) {
@@ -542,7 +568,7 @@ impl Timeline {
         }
         // The turn shrank (the final answer is shorter than its preview):
         // retire the messages it no longer fills.
-        if finishing {
+        if finishing || self.retracted {
             for (index, posted) in self.cards.iter().enumerate().skip(cards.len()) {
                 ops.push(Op::Delete {
                     card: index,

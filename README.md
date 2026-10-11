@@ -594,6 +594,11 @@ exists is registered, handled and documented or none of the three.
 | `/new` | Starts a fresh session for you | private |
 | `/reset` | Alias of `/new` | private |
 | `/stop` | Cancels the running turn | private |
+| `/steer text:…` | Adds guidance to the running turn; when idle it is sent as a new message | private |
+
+A message sent while a turn runs queues as its own next turn ("Queued — N
+ahead.", at most once per 30s per conversation). `{"busy_input_mode": "steer"}`
+in `config.json` makes such messages steer the running turn instead.
 
 Anything that shells out to gray (`/memory`) acknowledges first and answers
 afterwards: Discord drops a callback that took longer than three seconds.

@@ -122,7 +122,10 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
         scope.pending.pop_front();
     }
     scope.pending.push_back(row.clone());
-    if row.get("phase").and_then(Value::as_str) == Some("text") {
+    if matches!(
+        row.get("phase").and_then(Value::as_str),
+        Some("text") | Some("retract")
+    ) {
         return;
     }
     if scope.history.len() >= MAX_HISTORY {
