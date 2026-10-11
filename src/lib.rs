@@ -19,6 +19,7 @@ pub mod cron_card;
 pub mod discord_check;
 pub mod doctor;
 pub mod durable;
+pub mod exe_watch;
 pub mod gateway;
 pub mod graycmd;
 pub mod lifecycle;

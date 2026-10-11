@@ -1412,6 +1412,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let runtime_task = runtime.run();
     tokio::pin!(runtime_task);
 
+    let exe_watch = crate::exe_watch::ExeWatch::capture();
+    let mut exe_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    exe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Chat-bound cron. Its own task: firing a job spawns a gray turn, and
     // that must never stall shard events (a typing indicator that stops
     // updating mid-turn is a broken gateway).
@@ -1493,6 +1497,16 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             }
             _ = &mut sigterm_recv => {
                 break;
+            }
+            _ = exe_tick.tick() => {
+                let idle = store
+                    .running_channels()
+                    .map(|c| c.is_empty())
+                    .unwrap_or(false);
+                if idle && exe_watch.as_ref().is_some_and(|w| w.replaced()) {
+                    eprintln!("[discord] binary replaced; exiting for restart");
+                    break;
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 break;
