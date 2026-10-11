@@ -1761,6 +1761,32 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 continue;
                             }
                         }
+                        let run_autocomplete = match &interaction.data {
+                            Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(cmd)) => {
+                                is_autocomplete && cmd.name.as_str() == "run"
+                            }
+                            _ => false,
+                        };
+                        if run_autocomplete {
+                            let cmd = match &interaction.data {
+                                Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(cmd)) => cmd,
+                                _ => continue,
+                            };
+                            let query = cmd
+                                .options
+                                .iter()
+                                .find_map(|o| match &o.value {
+                                    twilight_model::application::interaction::application_command::CommandOptionValue::Focused(v, _) if o.name == "name" => Some(v.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            let reg = crate::graycmd::registry(&ctx).await;
+                            let choices = crate::graycmd::run_autocomplete(reg.as_deref(), &query);
+                            let _ = rest
+                                .autocomplete_response(&int_id, &interaction.token, &choices)
+                                .await;
+                            continue;
+                        }
                         if is_component || is_autocomplete {
                             let raw = serde_json::to_value(interaction)
                                 .map_err(|_| "interaction could not be normalized".to_string())?;

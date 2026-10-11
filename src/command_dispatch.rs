@@ -485,8 +485,9 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
             args,
             scope,
             surface,
+            slow,
         } => {
-            crate::graycmd::run(ctx, &name, args.as_deref(), &scope, &surface).await;
+            crate::graycmd::run(ctx, &name, args.as_deref(), &scope, &surface, slow).await;
         }
         Request::Stop => {
             let stopped = ctx

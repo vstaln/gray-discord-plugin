@@ -257,6 +257,7 @@ pub enum Request {
         args: Option<String>,
         scope: String,
         surface: String,
+        slow: bool,
     },
 }
 

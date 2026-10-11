@@ -46,6 +46,11 @@ const LIST_TIMEOUT: Duration = Duration::from_millis(2500);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// `run`/`interact` share the same 10s guard as the bridge's other CLI calls.
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Registry rows marked `slow` (compaction, plugin calls, updates) get the
+/// full deferred-interaction budget instead.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(120);
+/// Discord's global-command ceiling; `/run` always gets a slot.
+const COMMAND_LIMIT: usize = 100;
 
 /// One row of `gray cmd list`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -59,6 +64,10 @@ pub struct CmdInfo {
     pub surface: String,
     /// The first declared argument's hint, used as the option's description.
     pub arg_hint: Option<String>,
+    /// `builtin`, `plugin:<name>`, or `skill` — where the row came from.
+    pub source: String,
+    /// Runs that can exceed the normal timeout.
+    pub slow: bool,
 }
 
 /// The `result` of a `cmd run` / `cmd interact` call.
@@ -71,6 +80,10 @@ pub enum CmdResult {
     Ui {
         token: String,
         document: Value,
+        fallback_text: Option<String>,
+    },
+    Prompt {
+        prompt: String,
         fallback_text: Option<String>,
     },
 }
@@ -235,6 +248,12 @@ fn parse_commands(list: &Value) -> Option<Vec<CmdInfo>> {
                 // hint is already flattened.
                 .or_else(|| c.get("arg_hint").and_then(Value::as_str))
                 .map(str::to_string),
+            source: c
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("builtin")
+                .to_string(),
+            slow: c.get("slow").and_then(Value::as_bool).unwrap_or(false),
         });
     }
     Some(out)
@@ -243,25 +262,37 @@ fn parse_commands(list: &Value) -> Option<Vec<CmdInfo>> {
 /// Discord's global-command array. Bridge-owned commands keep their static
 /// shapes; every other live registry command registers flat with one
 /// optional `args` string; `local` commands are TUI-only and skipped.
-/// `None` (an old gray without `cmd`) yields today's table verbatim.
+/// Registry order is the host's priority (builtins, then plugins, then
+/// skills), and the table is capped under Discord's 100 with `/run` kept
+/// so everything that did not fit stays reachable. `None` (an old gray
+/// without `cmd`) yields today's table verbatim.
 pub fn registration_json(registry: Option<&[CmdInfo]>) -> Value {
     let mut out: Vec<Value> = Vec::new();
-    let mut names: HashSet<&str> = HashSet::new();
+    let mut names: HashSet<String> = HashSet::new();
     for c in commands::COMMANDS {
         if registry.is_some() && !BRIDGE_OWNED.contains(&c.name) {
             continue;
         }
-        names.insert(c.name);
+        names.insert(c.name.to_string());
         out.push(commands::command_json(c));
     }
-    for c in registry.unwrap_or(&[]) {
-        if c.surface == "local"
-            || BRIDGE_OWNED.contains(&c.name.as_str())
-            || !valid_name(&c.name)
-            || !names.insert(c.name.as_str())
-        {
+    let Some(registry) = registry else {
+        return Value::Array(out);
+    };
+    let budget = COMMAND_LIMIT.saturating_sub(out.len() + 1);
+    let mut taken = 0usize;
+    for c in registry {
+        if taken >= budget {
+            break;
+        }
+        if c.surface == "local" || BRIDGE_OWNED.contains(&c.name.as_str()) {
             continue;
         }
+        let name = discord_name(&c.name);
+        if name.is_empty() || name == "run" || !names.insert(name.clone()) {
+            continue;
+        }
+        taken += 1;
         let description = if c.description.trim().is_empty() {
             format!("Run /{}", c.name)
         } else {
@@ -274,7 +305,7 @@ pub fn registration_json(registry: Option<&[CmdInfo]>) -> Value {
             .map(|h| commands::truncate(h, 100))
             .unwrap_or_else(|| "Optional arguments".to_string());
         out.push(json!({
-            "name": c.name,
+            "name": name,
             "description": description,
             "options": [{
                 "name": "args",
@@ -284,18 +315,48 @@ pub fn registration_json(registry: Option<&[CmdInfo]>) -> Value {
             }],
         }));
     }
+    out.push(json!({
+        "name": "run",
+        "description": "Run a gray command by name",
+        "options": [
+            {"name": "name", "description": "Command name", "type": 3, "required": true, "autocomplete": true},
+            {"name": "args", "description": "Optional arguments", "type": 3, "required": false},
+        ],
+    }));
     Value::Array(out)
 }
 
-/// Discord's `^[-_\w]{1,32}$` lowercased — registry rows that would fail
-/// the platform's own validation are skipped rather than poisoning the
-/// whole registration payload.
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 32
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+/// Discord's `^[-_a-z0-9]{1,32}$`: lowercase, anything else becomes `-`,
+/// clipped to 32 chars; empty results are dropped by the caller (the row
+/// stays reachable through `/run`).
+pub fn discord_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        out.push(
+            if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '_' || lower == '-'
+            {
+                lower
+            } else {
+                '-'
+            },
+        );
+    }
+    out.truncate(32);
+    out
+}
+
+/// Choices for `/run`'s `name` option: every registry name matching the
+/// typed prefix/substring, canonical spelling as both label and value.
+pub fn run_autocomplete(registry: Option<&[CmdInfo]>, query: &str) -> Vec<(String, String)> {
+    let query = query.to_ascii_lowercase();
+    registry
+        .into_iter()
+        .flatten()
+        .filter(|c| query.is_empty() || c.name.to_ascii_lowercase().contains(&query))
+        .take(25)
+        .map(|c| (c.name.clone(), c.name.clone()))
+        .collect()
 }
 
 /// An incoming slash invocation as a `cmd run`, when `name` belongs to the
@@ -308,9 +369,45 @@ pub fn route(
     sub: Option<&str>,
     values: &[(&str, &str)],
 ) -> Option<Request> {
-    let cmd = registry?
+    let registry = registry?;
+    if name == "run" {
+        let wanted = values
+            .iter()
+            .find(|(k, _)| *k == "name")
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())?;
+        let cmd = registry.iter().find(|c| {
+            c.name == wanted || c.aliases.iter().any(|a| a.as_str() == wanted)
+        });
+        let args = values
+            .iter()
+            .find(|(k, _)| *k == "args")
+            .map(|(_, v)| v.to_string())
+            .filter(|s| !s.trim().is_empty());
+        return Some(match cmd {
+            Some(c) => Request::CmdRun {
+                name: c.name.clone(),
+                args,
+                scope: c.scope.clone(),
+                surface: c.surface.clone(),
+                slow: c.slow,
+            },
+            None => Request::CmdRun {
+                name: wanted.to_string(),
+                args,
+                scope: "conversation".to_string(),
+                surface: "text".to_string(),
+                slow: false,
+            },
+        });
+    }
+    let cmd = registry
         .iter()
-        .find(|c| c.name == name || c.aliases.iter().any(|a| a == name))?;
+        .find(|c| {
+            c.name == name
+                || discord_name(&c.name) == name
+                || c.aliases.iter().any(|a| a.as_str() == name)
+        })?;
     if cmd.surface == "local" || BRIDGE_OWNED.contains(&cmd.name.as_str()) {
         return None;
     }
@@ -331,27 +428,36 @@ pub fn route(
         args,
         scope: cmd.scope.clone(),
         surface: cmd.surface.clone(),
+        slow: cmd.slow,
     })
 }
 
 /// `/x [args]` → `gray cmd run x [args…]` in the right home, the result
 /// rendered the same way every other command answer is. Picker surfaces
-/// stay private; text answers are channel information like `/help`.
-pub async fn run(ctx: &Ctx<'_>, name: &str, args: Option<&str>, scope: &str, surface: &str) {
+/// stay private; text answers are channel information like `/help`; a
+/// `prompt` answer enqueues a turn exactly as if the user had typed it.
+pub async fn run(
+    ctx: &Ctx<'_>,
+    name: &str,
+    args: Option<&str>,
+    scope: &str,
+    surface: &str,
+    slow: bool,
+) {
     let public = surface != "interactive";
     if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, public).await {
         eprintln!("[discord] /{name} defer failed: {e}");
         return;
     }
-    let reply = match gray_cli_in(ctx, &home_for(ctx, scope), &run_argv(name, args), RUN_TIMEOUT)
-        .await
-    {
-        Ok((stdout, _)) => parse_reply(&stdout),
-        Err(e) => Err(CmdError {
-            code: "unavailable".to_string(),
-            message: e,
-        }),
-    };
+    let timeout = if slow { SLOW_TIMEOUT } else { RUN_TIMEOUT };
+    let reply =
+        match gray_cli_in(ctx, &home_for(ctx, scope), &run_argv(name, args), timeout).await {
+            Ok((stdout, _)) => parse_reply(&stdout),
+            Err(e) => Err(CmdError {
+                code: "unavailable".to_string(),
+                message: e,
+            }),
+        };
     let embed = match reply {
         Ok(CmdResult::Ui {
             token,
@@ -376,6 +482,39 @@ pub async fn run(ctx: &Ctx<'_>, name: &str, args: Option<&str>, scope: &str, sur
                 commands::embed(format!("/{name}"), text, &[])
             }
         },
+        Ok(CmdResult::Prompt {
+            prompt,
+            fallback_text,
+        }) => {
+            let capacity = ctx
+                .config
+                .get("queue_capacity")
+                .and_then(Value::as_u64)
+                .unwrap_or(1000);
+            let conv = ctx.conversation();
+            match ctx
+                .store
+                .enqueue(ctx.int_id, ctx.channel_id, &prompt, Some(&conv), capacity)
+            {
+                Ok(true) => {
+                    let _ = ctx
+                        .store
+                        .set_interaction(ctx.int_id, ctx.int_token, ctx.app_id);
+                    let text = fallback_text
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "Working on it.".to_string());
+                    commands::embed(format!("/{name}"), text, &[])
+                }
+                Ok(false) => commands::embed(
+                    format!("/{name}"),
+                    "That turn is already queued (Discord redelivered it).",
+                    &[],
+                ),
+                Err(e) => {
+                    commands::embed(format!("/{name}"), format!("Cannot queue that: {e}"), &[])
+                }
+            }
+        }
         Ok(CmdResult::Text { text, .. }) => {
             let text = if text.trim().is_empty() {
                 "Done.".to_string()
@@ -469,6 +608,31 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
                 text_components(&text)
             }
         },
+        Ok(CmdResult::Prompt {
+            prompt,
+            fallback_text,
+        }) => {
+            let capacity = ctx
+                .config
+                .get("queue_capacity")
+                .and_then(Value::as_u64)
+                .unwrap_or(1000);
+            let conv = ctx.conversation();
+            let text = match ctx.store.enqueue(
+                ctx.int_id,
+                ctx.channel_id,
+                &prompt,
+                Some(&conv),
+                capacity,
+            ) {
+                Ok(true) => fallback_text
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| "Working on it.".to_string()),
+                Ok(false) => "That turn is already queued.".to_string(),
+                Err(e) => format!("Cannot queue that: {e}"),
+            };
+            text_components(&text)
+        }
         Err(err) => {
             let text = if err.code == "expired" {
                 expired_text(&name)
@@ -543,6 +707,17 @@ pub fn parse_reply(stdout: &str) -> Result<CmdResult, CmdError> {
                 .unwrap_or("")
                 .to_string(),
             document: result.get("document").cloned().unwrap_or_default(),
+            fallback_text: result
+                .get("fallback_text")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        Some("prompt") => Ok(CmdResult::Prompt {
+            prompt: result
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             fallback_text: result
                 .get("fallback_text")
                 .and_then(Value::as_str)
