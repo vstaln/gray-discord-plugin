@@ -20,6 +20,7 @@ pub mod discord_check;
 pub mod doctor;
 pub mod durable;
 pub mod gateway;
+pub mod graycmd;
 pub mod lifecycle;
 pub mod media_tags;
 pub mod pairing;

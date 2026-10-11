@@ -170,12 +170,13 @@ pub fn open_store(config_path: &Path) -> Result<Store, String> {
     Ok(store)
 }
 
-/// Registration JSON for every slash command the bridge serves. Derived
-/// from `commands::COMMANDS` so the picker, the dispatcher and `/help`
-/// cannot disagree; the hash of this body is what Discord sees, so adding a
-/// command re-registers exactly once.
-pub fn slash_commands_json() -> Value {
-    crate::commands::registration_json()
+/// Registration JSON for every slash command the bridge serves: the
+/// bridge-owned rows from `commands::COMMANDS` merged with whatever
+/// `gray cmd` advertises (or the full static table when `cmd` is absent).
+/// The hash of this body is what Discord sees, so a changed merge
+/// re-registers exactly once.
+pub fn slash_commands_json(registry: Option<&[crate::graycmd::CmdInfo]>) -> Value {
+    crate::graycmd::registration_json(registry)
 }
 
 pub type ReactionHook = std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
@@ -1528,7 +1529,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         bot_id = ready.user.id.to_string();
                         app_id = Some(r_app_id.clone());
 
-                        let cmds = slash_commands_json();
+                        // `gray cmd` discovers what the binary answers
+                        // headlessly; an old gray's failed fetch caches as
+                        // a negative and the table stays static.
+                        let registry = crate::graycmd::fetch_registry(&config).await;
+                        crate::graycmd::cache_registry(&store, registry.as_deref());
+                        let cmds = slash_commands_json(registry.as_deref());
                         let cmds_str = serde_json::to_string(&cmds).unwrap_or_default();
                         let hash = crate::runner::hex_sha256(cmds_str.as_bytes());
                         let cached = store.meta_get("slash_commands_hash").ok().flatten();
@@ -1724,6 +1730,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 crate::command_dispatch::ask_press(&ctx, id, &component.values, None).await;
                                 continue;
                             }
+                            if id.starts_with("gc:") {
+                                let is_button = matches!(
+                                    component.component_type,
+                                    twilight_model::channel::message::component::ComponentType::Button
+                                );
+                                crate::graycmd::component(&ctx, id, &component.values, is_button).await;
+                                continue;
+                            }
                         }
                         if let Some(twilight_model::application::interaction::InteractionData::ModalSubmit(modal)) = &interaction.data {
                             if modal.custom_id.starts_with("ask:") {
@@ -1830,7 +1844,24 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 args.push((o.name.as_str(), v.as_str()));
                             }
                         }
-                        match crate::commands::parse(cmd.name.as_str(), sub.as_deref(), &args) {
+                        // Registry commands (`model`, `help`, `usage`, …)
+                        // route to `gray cmd`; bridge-owned commands answer
+                        // locally and never wait on a `cmd list` spawn.
+                        let request = if crate::graycmd::BRIDGE_OWNED.contains(&cmd.name.as_str()) {
+                            crate::commands::parse(cmd.name.as_str(), sub.as_deref(), &args)
+                        } else {
+                            let cmd_registry = crate::graycmd::registry(&ctx).await;
+                            crate::graycmd::route(
+                                cmd_registry.as_deref(),
+                                cmd.name.as_str(),
+                                sub.as_deref(),
+                                &args,
+                            )
+                            .or_else(|| {
+                                crate::commands::parse(cmd.name.as_str(), sub.as_deref(), &args)
+                            })
+                        };
+                        match request {
                             Some(request) => crate::command_dispatch::handle(&ctx, request).await,
                             None => {
                                 // An interaction we did not register (or a

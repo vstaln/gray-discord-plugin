@@ -202,39 +202,40 @@ pub const COMMANDS: &[Command] = &[
 
 /// Discord's global-command registration array, derived from [`COMMANDS`].
 pub fn registration_json() -> Value {
-    let out: Vec<Value> = COMMANDS
-        .iter()
-        .map(|c| {
-            let mut options: Vec<Value> = Vec::new();
-            for s in c.subcommands {
-                options.push(json!({
-                    "name": s.name,
-                    "description": s.description,
-                    "type": 1,
-                    "options": s.options.iter().map(|o| json!({
-                        "name": o.name,
-                        "description": o.description,
-                        "type": 3,
-                        "required": o.required,
-                    })).collect::<Vec<_>>(),
-                }));
-            }
-            for o in c.options {
-                options.push(json!({
-                    "name": o.name,
-                    "description": o.description,
-                    "type": 3,
-                    "required": o.required,
-                }));
-            }
-            json!({"name": c.name, "description": c.description, "options": options})
-        })
-        .collect();
-    Value::Array(out)
+    Value::Array(COMMANDS.iter().map(command_json).collect())
+}
+
+/// One command's registration object — shared with `graycmd`'s merged
+/// table so bridge-owned rows can never drift from the static shape.
+pub fn command_json(c: &Command) -> Value {
+    let mut options: Vec<Value> = Vec::new();
+    for s in c.subcommands {
+        options.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "type": 1,
+            "options": s.options.iter().map(|o| json!({
+                "name": o.name,
+                "description": o.description,
+                "type": 3,
+                "required": o.required,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    for o in c.options {
+        options.push(json!({
+            "name": o.name,
+            "description": o.description,
+            "type": 3,
+            "required": o.required,
+        }));
+    }
+    json!({"name": c.name, "description": c.description, "options": options})
 }
 
 /// What an invocation asked for. Discord sends strings; the bridge decides
 /// what they mean, so a typo surfaces as an embed, not a silent no-op.
+#[derive(Debug)]
 pub enum Request {
     Help { command: Option<String> },
     CronList,
@@ -250,6 +251,13 @@ pub enum Request {
     Ask { prompt: String },
     Reset,
     Stop,
+    /// A registry command `gray cmd` answers; built by `graycmd::route`.
+    CmdRun {
+        name: String,
+        args: Option<String>,
+        scope: String,
+        surface: String,
+    },
 }
 
 /// An answer: always an embed, with whether it belongs to the channel

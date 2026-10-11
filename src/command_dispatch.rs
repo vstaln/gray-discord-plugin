@@ -43,7 +43,7 @@ impl<'a> Ctx<'a> {
     /// The gray home this channel's turns run in. Same derivation as the
     /// runner's, so a `/memory` call sees exactly what the agent in this
     /// channel sees.
-    fn conversation_home(&self) -> PathBuf {
+    pub(crate) fn conversation_home(&self) -> PathBuf {
         let base = self
             .config_path
             .parent()
@@ -109,7 +109,21 @@ fn current_model(ctx: &Ctx<'_>) -> (Option<String>, Option<String>) {
 /// Run `gray <argv>` in this channel's home and take its text. gray owns the
 /// format; the bridge renders what it printed, so there is no second parser
 /// to keep in step with it.
-async fn gray_cli(ctx: &Ctx<'_>, argv: &[String]) -> Result<(String, String), String> {
+pub(crate) async fn gray_cli(
+    ctx: &Ctx<'_>,
+    argv: &[String],
+) -> Result<(String, String), String> {
+    let home = ctx.conversation_home();
+    gray_cli_in(ctx, &home, argv, CLI_TIMEOUT).await
+}
+
+/// The same call against an explicit home — `gray cmd` routes by scope.
+pub(crate) async fn gray_cli_in(
+    ctx: &Ctx<'_>,
+    home: &Path,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<(String, String), String> {
     let gray_bin = ctx
         .config
         .get("gray_bin")
@@ -119,27 +133,11 @@ async fn gray_cli(ctx: &Ctx<'_>, argv: &[String]) -> Result<(String, String), St
     if gray_bin.is_empty() {
         return Err("gray executable is missing".to_string());
     }
-    let home = ctx.conversation_home();
-    let child = tokio::process::Command::new(&gray_bin)
-        .args(argv)
-        .env("GRAY_HOME", &home)
-        .env("GRAY_SHOW_REASONING", "0")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run gray: {e}"))?;
-    let out = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "gray did not answer in time".to_string())?
-        .map_err(|e| format!("gray failed: {e}"))?;
-    Ok((
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    ))
+    crate::graycmd::spawn(&gray_bin, home, argv, timeout).await
 }
 
 /// Answer in the same call as the interaction (the 3-second path).
-async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
+pub(crate) async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
     let components = match render::from_embed(embed, buttons) {
         Ok(components) => components,
         Err(e) => {
@@ -156,7 +154,7 @@ async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
     }
 }
 
-async fn edit_deferred(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
+pub(crate) async fn edit_deferred(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
     let components = match render::from_embed(embed, buttons) {
         Ok(components) => components,
         Err(e) => {
@@ -482,6 +480,14 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
             )
             .await;
         }
+        Request::CmdRun {
+            name,
+            args,
+            scope,
+            surface,
+        } => {
+            crate::graycmd::run(ctx, &name, args.as_deref(), &scope, &surface).await;
+        }
         Request::Stop => {
             let stopped = ctx
                 .store
@@ -648,7 +654,7 @@ pub async fn ask_press(ctx: &Ctx<'_>, custom_id: &str, values: &[String], typed:
 }
 
 /// The private "that button no longer works" reply.
-async fn expired(ctx: &Ctx<'_>, title: &str, text: &str) {
+pub(crate) async fn expired(ctx: &Ctx<'_>, title: &str, text: &str) {
     answer(ctx, &commands::embed(title, text, &[]), &[], false).await;
 }
 
