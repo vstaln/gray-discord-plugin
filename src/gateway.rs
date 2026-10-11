@@ -638,19 +638,35 @@ impl<R, D> Runtime<R, D> {
             Some(timeline) => timeline.plan(now, crate::activity::MIN_EDIT_GAP, finishing),
             None => return None,
         };
+        let components_for = |body: &crate::stream::Card| -> Vec<Value> {
+            let mut components = body.components.clone();
+            if let Some(pages) = &body.pager {
+                if let Ok(token) = crate::pager::mint(
+                    &self.store,
+                    "*",
+                    channel,
+                    pages,
+                    "",
+                    crate::render::QUIET_ACCENT,
+                ) {
+                    if let Some(row) = crate::pager::nav_row(&token, 0, pages.len()) {
+                        components.push(row);
+                    }
+                }
+            }
+            components
+        };
         let mut busy: Option<f64> = None;
         for op in ops {
             match op {
                 crate::stream::Op::Post { card, body } => {
                     let files = files_for(&body);
+                    let components = components_for(&body);
                     let sent = match self.rest {
                         Some(ref rest) if files.is_empty() => {
-                            rest.send_v2(ch, &body.components, None).await
+                            rest.send_v2(ch, &components, None).await
                         }
-                        Some(ref rest) => {
-                            rest.send_v2_uploads(ch, &body.components, &files, None)
-                                .await
-                        }
+                        Some(ref rest) => rest.send_v2_uploads(ch, &components, &files, None).await,
                         // No REST (tests, dry runs): still narrate via the hook.
                         None => Ok(format!("hook-{card}")),
                     };
@@ -684,14 +700,12 @@ impl<R, D> Runtime<R, D> {
                 }
                 crate::stream::Op::Edit { card, id, body } => {
                     let files = files_for(&body);
+                    let components = components_for(&body);
                     let outcome = match self.rest {
                         Some(ref rest) if files.is_empty() => {
-                            rest.edit_v2(ch, &id, &body.components).await
+                            rest.edit_v2(ch, &id, &components).await
                         }
-                        Some(ref rest) => {
-                            rest.edit_v2_uploads(ch, &id, &body.components, &files)
-                                .await
-                        }
+                        Some(ref rest) => rest.edit_v2_uploads(ch, &id, &components, &files).await,
                         None => Ok(()),
                     };
                     let at = self.now_secs();
@@ -1313,12 +1327,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             {
                 return Err("stored component document has no components".to_string());
             }
-            if let Some(ref token) = part.interaction_token {
-                let app_id = part.app_id.as_deref().unwrap_or("");
-                return rest
-                    .edit_original_stored_document(app_id, token, &document)
-                    .await
-                    .map_err(|error| error.to_string());
+            if part.part == 0 {
+                if let Some(ref token) = part.interaction_token {
+                    let app_id = part.app_id.as_deref().unwrap_or("");
+                    return rest
+                        .edit_original_stored_document(app_id, token, &document)
+                        .await
+                        .map_err(|error| error.to_string());
+                }
             }
             let ch: u64 = part
                 .channel
@@ -1420,6 +1436,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     // that must never stall shard events (a typing indicator that stops
     // updating mid-turn is a broken gateway).
     let cron_rest = rest.clone();
+    let cron_store = store.clone();
     let cron_bin = std::path::PathBuf::from(
         config
             .get("gray_bin")
@@ -1441,7 +1458,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     let Ok(ch) = delivery.channel.parse::<u64>() else {
                         continue;
                     };
-                    let _ = crate::cron::post_delivery(&cron_rest, ch, &delivery).await;
+                    let _ =
+                        crate::cron::post_delivery(&cron_rest, &cron_store, ch, &delivery).await;
                 }
             }
         }
@@ -1744,6 +1762,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 crate::command_dispatch::ask_press(&ctx, id, &component.values, None).await;
                                 continue;
                             }
+                            if id.starts_with("pg:") {
+                                let pressed = interaction
+                                    .message
+                                    .as_ref()
+                                    .and_then(|message| serde_json::to_value(&message.components).ok());
+                                crate::pager::press(&ctx, id, pressed.as_ref()).await;
+                                continue;
+                            }
                             if id.starts_with("gc:") {
                                 let is_button = matches!(
                                     component.component_type,
@@ -1761,13 +1787,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 continue;
                             }
                         }
-                        let run_autocomplete = match &interaction.data {
+                        let autocomplete_cmd = match &interaction.data {
                             Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(cmd)) => {
-                                is_autocomplete && cmd.name.as_str() == "run"
+                                (is_autocomplete && matches!(cmd.name.as_str(), "run" | "skills"))
+                                    .then_some(cmd.name.as_str())
                             }
-                            _ => false,
+                            _ => None,
                         };
-                        if run_autocomplete {
+                        if let Some(ac_command) = autocomplete_cmd {
                             let cmd = match &interaction.data {
                                 Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(cmd)) => cmd,
                                 _ => continue,
@@ -1781,7 +1808,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 })
                                 .unwrap_or_default();
                             let reg = crate::graycmd::registry(&ctx).await;
-                            let choices = crate::graycmd::run_autocomplete(reg.as_deref(), &query);
+                            let choices = if ac_command == "skills" {
+                                crate::graycmd::skills_autocomplete(reg.as_deref(), &query)
+                            } else {
+                                crate::graycmd::run_autocomplete(reg.as_deref(), &query)
+                            };
                             let _ = rest
                                 .autocomplete_response(&int_id, &interaction.token, &choices)
                                 .await;

@@ -109,10 +109,7 @@ fn current_model(ctx: &Ctx<'_>) -> (Option<String>, Option<String>) {
 /// Run `gray <argv>` in this channel's home and take its text. gray owns the
 /// format; the bridge renders what it printed, so there is no second parser
 /// to keep in step with it.
-pub(crate) async fn gray_cli(
-    ctx: &Ctx<'_>,
-    argv: &[String],
-) -> Result<(String, String), String> {
+pub(crate) async fn gray_cli(ctx: &Ctx<'_>, argv: &[String]) -> Result<(String, String), String> {
     let home = ctx.conversation_home();
     gray_cli_in(ctx, &home, argv, CLI_TIMEOUT).await
 }
@@ -136,15 +133,37 @@ pub(crate) async fn gray_cli_in(
     crate::graycmd::spawn(&gray_bin, home, argv, timeout).await
 }
 
-/// Answer in the same call as the interaction (the 3-second path).
-pub(crate) async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
-    let components = match render::from_embed(embed, buttons) {
+fn rendered(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value]) -> Vec<Value> {
+    let (title, body, accent) = render::merged(embed);
+    if body.chars().count() > crate::render::MAX_DISPLAY_CHARS {
+        let pages = crate::pager::paginate(&body, crate::pager::PAGE_LIMIT);
+        if pages.len() > 1 {
+            if let Ok(token) = crate::pager::mint(
+                ctx.store,
+                ctx.user_id,
+                ctx.channel_id,
+                &pages,
+                &title,
+                accent,
+            ) {
+                let mut comps = crate::pager::components(&pages, 0, &token, &title, accent);
+                comps.extend(buttons.iter().cloned());
+                return comps;
+            }
+        }
+    }
+    match render::from_embed(embed, buttons) {
         Ok(components) => components,
         Err(e) => {
             eprintln!("[discord] invalid command render: {e}");
             vec![json!({"type": 10, "content": "Gray could not render this response."})]
         }
-    };
+    }
+}
+
+/// Answer in the same call as the interaction (the 3-second path).
+pub(crate) async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
+    let components = rendered(ctx, embed, buttons);
     if let Err(e) = ctx
         .rest
         .interaction_v2(ctx.int_id, ctx.int_token, &components, public)
@@ -155,13 +174,7 @@ pub(crate) async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], publ
 }
 
 pub(crate) async fn edit_deferred(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], public: bool) {
-    let components = match render::from_embed(embed, buttons) {
-        Ok(components) => components,
-        Err(e) => {
-            eprintln!("[discord] invalid deferred render: {e}");
-            vec![json!({"type": 10, "content": "Gray could not render this response."})]
-        }
-    };
+    let components = rendered(ctx, embed, buttons);
     if let Err(e) = ctx
         .rest
         .edit_original_v2(ctx.app_id, ctx.int_token, &components, public)
@@ -220,7 +233,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                     .cloned()
                     .collect();
             let mut state_tokens = Vec::new();
-            for job in mine.iter().take(5) {
+            for job in mine.iter().take(crate::commands::MAX_BUTTONS) {
                 match ctx.store.component_state_create(
                     "cron_remove",
                     ctx.user_id,
@@ -530,13 +543,7 @@ pub async fn modal(ctx: &Ctx<'_>, custom_id: &str) {
 }
 
 async fn update_original_or_answer(ctx: &Ctx<'_>, embed: &Value) {
-    let components = match render::from_embed(embed, &[]) {
-        Ok(components) => components,
-        Err(e) => {
-            eprintln!("[discord] invalid component update: {e}");
-            return;
-        }
-    };
+    let components = rendered(ctx, embed, &[]);
     if let Err(e) = ctx
         .rest
         .interaction_update_v2(ctx.int_id, ctx.int_token, &components)

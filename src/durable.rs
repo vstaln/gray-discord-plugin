@@ -425,12 +425,26 @@ impl Store {
             return Err("Completed answer must contain 1–200000 characters".to_string());
         }
         let chunks = crate::text::split_message(text, 2000).map_err(|e| e.to_string())?;
-        let dropped_chars: usize = if chunks.len() > 8 {
-            chunks[7..].iter().map(|c| c.len()).sum()
+        let mut doc_part: Option<Value> = None;
+        let kept: Vec<String> = if chunks.len() <= 8 {
+            chunks
         } else {
-            0
+            let channel: String = with_conn(&self.path, |db| {
+                db.query_row("SELECT channel FROM inbox WHERE id=?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional_str()
+            })?
+            .ok_or_else(|| "Item is not running".to_string())?;
+            let tail = chunks[7..].join("\n");
+            let pages = crate::pager::paginate(&tail, crate::pager::PAGE_LIMIT);
+            let token =
+                crate::pager::mint(self, "*", &channel, &pages, "", crate::render::QUIET_ACCENT)?;
+            let components =
+                crate::pager::components(&pages, 0, &token, "", crate::render::QUIET_ACCENT);
+            doc_part = Some(serde_json::json!({"components": components}));
+            chunks[..7].to_vec()
         };
-        let capped = cap_chunks(chunks, dropped_chars);
         let receipt_text =
             serde_json::to_string(receipt).map_err(|_| "cannot encode receipt".to_string())?;
         with_conn(&self.path, |db| {
@@ -443,13 +457,22 @@ impl Store {
             if n == 0 {
                 return Err("Item is not running".to_string());
             }
-            for (part, chunk) in capped.iter().enumerate() {
+            for (part, chunk) in kept.iter().enumerate() {
                 db.execute(
                     // Plain content, not a V2 card: the answer is a new
                     // message, and a push notification previews only
                     // `content`.
                     "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,?3,'text',NULL,NULL)",
                     params![id, part as i64, chunk],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            if let Some(document) = doc_part {
+                let encoded = serde_json::to_string(&document)
+                    .map_err(|_| "cannot encode pager document".to_string())?;
+                db.execute(
+                    "INSERT INTO outbox(id,part,content,render,document_json,document_version) VALUES(?1,?2,'','v2',?3,1)",
+                    params![id, kept.len() as i64, encoded],
                 )
                 .map_err(|_| "cannot complete".to_string())?;
             }
@@ -816,6 +839,41 @@ impl Store {
         })
     }
 
+    pub fn component_state_get(
+        &self,
+        token: &str,
+        user_id: &str,
+        channel_id: &str,
+        kind: &str,
+    ) -> Result<Option<String>, String> {
+        let now = now_secs();
+        with_conn(&self.path, |db| {
+            let row: Option<(String, String, String, String, f64)> = db
+                .query_row(
+                    "SELECT kind,user_id,channel_id,resource_id,expires
+                     FROM component_states WHERE token=?1",
+                    params![token],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional_str()?;
+            let Some((stored_kind, stored_user, stored_channel, resource, expires)) = row else {
+                return Ok(None);
+            };
+            let valid = expires >= now
+                && stored_kind == kind
+                && (stored_user == user_id || stored_user == "*")
+                && stored_channel == channel_id;
+            if !valid {
+                db.execute(
+                    "DELETE FROM component_states WHERE token=?1",
+                    params![token],
+                )
+                .map_err(|_| "cannot remove component state".to_string())?;
+            }
+            Ok(valid.then_some(resource))
+        })
+    }
+
     /// A pending pairing code for this user, if one is already waiting —
     /// repeat "hi" from an unknown DMer reuses it instead of piling codes up.
     pub fn pairing_code_for(&self, user_id: &str) -> Result<Option<String>, String> {
@@ -1063,20 +1121,6 @@ impl Store {
             Ok(ids.len())
         })
     }
-}
-
-/// Anti-flood (MAX_SPLIT_MESSAGES = 8): keep the first 7 chunks,
-/// replace the rest with a notice carrying the dropped character count.
-pub(crate) fn cap_chunks(chunks: Vec<String>, dropped_chars: usize) -> Vec<String> {
-    const MAX: usize = 8;
-    if chunks.len() <= MAX {
-        return chunks;
-    }
-    let mut kept = chunks.into_iter().take(MAX - 1).collect::<Vec<_>>();
-    kept.push(format!(
-        "… (truncated, {dropped_chars} more characters not sent)"
-    ));
-    kept
 }
 
 /// A short random id for a scheduled job. Filled from `/dev/urandom` where

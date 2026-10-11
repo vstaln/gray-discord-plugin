@@ -23,8 +23,8 @@ pub const MAX_CUSTOM_ID: usize = 100;
 
 pub const INFO_ACCENT: u32 = 0x0058_65F2;
 pub const DANGER_ACCENT: u32 = 0xED4245;
-const QUIET_ACCENT: u32 = 0x0057_4F6E;
-const MAX_DISPLAY_CHARS: usize = 3800;
+pub(crate) const QUIET_ACCENT: u32 = 0x0057_4F6E;
+pub(crate) const MAX_DISPLAY_CHARS: usize = 3800;
 const MAX_TEXT_DISPLAY_CHARS: usize = 4000;
 const MAX_BUTTONS_PER_ROW: usize = 5;
 
@@ -190,7 +190,14 @@ pub fn error_card(text: &str) -> Result<Vec<Value>, String> {
 /// buttons are read. It keeps command rendering and Discord wire validation in
 /// separate layers while retiring embeds from the wire.
 pub fn from_embed(embed: &Value, buttons: &[Value]) -> Result<Vec<Value>, String> {
-    let title = embed
+    let (title, body, accent) = merged(embed);
+    let components = card(&title, &body, accent, buttons)?;
+    validate_components(&components)?;
+    Ok(components)
+}
+
+pub fn merged(embed: &Value) -> (String, String, u32) {
+    let mut title = embed
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -206,11 +213,17 @@ pub fn from_embed(embed: &Value, buttons: &[Value]) -> Result<Vec<Value>, String
         .unwrap_or(INFO_ACCENT as u64)
         .min(0xFF_FFFF) as u32;
 
-    let mut body = if description.trim().is_empty() {
-        String::new()
-    } else {
-        bounded(&description, MAX_DISPLAY_CHARS)
-    };
+    let mut body = String::new();
+    if title.chars().count() > 256 {
+        body.push_str(title.trim());
+        title = String::new();
+    }
+    if !description.trim().is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&description);
+    }
     if let Some(fields) = embed.get("fields").and_then(Value::as_array) {
         for field in fields {
             let name = field
@@ -230,13 +243,13 @@ pub fn from_embed(embed: &Value, buttons: &[Value]) -> Result<Vec<Value>, String
                 body.push_str("\n\n");
             }
             if !name.is_empty() {
-                body.push_str(&bounded(&crate::text::sanitize(name), 256));
+                body.push_str(&crate::text::sanitize(name));
             }
             if !name.is_empty() && !value.is_empty() {
                 body.push('\n');
             }
             if !value.is_empty() {
-                body.push_str(&bounded(&crate::text::sanitize(value), 1024));
+                body.push_str(&crate::text::sanitize(value));
             }
         }
     }
@@ -249,12 +262,10 @@ pub fn from_embed(embed: &Value, buttons: &[Value]) -> Result<Vec<Value>, String
             if !body.is_empty() {
                 body.push_str("\n\n");
             }
-            body.push_str(&bounded(&crate::text::sanitize(footer), 256));
+            body.push_str(&crate::text::sanitize(footer));
         }
     }
-    let components = card(&title, &body, accent, buttons)?;
-    validate_components(&components)?;
-    Ok(components)
+    (title, body, accent)
 }
 
 /// Validate a V2 component tree before transmission.

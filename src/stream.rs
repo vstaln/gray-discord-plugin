@@ -143,6 +143,7 @@ pub struct Card {
     pub files: Vec<String>,
     /// The last block of the turn this message shows.
     pub block: usize,
+    pub pager: Option<Vec<String>>,
 }
 
 /// A file the finished answer named, shown inside its message.
@@ -155,7 +156,11 @@ pub struct Media {
 
 impl Card {
     fn key(&self) -> String {
-        serde_json::to_string(&self.components).unwrap_or_default()
+        format!(
+            "{}{}",
+            serde_json::to_string(&self.components).unwrap_or_default(),
+            serde_json::to_string(&self.pager).unwrap_or_default()
+        )
     }
 }
 
@@ -397,7 +402,7 @@ impl Timeline {
         let mut cards: Vec<Card> = Vec::new();
         for unit in units {
             let log_size = unit.log.as_ref().map_or(0, |(_, size)| *size);
-            let chunks = split_block(&unit.text, CARD_TEXT.saturating_sub(log_size));
+            let (chunks, overflow) = split_block(&unit.text, CARD_TEXT.saturating_sub(log_size));
             let last = chunks.len().saturating_sub(1);
             for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut components = vec![json!({"type": 10, "content": chunk})];
@@ -409,6 +414,22 @@ impl Timeline {
                     text: chunk,
                     files: Vec::new(),
                     block: unit.block,
+                    pager: None,
+                });
+            }
+            if let Some(rest) = overflow {
+                let pages = crate::pager::paginate(&rest, crate::pager::PAGE_LIMIT);
+                let first = pages.first().cloned().unwrap_or_default();
+                cards.push(Card {
+                    components: vec![crate::pager::container(
+                        &first,
+                        "",
+                        crate::render::QUIET_ACCENT,
+                    )],
+                    text: first,
+                    files: Vec::new(),
+                    block: unit.block,
+                    pager: Some(pages),
                 });
             }
         }
@@ -823,8 +844,10 @@ fn strip_nulls(value: &mut Value) {
 /// (an overflowing preview is sealed the same way), so text never moves
 /// between messages as it grows: a cut lands on the last newline that keeps
 /// at least half the room, and a code fence open at the cut is closed there
-/// and reopened in the next message. At most [`MAX_SPLIT`] messages.
-pub fn split_block(text: &str, budget: usize) -> Vec<String> {
+/// and reopened in the next message. At most `MAX_SPLIT - 1` chunks;
+/// whatever is left past them is returned as the second tuple element so a
+/// pager can hold it instead of dropping it.
+pub fn split_block(text: &str, budget: usize) -> (Vec<String>, Option<String>) {
     let mut chunks: Vec<String> = Vec::new();
     let mut rest = text.to_string();
     while !rest.trim().is_empty() {
@@ -833,16 +856,16 @@ pub fn split_block(text: &str, budget: usize) -> Vec<String> {
             break;
         }
         if chunks.len() + 1 == MAX_SPLIT {
-            let (head, _) = split_at(&rest, budget.saturating_sub(24));
-            chunks.push(format!("{head}\n-# … (truncated)"));
-            break;
+            let overflow = rest.trim().to_string();
+            chunks.retain(|chunk| !chunk.trim().is_empty());
+            return (chunks, (!overflow.is_empty()).then_some(overflow));
         }
         let (head, tail) = split_at(&rest, budget);
         chunks.push(head);
         rest = tail;
     }
     chunks.retain(|chunk| !chunk.trim().is_empty());
-    chunks
+    (chunks, None)
 }
 
 /// Cut `text` to fit `room`, returning the head and what remains.
@@ -1235,8 +1258,9 @@ mod tests {
             body.push('\n');
         }
         body.push_str("```\nafter");
-        let chunks = split_block(&body, CARD_TEXT);
+        let (chunks, overflow) = split_block(&body, CARD_TEXT);
         assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(overflow.is_none());
         assert!(chunks[0].ends_with("\n```"), "the cut closes its fence");
         assert!(chunks[1].starts_with("```rust\n"), "and reopens it");
         for chunk in &chunks {
@@ -1263,9 +1287,12 @@ mod tests {
 
     #[test]
     fn a_runaway_block_is_capped() {
-        let chunks = split_block(&"word ".repeat(20_000), CARD_TEXT);
-        assert_eq!(chunks.len(), MAX_SPLIT);
-        assert!(chunks.last().unwrap().ends_with("-# … (truncated)"));
+        let (chunks, overflow) = split_block(&"word ".repeat(20_000), CARD_TEXT);
+        assert_eq!(chunks.len(), MAX_SPLIT - 1);
+        let overflow = overflow.expect("the rest parks behind a pager");
+        assert!(!overflow.contains("(truncated)"));
+        let pages = crate::pager::paginate(&overflow, crate::pager::PAGE_LIMIT);
+        assert!(pages.len() > 1);
     }
 
     #[test]

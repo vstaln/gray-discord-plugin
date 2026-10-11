@@ -22,9 +22,13 @@ use std::time::Duration;
 
 use crate::command_dispatch::{edit_deferred, expired, gray_cli_in, Ctx};
 use crate::commands::{self, Request};
-use crate::component_compile::{compile_message, CompileContext, CompileError, ComponentIdAllocator};
+use crate::component_compile::{
+    compile_message, CompileContext, CompileError, ComponentIdAllocator,
+};
 use crate::component_normalize;
-use crate::component_protocol::{FileRef, MessageDocument, Origin, Surface, UiDocument, UI_VERSION};
+use crate::component_protocol::{
+    FileRef, MessageDocument, Origin, Surface, UiDocument, UI_VERSION,
+};
 use crate::component_state::{NewDocument, NewState, ResolvedState};
 use crate::durable::{now_secs, Store};
 
@@ -68,6 +72,7 @@ pub struct CmdInfo {
     pub source: String,
     /// Runs that can exceed the normal timeout.
     pub slow: bool,
+    pub completions: Vec<(String, String)>,
 }
 
 /// The `result` of a `cmd run` / `cmd interact` call.
@@ -254,6 +259,32 @@ fn parse_commands(list: &Value) -> Option<Vec<CmdInfo>> {
                 .unwrap_or("builtin")
                 .to_string(),
             slow: c.get("slow").and_then(Value::as_bool).unwrap_or(false),
+            completions: c
+                .get("completions")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|entry| {
+                            if let Some(name) = entry.get("name").and_then(Value::as_str) {
+                                let description = entry
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                return Some((name.to_string(), description));
+                            }
+                            let pair = entry.as_array()?;
+                            Some((
+                                pair.first()?.as_str()?.to_string(),
+                                pair.get(1)
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
     }
     Some(out)
@@ -304,6 +335,17 @@ pub fn registration_json(registry: Option<&[CmdInfo]>) -> Value {
             .filter(|h| !h.trim().is_empty())
             .map(|h| commands::truncate(h, 100))
             .unwrap_or_else(|| "Optional arguments".to_string());
+        if c.name == "skills" {
+            out.push(json!({
+                "name": name,
+                "description": description,
+                "options": [
+                    {"name": "name", "description": "Skill name", "type": 3, "required": false, "autocomplete": true},
+                    {"name": "args", "description": "Optional arguments", "type": 3, "required": false},
+                ],
+            }));
+            continue;
+        }
         out.push(json!({
             "name": name,
             "description": description,
@@ -353,10 +395,28 @@ pub fn run_autocomplete(registry: Option<&[CmdInfo]>, query: &str) -> Vec<(Strin
     registry
         .into_iter()
         .flatten()
+        .filter(|c| c.source != "skill")
         .filter(|c| query.is_empty() || c.name.to_ascii_lowercase().contains(&query))
         .take(25)
         .map(|c| (c.name.clone(), c.name.clone()))
         .collect()
+}
+
+pub fn skills_autocomplete(registry: Option<&[CmdInfo]>, query: &str) -> Vec<(String, String)> {
+    let query = query.to_ascii_lowercase();
+    registry
+        .into_iter()
+        .flatten()
+        .find(|c| c.name == "skills")
+        .map(|c| {
+            c.completions
+                .iter()
+                .filter(|(name, _)| query.is_empty() || name.to_ascii_lowercase().contains(&query))
+                .take(25)
+                .map(|(name, _)| (name.clone(), name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// An incoming slash invocation as a `cmd run`, when `name` belongs to the
@@ -376,9 +436,9 @@ pub fn route(
             .find(|(k, _)| *k == "name")
             .map(|(_, v)| v.trim())
             .filter(|v| !v.is_empty())?;
-        let cmd = registry.iter().find(|c| {
-            c.name == wanted || c.aliases.iter().any(|a| a.as_str() == wanted)
-        });
+        let cmd = registry
+            .iter()
+            .find(|c| c.name == wanted || c.aliases.iter().any(|a| a.as_str() == wanted));
         let args = values
             .iter()
             .find(|(k, _)| *k == "args")
@@ -401,28 +461,31 @@ pub fn route(
             },
         });
     }
-    let cmd = registry
-        .iter()
-        .find(|c| {
-            c.name == name
-                || discord_name(&c.name) == name
-                || c.aliases.iter().any(|a| a.as_str() == name)
-        })?;
+    let cmd = registry.iter().find(|c| {
+        c.name == name
+            || discord_name(&c.name) == name
+            || c.aliases.iter().any(|a| a.as_str() == name)
+    })?;
     if cmd.surface == "local" || BRIDGE_OWNED.contains(&cmd.name.as_str()) {
         return None;
     }
-    let args = values
-        .iter()
-        .find(|(k, _)| *k == "args")
-        .map(|(_, v)| v.to_string())
-        .or_else(|| {
-            let joined: Vec<&str> = sub
-                .into_iter()
-                .chain(values.iter().map(|(_, v)| *v))
-                .collect();
-            (!joined.is_empty()).then(|| joined.join(" "))
-        })
-        .filter(|s| !s.trim().is_empty());
+    let args = if cmd.name == "skills" {
+        let joined: Vec<&str> = values.iter().map(|(_, v)| *v).collect();
+        (!joined.is_empty()).then(|| joined.join(" "))
+    } else {
+        values
+            .iter()
+            .find(|(k, _)| *k == "args")
+            .map(|(_, v)| v.to_string())
+            .or_else(|| {
+                let joined: Vec<&str> = sub
+                    .into_iter()
+                    .chain(values.iter().map(|(_, v)| *v))
+                    .collect();
+                (!joined.is_empty()).then(|| joined.join(" "))
+            })
+    }
+    .filter(|s| !s.trim().is_empty());
     Some(Request::CmdRun {
         name: cmd.name.clone(),
         args,
@@ -450,14 +513,14 @@ pub async fn run(
         return;
     }
     let timeout = if slow { SLOW_TIMEOUT } else { RUN_TIMEOUT };
-    let reply =
-        match gray_cli_in(ctx, &home_for(ctx, scope), &run_argv(name, args), timeout).await {
-            Ok((stdout, _)) => parse_reply(&stdout),
-            Err(e) => Err(CmdError {
-                code: "unavailable".to_string(),
-                message: e,
-            }),
-        };
+    let reply = match gray_cli_in(ctx, &home_for(ctx, scope), &run_argv(name, args), timeout).await
+    {
+        Ok((stdout, _)) => parse_reply(&stdout),
+        Err(e) => Err(CmdError {
+            code: "unavailable".to_string(),
+            message: e,
+        }),
+    };
     let embed = match reply {
         Ok(CmdResult::Ui {
             token,
@@ -592,7 +655,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
         Ok(CmdResult::Text { text, .. }) => {
             // Done: swap the picker for its closing text and retire its states.
             let _ = ctx.store.invalidate_document(&doc_key(&core));
-            text_components(&text)
+            text_components(ctx, &text)
         }
         Ok(CmdResult::Ui {
             token,
@@ -605,7 +668,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
                 let text = fallback_text
                     .filter(|t| !t.trim().is_empty())
                     .unwrap_or_else(|| "That answer could not be drawn.".to_string());
-                text_components(&text)
+                text_components(ctx, &text)
             }
         },
         Ok(CmdResult::Prompt {
@@ -618,20 +681,18 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
                 .and_then(Value::as_u64)
                 .unwrap_or(1000);
             let conv = ctx.conversation();
-            let text = match ctx.store.enqueue(
-                ctx.int_id,
-                ctx.channel_id,
-                &prompt,
-                Some(&conv),
-                capacity,
-            ) {
-                Ok(true) => fallback_text
-                    .filter(|t| !t.trim().is_empty())
-                    .unwrap_or_else(|| "Working on it.".to_string()),
-                Ok(false) => "That turn is already queued.".to_string(),
-                Err(e) => format!("Cannot queue that: {e}"),
-            };
-            text_components(&text)
+            let text =
+                match ctx
+                    .store
+                    .enqueue(ctx.int_id, ctx.channel_id, &prompt, Some(&conv), capacity)
+                {
+                    Ok(true) => fallback_text
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "Working on it.".to_string()),
+                    Ok(false) => "That turn is already queued.".to_string(),
+                    Err(e) => format!("Cannot queue that: {e}"),
+                };
+            text_components(ctx, &text)
         }
         Err(err) => {
             let text = if err.code == "expired" {
@@ -639,7 +700,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
             } else {
                 err.message
             };
-            text_components(&text)
+            text_components(ctx, &text)
         }
     };
     if let Err(e) = ctx
@@ -669,7 +730,7 @@ pub fn parse_reply(stdout: &str) -> Result<CmdResult, CmdError> {
         CmdError::wire(if trimmed.is_empty() {
             "gray returned no answer".to_string()
         } else {
-            commands::truncate(trimmed, 200)
+            trimmed.to_string()
         })
     })?;
     if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -723,9 +784,7 @@ pub fn parse_reply(stdout: &str) -> Result<CmdResult, CmdError> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         }),
-        _ => Err(CmdError::wire(
-            "gray answered with an unknown result kind",
-        )),
+        _ => Err(CmdError::wire("gray answered with an unknown result kind")),
     }
 }
 
@@ -781,12 +840,34 @@ async fn picker_expired(ctx: &Ctx<'_>, name: &str) {
 }
 
 /// A text answer as V2 components, with a guaranteed non-empty body.
-fn text_components(text: &str) -> Vec<Value> {
+/// Past the display bound the answer pages in place like any command.
+fn text_components(ctx: &Ctx<'_>, text: &str) -> Vec<Value> {
     let text = if text.trim().is_empty() {
         "Done.".to_string()
     } else {
         text.to_string()
     };
+    if text.chars().count() > crate::render::MAX_DISPLAY_CHARS {
+        let pages = crate::pager::paginate(&text, crate::pager::PAGE_LIMIT);
+        if pages.len() > 1 {
+            if let Ok(token) = crate::pager::mint(
+                ctx.store,
+                ctx.user_id,
+                ctx.channel_id,
+                &pages,
+                "",
+                crate::render::QUIET_ACCENT,
+            ) {
+                return crate::pager::components(
+                    &pages,
+                    0,
+                    &token,
+                    "",
+                    crate::render::QUIET_ACCENT,
+                );
+            }
+        }
+    }
     crate::render::text_message(&text)
         .unwrap_or_else(|_| vec![json!({"type": 10, "content": text})])
 }
@@ -1002,10 +1083,10 @@ mod tests {
     fn the_list_rejects_everything_but_the_envelope() {
         assert!(parse_list("not json").is_none());
         assert!(parse_list("").is_none());
-        assert!(parse_list(
-            r#"{"ok": false, "error": {"code": "unavailable", "message": "no"}}"#
-        )
-        .is_none());
+        assert!(
+            parse_list(r#"{"ok": false, "error": {"code": "unavailable", "message": "no"}}"#)
+                .is_none()
+        );
         assert!(parse_list(r#"{"ok": true, "result": {"commands": "nope"}}"#).is_none());
     }
 
@@ -1140,10 +1221,7 @@ mod tests {
         );
         // A select may legally submit an empty set.
         let cleared = action_json("user-1", "effort", false, &[]);
-        assert_eq!(
-            cleared,
-            json!({"user": "user-1", "values": {"effort": []}})
-        );
+        assert_eq!(cleared, json!({"user": "user-1", "values": {"effort": []}}));
     }
 
     #[test]

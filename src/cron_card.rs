@@ -24,7 +24,7 @@ use crate::text::utf16_len;
 /// not `chars()`: 1900 astral emoji are 1900 chars and 3800 units, and a 400.
 /// The body leaves room for the title and the footer inside one message's
 /// 4000-unit text budget.
-const MAX_BODY_UNITS: usize = 3400;
+pub(crate) const MAX_BODY_UNITS: usize = 3400;
 const MAX_TITLE_UNITS: usize = 80;
 const MAX_PLAIN_UNITS: usize = 1900;
 const REMINDER_ACCENT: u32 = 0xFEE75C;
@@ -247,12 +247,9 @@ impl CronCard {
         }
     }
 
-    /// The component array (one Container), or `None` for an empty body.
-    pub fn components(&self) -> Option<Vec<Value>> {
-        if self.parsed.body.trim().is_empty() {
-            return None;
-        }
-
+    /// Card head shared by the single-shot and paged renders: title line,
+    /// accent color, and the `-#` meta footer text.
+    pub(crate) fn head(&self) -> (String, u32, String) {
         let name = truncate(
             &self
                 .parsed
@@ -267,8 +264,6 @@ impl CronCard {
             (_, Kind::Reminder) => ("⏰", "Reminder".to_string(), REMINDER_ACCENT),
             (_, Kind::Task) => ("🕒", name, render::INFO_ACCENT),
         };
-        let body = truncate(&self.parsed.body, MAX_BODY_UNITS);
-
         let mut meta = vec![match self.status {
             Status::Ok => "✅ done".to_string(),
             Status::Failed => "❌ failed".to_string(),
@@ -279,14 +274,46 @@ impl CronCard {
         if let Some(s) = &self.schedule {
             meta.push(s.clone());
         }
+        (
+            format!("{icon} {title}"),
+            color,
+            format!("-# {}", meta.join(" · ")),
+        )
+    }
+
+    /// A body too long for one card becomes `pages[cur]` plus the footer
+    /// and a `pg:` nav row; page turns keep the footer via the pager's
+    /// trailing-component carry-over.
+    pub fn paged_components(&self, token: &str, pages: &[String], cur: usize) -> Vec<Value> {
+        let (title, color, meta) = self.head();
+        let page = pages.get(cur).cloned().unwrap_or_default();
+        let mut out = vec![
+            crate::pager::container(&page, &title, color),
+            separator(),
+            text_display(meta),
+        ];
+        if let Some(row) = crate::pager::nav_row(token, cur, pages.len()) {
+            out.push(row);
+        }
+        out
+    }
+
+    /// The component array (one Container), or `None` for an empty body.
+    pub fn components(&self) -> Option<Vec<Value>> {
+        if self.parsed.body.trim().is_empty() {
+            return None;
+        }
+
+        let (title, color, meta) = self.head();
+        let body = truncate(&self.parsed.body, MAX_BODY_UNITS);
 
         Some(vec![container(
             vec![
-                text_display(format!("### {icon} {title}")),
+                text_display(format!("### {title}")),
                 separator(),
                 text_display(body),
                 separator(),
-                text_display(format!("-# {}", meta.join(" · "))),
+                text_display(meta),
             ],
             Some(color),
         )])

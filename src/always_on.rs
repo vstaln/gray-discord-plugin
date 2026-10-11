@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// How often the outbox is polled.
 pub const PUMP_EVERY: Duration = Duration::from_secs(3);
@@ -32,7 +32,9 @@ pub async fn request(sock: &Path, req: &Value) -> Option<Value> {
         let v: Value = serde_json::from_str(&answer).ok()?;
         (v.get("ok").and_then(Value::as_bool) == Some(true)).then(|| v["result"].clone())
     };
-    tokio::time::timeout(Duration::from_secs(5), io).await.ok()?
+    tokio::time::timeout(Duration::from_secs(5), io)
+        .await
+        .ok()?
 }
 
 /// The channel an intent goes to: its route's opaque `route` token, else
@@ -51,7 +53,11 @@ pub fn channel_for(intent: &Value) -> Option<u64> {
 /// What is posted: autonomous output gets a small provenance line so a
 /// trigger result never reads like a reply to something the owner said.
 pub fn render(intent: &Value) -> String {
-    let text = intent.get("text").and_then(Value::as_str).unwrap_or("").trim();
+    let text = intent
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     match intent.get("kind").and_then(Value::as_str) {
         Some("trigger") => format!("-# ⚡ trigger\n{text}"),
         Some("system") => format!("-# ⚙ gray\n{text}"),
@@ -79,7 +85,11 @@ fn note_posted(conversations: &Path, channel: u64, body: &str) {
     use std::io::Write as _;
     let path = posted_file(conversations, channel);
     let _ = path.parent().map(std::fs::create_dir_all);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{body}\n");
     }
 }
@@ -97,7 +107,11 @@ pub fn with_posted(home: &Path, prompt: String) -> String {
     if posted.is_empty() {
         return prompt;
     }
-    let cut = posted.char_indices().rev().nth(POSTED_KEEP).map_or(0, |(i, _)| i);
+    let cut = posted
+        .char_indices()
+        .rev()
+        .nth(POSTED_KEEP)
+        .map_or(0, |(i, _)| i);
     format!(
         "[Since your last reply here, you posted this to the owner on your own \
          (trigger/wake); they may be replying to it:]\n{}\n[end]\n\n{prompt}",
@@ -185,7 +199,10 @@ mod tests {
         note_posted(dir.path(), 42, "disk at 91%");
         let home = posted_file(dir.path(), 42).parent().unwrap().to_path_buf();
         let p = with_posted(&home, "which mount?".into());
-        assert!(p.contains("disk at 91%") && p.ends_with("which mount?"), "{p}");
+        assert!(
+            p.contains("disk at 91%") && p.ends_with("which mount?"),
+            "{p}"
+        );
         assert_eq!(with_posted(&home, "again".into()), "again");
     }
 }

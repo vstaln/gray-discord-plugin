@@ -206,16 +206,35 @@ pub fn card_for(d: &Delivery) -> crate::cron_card::CronCard {
 ///   retry loop; the caller decides what a failed delivery means.
 ///
 /// The full-output path is logged here and never appears in Discord.
-pub async fn post_delivery(rest: &crate::transport::Rest, channel: u64, d: &Delivery) -> bool {
+pub async fn post_delivery(
+    rest: &crate::transport::Rest,
+    store: &crate::durable::Store,
+    channel: u64,
+    d: &Delivery,
+) -> bool {
     use crate::transport::TransportError;
     let card = card_for(d);
     if let Some(path) = card.parsed.full_output.as_deref().or(d.path.as_deref()) {
         eprintln!("[discord] cron full output: {path}");
     }
-    let Some(components) = card.components() else {
+    let long = crate::text::utf16_len(&card.parsed.body) > crate::cron_card::MAX_BODY_UNITS;
+    let components = if long {
+        let pages = crate::pager::paginate(&card.parsed.body, crate::pager::PAGE_LIMIT);
+        let (title, accent, _) = card.head();
+        match crate::pager::mint(store, "*", &channel.to_string(), &pages, &title, accent) {
+            Ok(token) => card.paged_components(&token, &pages, 0),
+            Err(e) => {
+                eprintln!("[discord] cron pager state failed: {e}");
+                card.components().unwrap_or_default()
+            }
+        }
+    } else {
+        card.components().unwrap_or_default()
+    };
+    if components.is_empty() {
         eprintln!("[discord] cron delivery for channel {channel} has an empty body; not posting");
         return true;
-    };
+    }
     let mut retried = false;
     loop {
         match rest.send_v2(channel, &components, None).await {
@@ -250,13 +269,14 @@ async fn send_plain(
     channel: u64,
     card: &crate::cron_card::CronCard,
 ) -> bool {
-    match rest.send(channel, &card.plain_text(), None).await {
-        Ok(_) => true,
-        Err(e) => {
+    let pages = crate::pager::paginate(&card.parsed.body, 1900);
+    for page in &pages {
+        if let Err(e) = rest.send(channel, page, None).await {
             eprintln!("[discord] cron plain fallback to channel {channel} failed: {e:?}");
-            false
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]

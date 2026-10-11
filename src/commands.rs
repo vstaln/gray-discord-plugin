@@ -17,13 +17,8 @@ use serde_json::{json, Value};
 const INFO: u32 = 0x0058_65F2;
 const DANGER: u32 = 0x00ED_4245;
 
-/// Discord's embed limits. Exceeding them is a 400 from the API, so the
-/// renderer truncates with a notice instead of failing the reply.
-const MAX_DESCRIPTION: usize = 4096;
-const MAX_FIELD_NAME: usize = 256;
-const MAX_FIELD_VALUE: usize = 1024;
 /// Five buttons per row, max.
-const MAX_BUTTONS: usize = 5;
+pub(crate) const MAX_BUTTONS: usize = 5;
 
 /// A string option (`/cron add --every`), or a sub-command when rendered at
 /// type 1. `required` only applies to string options.
@@ -237,18 +232,36 @@ pub fn command_json(c: &Command) -> Value {
 /// what they mean, so a typo surfaces as an embed, not a silent no-op.
 #[derive(Debug)]
 pub enum Request {
-    Help { command: Option<String> },
+    Help {
+        command: Option<String>,
+    },
     CronList,
-    CronAdd { every: String, prompt: String },
-    CronRemove { id: String },
+    CronAdd {
+        every: String,
+        prompt: String,
+    },
+    CronRemove {
+        id: String,
+    },
     ModelShow,
-    ModelSet { model: String },
+    ModelSet {
+        model: String,
+    },
     MemoryList,
-    MemoryShow { key: String },
-    MemorySet { key: String, text: String },
-    MemoryRemove { key: String },
+    MemoryShow {
+        key: String,
+    },
+    MemorySet {
+        key: String,
+        text: String,
+    },
+    MemoryRemove {
+        key: String,
+    },
     Status,
-    Ask { prompt: String },
+    Ask {
+        prompt: String,
+    },
     Reset,
     Stop,
     /// A registry command `gray cmd` answers; built by `graycmd::route`.
@@ -381,11 +394,8 @@ pub fn cron_view(
         .iter()
         .map(|(id, prompt, interval, status)| {
             json!({
-                "name": truncate(
-                    &format!("`{id}` · every {} · {status}", human(*interval)),
-                    MAX_FIELD_NAME
-                ),
-                "value": truncate(prompt, MAX_FIELD_VALUE),
+                "name": format!("`{id}` · every {} · {status}", human(*interval)),
+                "value": prompt,
                 "inline": false,
             })
         })
@@ -422,7 +432,7 @@ pub fn cli_embed(title: &str, stdout: &str, stderr: &str, ok: bool) -> Value {
             "No output.".to_string()
         }
     } else {
-        truncate(body, MAX_DESCRIPTION)
+        body.to_string()
     };
     let mut out = embed(title, format!("```\n{body}\n```"), &[]);
     if !ok {
@@ -475,11 +485,9 @@ pub fn parse_interval(text: &str) -> Option<i64> {
 /// Takes `AsRef<str>` on purpose: every caller has a `String` or a literal
 /// and none should have to reach for `&`.
 pub fn embed(title: impl AsRef<str>, description: impl AsRef<str>, fields: &[Value]) -> Value {
-    let title = title.as_ref();
-    let description = description.as_ref();
     json!({
-        "title": truncate(title, 256),
-        "description": truncate(description, MAX_DESCRIPTION),
+        "title": title.as_ref(),
+        "description": description.as_ref(),
         "color": INFO,
         "fields": fields,
     })

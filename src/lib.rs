@@ -1,5 +1,5 @@
-pub mod always_on;
 pub mod activity;
+pub mod always_on;
 pub mod ask;
 pub mod attachments;
 pub mod budget;
@@ -24,6 +24,7 @@ pub mod gateway;
 pub mod graycmd;
 pub mod lifecycle;
 pub mod media_tags;
+pub mod pager;
 pub mod pairing;
 pub mod policy;
 pub mod ratelimit;
