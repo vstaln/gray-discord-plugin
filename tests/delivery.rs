@@ -92,7 +92,7 @@ async fn invalid_content_rejected_before_http() {
 }
 
 #[test]
-fn chunk_cap_truncates_at_8_parts_with_notice() {
+fn chunk_cap_pages_the_overflow_instead_of_truncating() {
     let tmp = tempfile::tempdir().unwrap();
     let store = gray_discord::durable::Store::new(&tmp.path().join("queue.sqlite")).unwrap();
     store.enqueue("msg_chunk", "42", "q", None, 100).unwrap();
@@ -110,8 +110,38 @@ fn chunk_cap_truncates_at_8_parts_with_notice() {
             .unwrap();
     }
     assert_eq!(parts.len(), 8);
-    assert!(parts[7].content.contains("… (truncated,"));
-    assert!(parts[7].content.contains("more characters not sent)"));
+    // The first seven parts are text; the overflow is a pager document.
+    for part in &parts[..7] {
+        assert_eq!(part.render.as_deref(), Some("text"));
+    }
+    let overflow = &parts[7];
+    assert_eq!(overflow.render.as_deref(), Some("v2"));
+    assert!(overflow.content.is_empty());
+    let document: Value =
+        serde_json::from_str(overflow.document_json.as_deref().unwrap()).unwrap();
+    // The nav row's Prev button carries the pager token: `pg:<token>:<page>`.
+    let custom_id = document["components"][1]["components"][0]["custom_id"]
+        .as_str()
+        .unwrap();
+    let token = custom_id.split(':').nth(1).unwrap();
+    let state: Value = serde_json::from_str(
+        &store
+            .component_state_get(token, "*", "42", "pager")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let pages: Vec<String> = serde_json::from_value(state["pages"].clone()).unwrap();
+    assert!(pages.len() > 1);
+    // Nothing is dropped: the kept parts and all pager pages hold every
+    // non-whitespace character of the answer.
+    let delivered: String = parts[..7]
+        .iter()
+        .map(|p| p.content.as_str())
+        .chain(pages.iter().map(String::as_str))
+        .collect();
+    let visible = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
+    assert_eq!(visible(&delivered), visible(&text));
 }
 
 #[tokio::test]
