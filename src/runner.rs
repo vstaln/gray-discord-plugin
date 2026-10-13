@@ -72,7 +72,9 @@ pub type AskFn = std::sync::Arc<
         + Sync,
 >;
 
-type SharedStdin = std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
+/// `None` once the turn's input is closed (see the terminal handling in
+/// `run_gray_input`); a write then fails and the message becomes a new turn.
+type SharedStdin = std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
 
 struct AskWire {
     handler: AskFn,
@@ -138,7 +140,10 @@ pub async fn steer(conversation: &str, text: &str) -> bool {
         return false;
     };
     let line = format!("{}\n", serde_json::json!({"type": "steer", "text": text}));
-    let mut stdin = stdin.lock().await;
+    let mut guard = stdin.lock().await;
+    let Some(stdin) = guard.as_mut() else {
+        return false;
+    };
     stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
 }
 
@@ -245,6 +250,7 @@ pub async fn run_gray_input(
         .map_err(|_| RunError::Io("cannot create conversation home".to_string()))?;
     let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
 
+    wait_for_reaper(conversation).await;
     // Non-blocking per-conversation lock, held for the whole turn.
     let lock_file = std::fs::File::create(home.join("run.lock"))
         .map_err(|_| RunError::Io("cannot lock conversation".to_string()))?;
@@ -515,10 +521,10 @@ pub async fn run_gray_input(
     let stdin: Option<SharedStdin> = child
         .stdin
         .take()
-        .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(s)));
-    let _live = stdin.clone().map(|s| LiveStdin::register(conversation, s));
+        .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(Some(s))));
+    let live = stdin.clone().map(|s| LiveStdin::register(conversation, s));
     let turn_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let asks = match (opts.ask.take(), stdin) {
+    let asks = match (opts.ask.take(), stdin.clone()) {
         (Some(handler), Some(stdin)) => Some(AskWire {
             handler,
             stdin,
@@ -558,26 +564,51 @@ pub async fn run_gray_input(
         )
         .await
     };
-    let outcome: Result<Consume, RunError> =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await {
-            Ok(r) => r,
+    let outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await;
+    // However the read ended, the child takes no more input: unregister it so
+    // a later message is not steered into it, then close its stdin.
+    drop(live);
+    if let Some(stdin) = stdin {
+        tokio::spawn(async move {
+            *stdin.lock().await = None;
+        });
+    }
+    let consumed = match outcome {
+        Ok(Ok(consumed)) => consumed,
+        Ok(Err(e)) => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            return Err(e);
+        }
+        // Timeout: kill the whole process group (Python: killpg SIGKILL).
+        Err(_) => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            return Err(RunError::Timeout);
+        }
+    };
+    if consumed.terminal.is_some() {
+        // The terminal row is the answer and is published now. The child gets
+        // a short grace period to exit on its own; the reaper kills it after
+        // that and keeps the conversation lock until the child is gone.
+        set_reaping(conversation, true);
+        tokio::spawn(reap_after_result(child, pid, _lock, conversation.to_string()));
+    } else {
+        let status = match tokio::time::timeout(TURN_EXIT_GRACE, child.wait()).await {
+            Ok(status) => status.map_err(|_| RunError::Spawn("wait failed".to_string()))?,
             Err(_) => {
-                // Timeout: kill the whole process group (Python: killpg SIGKILL).
-                if pid != 0 {
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    }
-                }
-                let _ = child.wait().await;
-                return Err(RunError::Timeout);
+                kill_group(pid);
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| RunError::Spawn("wait failed".to_string()))?
             }
         };
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| RunError::Spawn("wait failed".to_string()))?;
-    let consumed = outcome?;
-
+        if !status.success() {
+            return Err(RunError::Exit(status.code()));
+        }
+    }
     if let Some(final_row) = &consumed.terminal {
         if let Some(receipt) = opts.receipt.as_deref_mut() {
             for (k, v) in final_row.as_object().cloned().unwrap_or_default() {
@@ -597,9 +628,6 @@ pub async fn run_gray_input(
         if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
             return Err(RunError::RequestLimit(max_requests));
         }
-    }
-    if !status.success() {
-        return Err(RunError::Exit(status.code()));
     }
     if !consumed.protocol_ok {
         return Err(RunError::Protocol(
@@ -621,9 +649,6 @@ pub async fn run_gray_input(
         Some(t) if !t.trim().is_empty() => Ok(t.to_string()),
         _ => Err(RunError::Empty),
     };
-    // Drop the lock before the async state machine is suspended again. This
-    // matters when several workers are created in one Tokio process.
-    drop(_lock);
     answer
 }
 
@@ -756,11 +781,24 @@ async fn consume_ndjson(
     let mut turn_id: Option<String> = None;
     let mut terminal: Option<Value> = None;
     let mut protocol_ok = true;
+    let mut after_terminal = 0usize;
     loop {
-        let line = lines
-            .next_line()
-            .await
-            .map_err(|_| RunError::Io("cannot read agent output".to_string()))?;
+        let read = if terminal.is_some() {
+            // The turn ended with the terminal row. Only rows already buffered
+            // are read, so a violation right behind it is still caught, but a
+            // child that lingers with stdout open cannot hold the turn.
+            after_terminal += 1;
+            if after_terminal > POST_TERMINAL_LINES {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::ZERO, lines.next_line()).await {
+                Ok(read) => read,
+                Err(_) => break,
+            }
+        } else {
+            lines.next_line().await
+        };
+        let line = read.map_err(|_| RunError::Io("cannot read agent output".to_string()))?;
         let Some(line) = line else { break };
         if line.len() > LINE_CAP {
             protocol_ok = false;
@@ -797,7 +835,7 @@ async fn consume_ndjson(
         // "Data after terminal agent result"), not a second result.
         if terminal.is_some() {
             protocol_ok = false;
-            continue;
+            break;
         }
         if let Some(sid) = row.get("session_id").and_then(Value::as_str) {
             if session_id_valid(sid) {
@@ -865,10 +903,94 @@ fn answer_ask(asks: &AskWire, row: &Value) {
             "{}\n",
             serde_json::json!({"ask_id": ask_id, "answers": answers})
         );
-        let mut stdin = stdin.lock().await;
-        let _ = stdin.write_all(line.as_bytes()).await;
-        let _ = stdin.flush().await;
+        let mut guard = stdin.lock().await;
+        if let Some(stdin) = guard.as_mut() {
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
     });
+}
+
+/// How long a gray child may keep running after its terminal row before its
+/// process group is killed.
+const TURN_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Rows read after the terminal row (only those already buffered) before the
+/// reader stops looking for a protocol violation.
+const POST_TERMINAL_LINES: usize = 64;
+
+/// SIGKILL the child's process group (it leads its own, see `pre_exec`).
+fn kill_group(pid: u32) {
+    if pid != 0 {
+        // SAFETY: plain kill(2) on the negated pgid of a child we spawned.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
+/// Wait for a child whose terminal row was already taken as the answer, and
+/// kill it if it has not exited within the grace period. The conversation
+/// lock is held until the child is gone, so the next turn cannot overlap it.
+async fn reap_after_result(
+    mut child: tokio::process::Child,
+    pid: u32,
+    lock: ConversationLock,
+    conversation: String,
+) {
+    match tokio::time::timeout(TURN_EXIT_GRACE, child.wait()).await {
+        Ok(Ok(status)) if !status.success() => {
+            crate::eprintln_stamped!(
+                "[discord] gray child {pid} exited {:?} after its result",
+                status.code()
+            );
+        }
+        Ok(_) => {}
+        Err(_) => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            crate::eprintln_stamped!(
+                "[discord] gray child {pid} still running {}s after its result; killed",
+                TURN_EXIT_GRACE.as_secs()
+            );
+        }
+    }
+    // Release the lock before the next turn is let in.
+    drop(lock);
+    set_reaping(&conversation, false);
+}
+
+/// Conversations whose previous child is still inside its grace period. A new
+/// turn for one of them waits instead of reporting the conversation busy.
+fn reaping() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static REAPING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    REAPING.get_or_init(Default::default)
+}
+
+fn set_reaping(conversation: &str, on: bool) {
+    if let Ok(mut set) = reaping().lock() {
+        if on {
+            set.insert(conversation.to_string());
+        } else {
+            set.remove(conversation);
+        }
+    }
+}
+
+fn is_reaping(conversation: &str) -> bool {
+    reaping()
+        .lock()
+        .is_ok_and(|set| set.contains(conversation))
+}
+
+/// Wait (bounded) for a previous child's grace period to end, so that a turn
+/// right after an answer is not rejected as busy by a child that is exiting.
+async fn wait_for_reaper(conversation: &str) {
+    let deadline = std::time::Instant::now() + TURN_EXIT_GRACE + std::time::Duration::from_secs(5);
+    while is_reaping(conversation) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 fn session_id_valid(s: &str) -> bool {

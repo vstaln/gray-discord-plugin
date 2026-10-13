@@ -140,7 +140,7 @@ pub async fn press(ctx: &Ctx<'_>, custom_id: &str, message: Option<&Value>) {
             return;
         }
         Err(e) => {
-            eprintln!("[discord] pager state failed: {e}");
+            crate::eprintln_stamped!("[discord] pager state failed: {e}");
             return;
         }
     };
@@ -187,7 +187,7 @@ pub async fn press(ctx: &Ctx<'_>, custom_id: &str, message: Option<&Value>) {
         .interaction_update_v2(ctx.int_id, ctx.int_token, &comps)
         .await
     {
-        eprintln!("[discord] pager update failed: {e}");
+        crate::eprintln_stamped!("[discord] pager update failed: {e}");
         let _ = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await;
     }
 }

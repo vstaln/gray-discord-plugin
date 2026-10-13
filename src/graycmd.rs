@@ -511,7 +511,7 @@ pub async fn run(
 ) {
     let public = surface != "interactive";
     if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, public).await {
-        eprintln!("[discord] /{name} defer failed: {e}");
+        crate::eprintln_stamped!("[discord] /{name} defer failed: {e}");
         return;
     }
     let timeout = if slow { SLOW_TIMEOUT } else { RUN_TIMEOUT };
@@ -535,12 +535,12 @@ pub async fn run(
                     .edit_original_v2(ctx.app_id, ctx.int_token, &components, public)
                     .await
                 {
-                    eprintln!("[discord] /{name} ui answer failed: {e}");
+                    crate::eprintln_stamped!("[discord] /{name} ui answer failed: {e}");
                 }
                 return;
             }
             Err(e) => {
-                eprintln!("[discord] /{name} ui compile failed: {e}");
+                crate::eprintln_stamped!("[discord] /{name} ui compile failed: {e}");
                 let text = fallback_text
                     .filter(|t| !t.trim().is_empty())
                     .unwrap_or_else(|| "This answer needs a newer Discord client.".to_string());
@@ -641,7 +641,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
         return picker_expired(ctx, &name).await;
     }
     if let Err(e) = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await {
-        eprintln!("[discord] /{name} component defer failed: {e}");
+        crate::eprintln_stamped!("[discord] /{name} component defer failed: {e}");
         return;
     }
     let action = action_json(ctx.user_id, &resolved.logical_id, is_button, values);
@@ -671,7 +671,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
         }) => match render(ctx, &name, &scope, &token, &document, public) {
             Ok(components) => components,
             Err(e) => {
-                eprintln!("[discord] /{name} ui re-render failed: {e}");
+                crate::eprintln_stamped!("[discord] /{name} ui re-render failed: {e}");
                 let text = fallback_text
                     .filter(|t| !t.trim().is_empty())
                     .unwrap_or_else(|| "That answer could not be drawn.".to_string());
@@ -715,7 +715,7 @@ pub async fn component(ctx: &Ctx<'_>, custom_id: &str, values: &[String], is_but
         .edit_original_v2(ctx.app_id, ctx.int_token, &components, public)
         .await
     {
-        eprintln!("[discord] /{name} component update failed: {e}");
+        crate::eprintln_stamped!("[discord] /{name} component update failed: {e}");
     }
 }
 

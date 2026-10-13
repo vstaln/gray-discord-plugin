@@ -23,6 +23,7 @@ pub mod exe_watch;
 pub mod gateway;
 pub mod graycmd;
 pub mod lifecycle;
+pub mod log_stamp;
 pub mod media_tags;
 pub mod pager;
 pub mod pairing;

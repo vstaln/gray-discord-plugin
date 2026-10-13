@@ -148,7 +148,7 @@ pub async fn pump(gray_home: PathBuf, conversations: PathBuf, rest: crate::trans
             };
             let body = render(intent);
             let Some(channel) = channel_for(intent) else {
-                eprintln!("[discord] always-on delivery {id} has no channel; dropping");
+                crate::eprintln_stamped!("[discord] always-on delivery {id} has no channel; dropping");
                 acked.push(id.to_string());
                 continue;
             };
@@ -164,7 +164,7 @@ pub async fn pump(gray_home: PathBuf, conversations: PathBuf, rest: crate::trans
                     note_posted(&conversations, channel, &body);
                     acked.push(id.to_string());
                 }
-                Err(e) => eprintln!("[discord] always-on delivery {id} failed: {e:?}"),
+                Err(e) => crate::eprintln_stamped!("[discord] always-on delivery {id} failed: {e:?}"),
             }
         }
         if !acked.is_empty() {

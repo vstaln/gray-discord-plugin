@@ -155,7 +155,7 @@ fn rendered(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value]) -> Vec<Value> {
     match render::from_embed(embed, buttons) {
         Ok(components) => components,
         Err(e) => {
-            eprintln!("[discord] invalid command render: {e}");
+            crate::eprintln_stamped!("[discord] invalid command render: {e}");
             vec![json!({"type": 10, "content": "Gray could not render this response."})]
         }
     }
@@ -169,7 +169,7 @@ pub(crate) async fn answer(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value], publ
         .interaction_v2(ctx.int_id, ctx.int_token, &components, public)
         .await
     {
-        eprintln!("[discord] command reply failed: {e}");
+        crate::eprintln_stamped!("[discord] command reply failed: {e}");
     }
 }
 
@@ -180,7 +180,7 @@ pub(crate) async fn edit_deferred(ctx: &Ctx<'_>, embed: &Value, buttons: &[Value
         .edit_original_v2(ctx.app_id, ctx.int_token, &components, public)
         .await
     {
-        eprintln!("[discord] command original edit failed: {e}");
+        crate::eprintln_stamped!("[discord] command original edit failed: {e}");
     }
 }
 
@@ -192,7 +192,7 @@ async fn answer_deferred(
     render: impl std::future::Future<Output = Value>,
 ) {
     if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, public).await {
-        eprintln!("[discord] command defer failed: {e}");
+        crate::eprintln_stamped!("[discord] command defer failed: {e}");
         return;
     }
     let embed = render.await;
@@ -243,7 +243,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                 ) {
                     Ok(token) => state_tokens.push(token),
                     Err(e) => {
-                        eprintln!("[discord] could not create cron button state: {e}");
+                        crate::eprintln_stamped!("[discord] could not create cron button state: {e}");
                         state_tokens.clear();
                         break;
                     }
@@ -431,7 +431,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
             // The 3-second rule: acknowledge now, enqueue the turn, and let
             // the delivery loop answer through the webhook when gray is done.
             if let Err(e) = ctx.rest.defer_v2(ctx.int_id, ctx.int_token, true).await {
-                eprintln!("[discord] /ask defer failed: {e}");
+                crate::eprintln_stamped!("[discord] /ask defer failed: {e}");
                 return;
             }
             let capacity = ctx
@@ -463,7 +463,7 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                     .await;
                 }
                 Err(e) => {
-                    eprintln!("[discord] /ask enqueue failed: {e}");
+                    crate::eprintln_stamped!("[discord] /ask enqueue failed: {e}");
                     edit_deferred(
                         ctx,
                         &commands::embed("/ask", format!("Cannot queue that: {e}"), &[]),
@@ -552,7 +552,7 @@ pub async fn unknown(ctx: &Ctx<'_>) {
 /// currently registered. This prevents Discord's three-second retry storm if
 /// an old or manually-created modal reaches the bridge.
 pub async fn modal(ctx: &Ctx<'_>, custom_id: &str) {
-    eprintln!("[discord] unhandled modal submission: {custom_id}");
+    crate::eprintln_stamped!("[discord] unhandled modal submission: {custom_id}");
     answer(
         ctx,
         &commands::embed("Modal", "This Gray dialog is no longer active.", &[]),
@@ -569,7 +569,7 @@ async fn update_original_or_answer(ctx: &Ctx<'_>, embed: &Value) {
         .interaction_update_v2(ctx.int_id, ctx.int_token, &components)
         .await
     {
-        eprintln!("[discord] component update failed; sending fallback: {e}");
+        crate::eprintln_stamped!("[discord] component update failed; sending fallback: {e}");
         answer(ctx, embed, &[], false).await;
     }
 }
@@ -589,7 +589,7 @@ pub async fn stop_button(ctx: &Ctx<'_>, custom_id: &str, message: Option<&Value>
             Ok(Some(turn)) => ctx.store.cancel(&turn).is_ok(),
             Ok(None) => false,
             Err(e) => {
-                eprintln!("[discord] stop state failed: {e}");
+                crate::eprintln_stamped!("[discord] stop state failed: {e}");
                 false
             }
         };
@@ -607,7 +607,7 @@ pub async fn stop_button(ctx: &Ctx<'_>, custom_id: &str, message: Option<&Value>
     };
     if !updated {
         if let Err(e) = ctx.rest.defer_update(ctx.int_id, ctx.int_token).await {
-            eprintln!("[discord] stop acknowledgement failed: {e}");
+            crate::eprintln_stamped!("[discord] stop acknowledgement failed: {e}");
         }
     }
 }
@@ -643,7 +643,7 @@ pub async fn ask_press(ctx: &Ctx<'_>, custom_id: &str, values: &[String], typed:
                     )
                     .await
                 {
-                    eprintln!("[discord] ask modal failed: {e}");
+                    crate::eprintln_stamped!("[discord] ask modal failed: {e}");
                 }
             }
             None => expired(ctx, "Question", closed).await,
@@ -715,7 +715,7 @@ pub async fn button(ctx: &Ctx<'_>, custom_id: &str) {
             return;
         }
         Err(e) => {
-            eprintln!("[discord] component state failed: {e}");
+            crate::eprintln_stamped!("[discord] component state failed: {e}");
             answer(
                 ctx,
                 &commands::embed("Cron", "The action could not be completed.", &[]),

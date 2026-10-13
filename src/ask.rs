@@ -327,7 +327,7 @@ pub async fn ask(
     let message = match rest.send_v2(channel, &render(&row), None).await {
         Ok(id) => id,
         Err(error) => {
-            eprintln!("[discord] question card refused: {error}");
+            crate::eprintln_stamped!("[discord] question card refused: {error}");
             let _ = store.ask_close(&ask_id, "cancelled");
             return json!({});
         }

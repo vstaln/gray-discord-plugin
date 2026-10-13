@@ -287,7 +287,7 @@ fn log_failure(what: &str, channel: &str, error: &TransportError) {
         TransportError::Auth(_) => "unauthorized".to_string(),
         TransportError::Forbidden(_) => "forbidden".to_string(),
     };
-    eprintln!("[discord] turn message {what} failed in channel {channel}: {detail}");
+    crate::eprintln_stamped!("[discord] turn message {what} failed in channel {channel}: {detail}");
 }
 
 #[derive(Clone)]
@@ -616,7 +616,7 @@ impl<R, D> Runtime<R, D> {
             // The answer did not fully land. Retract its preview so the
             // durable resend does not leave the same words on screen twice;
             // the tool lines above it stay as the turn's record.
-            eprintln!("[discord] the answer did not land in place in channel {channel}; posting it durably");
+            crate::eprintln_stamped!("[discord] the answer did not land in place in channel {channel}; posting it durably");
             if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
                 for id in timeline.answer_ids() {
                     let _ = rest.delete_message(ch, &id).await;
@@ -1590,7 +1590,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     .map(|c| c.is_empty())
                     .unwrap_or(false);
                 if idle && exe_watch.as_ref().is_some_and(|w| w.replaced()) {
-                    eprintln!("[discord] binary replaced; exiting for restart");
+                    crate::eprintln_stamped!("[discord] binary replaced; exiting for restart");
                     break;
                 }
             }
@@ -1601,9 +1601,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 match event {
                     Some(Ok(Event::Ready(ready))) => {
                         if owner_id.is_empty() {
-                            println!("Discord connected; nobody admitted yet (pairing replies only).");
+                            crate::println_stamped!("Discord connected; nobody admitted yet (pairing replies only).");
                         } else {
-                            println!("Discord connected; durable owner-only queue enabled.");
+                            crate::println_stamped!("Discord connected; durable owner-only queue enabled.");
                         }
                         {
                             // Pin the identity for gray's /gateway row: files
@@ -1641,7 +1641,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         if cached.as_deref() == Some(&hash) {
                             // Unchanged, skip registration
                         } else if let Err(e) = rest.register_commands(&r_app_id, &cmds).await {
-                            eprintln!("[discord] slash command registration failed: {e}");
+                            crate::eprintln_stamped!("[discord] slash command registration failed: {e}");
                         } else {
                             let _ = store.meta_set("slash_commands_hash", &hash);
                         }
@@ -1654,7 +1654,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         // Receipt log: every message the gateway sees, by ID
                         // and surface. Never the content — this is the only
                         // way to tell "never DM'd" from "event never arrived".
-                        eprintln!("[discord] message from {} (dm: {is_dm})", m.author.id.get());
+                        crate::eprintln_stamped!("[discord] message from {} (dm: {is_dm})", m.author.id.get());
                         let prompt = crate::policy::incoming(
                             &author_id,
                             &owner_id,
@@ -1774,10 +1774,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     crate::pairing::unconfigured_embed(&author_id, &paired.code);
                                 match crate::render::from_embed(&embed, &[]) {
                                     Ok(components) => match rest.send_v2(ch, &components, None).await {
-                                        Ok(_) => eprintln!("[discord] pairing reply sent"),
-                                        Err(e) => eprintln!("[discord] pairing reply failed: {e}"),
+                                        Ok(_) => crate::eprintln_stamped!("[discord] pairing reply sent"),
+                                        Err(e) => crate::eprintln_stamped!("[discord] pairing reply failed: {e}"),
                                     },
-                                    Err(e) => eprintln!("[discord] pairing render failed: {e}"),
+                                    Err(e) => crate::eprintln_stamped!("[discord] pairing render failed: {e}"),
                                 }
                             }
                         }
@@ -1959,7 +1959,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                             )
                                             .await;
                                     }
-                                    eprintln!("[discord] component interaction rejected: {error}");
+                                    crate::eprintln_stamped!("[discord] component interaction rejected: {error}");
                                 }
                             }
                             continue;
@@ -2016,7 +2016,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             None => {
                                 // An interaction we did not register (or a
                                 // sub-command that vanished under us).
-                                eprintln!(
+                                crate::eprintln_stamped!(
                                     "[discord] unparseable slash command: {} {sub:?}",
                                     cmd.name.as_str()
                                 );
@@ -2030,14 +2030,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         // but are never selected for new interactions.
                     }
                     Some(Err(e)) => {
-                        eprintln!("[discord] gateway error: {e}");
+                        crate::eprintln_stamped!("[discord] gateway error: {e}");
                     }
                     None => {
                         // The stream only ends on a fatal close (bad token,
                         // disabled privileged intent, or dropped network).
                         // Say so: an exit-0 silence would restart-loop under
                         // a supervisor with empty logs.
-                        eprintln!(
+                        crate::eprintln_stamped!(
                             "[discord] gateway closed the connection (token, Message Content Intent, or network); exiting"
                         );
                         break;

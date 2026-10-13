@@ -103,7 +103,7 @@ async fn multi_terminal_rows_are_rejected() {
     let exe = root.join("double");
     write_exe(
         &exe,
-        "#!/bin/sh\necho '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"one\"}'\necho '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"two\"}'\n",
+        "#!/bin/sh\nprintf '%s\\n%s\\n' '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"one\"}' '{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"two\"}'\n",
     );
     let config = base_config(&exe, &home);
     let err = run_gray(
@@ -425,4 +425,53 @@ async fn exhausted_request_cap_is_request_limit() {
         matches!(err, RunError::RequestLimit(32)),
         "unexpected: {err}"
     );
+}
+
+/// A gray that prints its terminal row and then keeps running with stdout
+/// open, like a child that never exits. The answer must not wait for it, its
+/// stdin must no longer be steerable, and the child must be killed.
+#[tokio::test]
+async fn a_lingering_child_does_not_hold_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let exe = root.join("linger");
+    let pid_file = root.join("linger.pid");
+    let script = format!(
+        "#!/bin/sh\necho $$ > {}\necho '{{\"protocol\":1,\"turn_id\":\"t\",\"type\":\"result\",\"session_id\":\"11111111-1111-1111-1111-111111111111\",\"text\":\"done\"}}'\nsleep 60\n",
+        pid_file.display()
+    );
+    write_exe(&exe, &script);
+    let config = base_config(&exe, &home);
+    let started = std::time::Instant::now();
+    let answer = run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:linger",
+        "hello",
+        default_opts(),
+    )
+    .await
+    .expect("the terminal row is the answer");
+    assert_eq!(answer, "done");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "turn waited for the lingering child: {:?}",
+        started.elapsed()
+    );
+    assert!(!gray_discord::runner::is_live("chat:linger"));
+    let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    // kill(pid, 0) also succeeds on an unreaped zombie, so this needs the reap.
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} survived its grace period"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
