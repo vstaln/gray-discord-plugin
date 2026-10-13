@@ -229,6 +229,10 @@ pub struct Timeline {
     flood: u32,
     /// Set after [`FLOOD_STRIKES`]: no more edits; the rest is posted anew.
     edits_stopped: bool,
+    /// Posted messages already on screen when edits stopped — the frozen
+    /// prefix the remainder goes out after. Pinned at the stop so fresh
+    /// posts landing cannot move the cut.
+    stop_prefix: Option<usize>,
 }
 
 impl Timeline {
@@ -590,12 +594,7 @@ impl Timeline {
         if self.lost {
             return Vec::new();
         }
-        let cards = self.render(now);
-        let cards = if self.edits_stopped {
-            self.after_stop(cards)
-        } else {
-            cards
-        };
+        let cards = self.rendered(now);
         let mut ops = Vec::new();
         for (index, body) in cards.iter().enumerate() {
             match self.cards.get(index) {
@@ -642,12 +641,25 @@ impl Timeline {
         }
     }
 
+    /// The turn's messages as they should look on screen at `now`: the
+    /// rendered cards, or — once edits have stopped — the frozen prefix
+    /// plus the remainder as new messages. `plan` publishes this view, so
+    /// `landed`, `newest_shown` and `answer_ids` must check against it too.
+    pub fn rendered(&self, now: f64) -> Vec<Card> {
+        let cards = self.render(now);
+        if self.edits_stopped {
+            self.after_stop(cards)
+        } else {
+            cards
+        }
+    }
+
     /// Once edits have stopped, the frozen messages stay as they are, and
     /// what they have not shown yet goes out as new messages: the last
     /// frozen message's text is a prefix of what it now renders, and the
     /// rest of the turn follows it.
     fn after_stop(&self, cards: Vec<Card>) -> Vec<Card> {
-        let k = self.cards.len();
+        let k = self.stop_prefix.unwrap_or(self.cards.len());
         if k == 0 || cards.len() < k {
             return cards;
         }
@@ -658,7 +670,10 @@ impl Timeline {
             rest.push('\n');
             rest.push_str(&card.text);
         }
-        let block = cards[k - 1].block;
+        // The remainder ends on the turn's last block — the answer once it
+        // is adopted — and its messages are tagged so, whatever block the
+        // frozen prefix card belonged to.
+        let block = cards.last().map(|card| card.block).unwrap_or_default();
         let extras: Vec<Value> = cards
             .last()
             .map(|card| card.components.iter().skip(1).cloned().collect())
@@ -738,8 +753,9 @@ impl Timeline {
         let reposts = self.reposts;
         if matches!(failure, Failure::Busy(_)) {
             self.flood += 1;
-            if self.flood >= FLOOD_STRIKES {
+            if self.flood >= FLOOD_STRIKES && !self.edits_stopped {
                 self.edits_stopped = true;
+                self.stop_prefix = Some(self.cards.len());
             }
         }
         let Some(posted) = self.cards.get_mut(card) else {
@@ -784,7 +800,7 @@ impl Timeline {
         if self.lost {
             return None;
         }
-        let cards = self.render(now);
+        let cards = self.rendered(now);
         let index = cards.len().checked_sub(1)?;
         let posted = self.cards.get(index)?;
         let card = cards.into_iter().nth(index)?;
@@ -808,20 +824,32 @@ impl Timeline {
         if self.lost {
             return None;
         }
-        let cards = self.render(now);
+        let cards = self.rendered(now);
         if self.cards.len() > cards.len() {
             return None;
         }
+        let prefix = self.stop_prefix.unwrap_or(usize::MAX);
         let mut parts = Vec::new();
         for (index, card) in cards.iter().enumerate() {
             if card.block != answer {
                 continue;
             }
             let posted = self.cards.get(index)?;
-            if posted.shown != card.key() {
+            // Equal text with only the chip or a pager mint behind is the
+            // answer on screen already; a message carrying files must match
+            // exactly so they are known delivered.
+            if posted.shown == card.key()
+                || (card.files.is_empty() && posted.text == card.text)
+            {
+                parts.push((card.text.clone(), posted.id.clone()));
+                continue;
+            }
+            // The frozen prefix's last card may lag: the tail it could not
+            // show went out as the fresh messages after it, which carry the
+            // answer and are checked as their own cards.
+            if !(self.edits_stopped && index + 1 == prefix && cards.len() > prefix) {
                 return None;
             }
-            parts.push((card.text.clone(), posted.id.clone()));
         }
         (!parts.is_empty()).then_some(Landed { parts })
     }
@@ -842,7 +870,7 @@ impl Timeline {
         let Some(answer) = self.answer_block() else {
             return Vec::new();
         };
-        let cards = self.render(0.0);
+        let cards = self.rendered(0.0);
         self.cards
             .iter()
             .enumerate()
@@ -1427,6 +1455,33 @@ mod tests {
             .iter()
             .any(|op| matches!(op, Op::Delete { card: 1, .. })));
         assert_eq!(t.landed(0.1).unwrap().parts.len(), 1);
+    }
+
+    #[test]
+    fn an_answer_posted_fresh_after_edits_stop_still_lands() {
+        let mut t = Timeline::new(true, 0.0);
+        t.absorb(&text(0, "", "working on it", false));
+        land(&mut t, 0.0, false);
+        // Discord flood-limits the edits; the turn stops touching the card.
+        for _ in 0..FLOOD_STRIKES {
+            t.edit_failed(0, Failure::Busy(1.0), 0.0);
+        }
+        t.adopt("the answer");
+        t.settle(Status::Done, 0.1);
+        let ops = land(&mut t, 0.1, true);
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::Post { .. })),
+            "the remainder went out as new messages: {ops:?}"
+        );
+        // The answer is on screen in its fresh message: not a durable repost.
+        let landed = t.landed(0.1).expect("the answer is on screen");
+        assert!(landed
+            .parts
+            .iter()
+            .any(|(text, _)| text.contains("the answer")));
+        // A second finish stays stable: nothing more to send, still landed.
+        assert!(t.plan(0.2, 1.0, true).is_empty());
+        assert!(t.landed(0.2).is_some());
     }
 
     #[test]

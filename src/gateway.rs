@@ -867,7 +867,7 @@ impl<R, D> Runtime<R, D> {
                 // The answer is the turn's last block: its messages are the
                 // ones in the newest block.
                 let held = hold_answer
-                    .then(|| timeline.render(now).iter().map(|card| card.block).max())
+                    .then(|| timeline.rendered(now).iter().map(|card| card.block).max())
                     .flatten();
                 (ops, held)
             }
