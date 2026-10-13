@@ -1749,7 +1749,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                 match store.enqueue(&msg_id, &channel_id, &prompt, Some(&conv), capacity) {
                                     Err(_) => Some("Queue full or message invalid; this message was not accepted.".to_string()),
                                     Ok(true) if explicit => Some("Nothing running — sent as a new message.".to_string()),
-                                    Ok(true) => queued_notice(&store, &mut queued_acks, &conv, &msg_id),
+                                    Ok(true) if !crate::stream::quiet(&config) => {
+                                        queued_notice(&store, &mut queued_acks, &conv, &msg_id)
+                                    }
+                                    Ok(true) => None,
                                     Ok(false) => None,
                                 }
                             };

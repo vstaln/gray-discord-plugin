@@ -65,13 +65,24 @@ const WORKING: u32 = 0x4E5058;
 const FAILED: u32 = 0xED4245;
 const STOPPED: u32 = 0x80848E;
 
+/// Quiet mode (`"quiet": true`): one durable post per turn. Flips the
+/// defaults for `stream_replies`, `activity_indicator` and the queued ack
+/// to off; an explicit key always wins over the meta flag. The typing
+/// indicator stays — it is the only sign of life a quiet turn has.
+pub fn quiet(config: &Value) -> bool {
+    config
+        .get("quiet")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Live replies on/off. Default on; `"stream_replies": false` keeps the
 /// answer in one durable post at the end of the turn.
 pub fn enabled(config: &Value) -> bool {
     config
         .get("stream_replies")
         .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .unwrap_or_else(|| !quiet(config))
 }
 
 /// Where the turn ended up; drives the accent and the status line.

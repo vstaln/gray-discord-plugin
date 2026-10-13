@@ -74,7 +74,7 @@ pub fn enabled(config: &Value) -> bool {
     config
         .get("activity_indicator")
         .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .unwrap_or_else(|| !crate::stream::quiet(config))
 }
 
 /// The end-of-turn tally card (`⋯ 12.4s · ran 3 commands`). Off by default:
