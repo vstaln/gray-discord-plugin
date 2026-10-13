@@ -591,7 +591,7 @@ async fn quiet_posts_one_status_card_and_the_durable_answer() {
     store.enqueue("m1", "42", "run it", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
 
-    let sent = stub.sent.lock().unwrap();
+    let sent = stub.sent.lock().unwrap().clone();
     let posts: Vec<_> = sent
         .iter()
         .filter(|s| s.method == "POST" && s.path.starts_with("/api/v10/channels/42/messages"))
@@ -642,7 +642,6 @@ async fn quiet_posts_one_status_card_and_the_durable_answer() {
         sent.iter().any(|s| s.method == "DELETE"),
         "a finished quiet turn retires its status card: {sent:?}"
     );
-    drop(sent);
     assert!(rt.deliver_one().await.unwrap());
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
 }

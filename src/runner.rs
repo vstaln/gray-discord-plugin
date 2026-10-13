@@ -138,13 +138,19 @@ impl LiveStdin {
 
 impl Drop for LiveStdin {
     fn drop(&mut self) {
-        if let Ok(mut live) = live_stdins().lock() {
-            if live
-                .get(&self.conversation)
-                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &self.stdin))
-            {
-                live.remove(&self.conversation);
-            }
+        unregister(&self.conversation, &self.stdin);
+    }
+}
+
+/// Removes `stdin` from the registry, but only if it is still the entry for
+/// `conversation` (a newer turn may have replaced it).
+fn unregister(conversation: &str, stdin: &SharedStdin) {
+    if let Ok(mut live) = live_stdins().lock() {
+        if live
+            .get(conversation)
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, stdin))
+        {
+            live.remove(conversation);
         }
     }
 }
@@ -156,6 +162,16 @@ pub fn is_live(conversation: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Longest a steer may wait on a turn's stdin. The gateway awaits steer inline
+/// in its event loop, so a child that stopped reading (full pipe) must not
+/// stall every other conversation.
+const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Writes a steer line to the turn running in `conversation`. `false` when
+/// there is no such turn, the write fails, or the child does not take the
+/// line within [`STEER_TIMEOUT`]; the caller then enqueues the text as a new
+/// message. A timed-out child is unregistered and its stdin closed, so later
+/// messages do not retry the wedged pipe.
 pub async fn steer(conversation: &str, text: &str) -> bool {
     use tokio::io::AsyncWriteExt;
     let text = text.trim();
@@ -170,11 +186,25 @@ pub async fn steer(conversation: &str, text: &str) -> bool {
         return false;
     };
     let line = format!("{}\n", serde_json::json!({"type": "steer", "text": text}));
-    let mut guard = stdin.lock().await;
-    let Some(stdin) = guard.as_mut() else {
-        return false;
+    let write = async {
+        let mut guard = stdin.lock().await;
+        let Some(stdin) = guard.as_mut() else {
+            return false;
+        };
+        stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
     };
-    stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+    match tokio::time::timeout(STEER_TIMEOUT, write).await {
+        Ok(delivered) => delivered,
+        Err(_) => {
+            unregister(conversation, &stdin);
+            // Closing stdin needs the lock the stalled write may hold; the
+            // write is dropped by now, so this task gets it promptly.
+            tokio::spawn(async move {
+                *stdin.lock().await = None;
+            });
+            false
+        }
+    }
 }
 
 /// Per-turn options. `timeout_secs` defaults to `timeout_seconds` from config

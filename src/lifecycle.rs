@@ -279,15 +279,13 @@ mod tests {
 
     #[tokio::test]
     async fn core_answers_win() {
+        // A checked-in fake, not a script written here: exec'ing a file this
+        // test just wrote races the fork() of any other test thread, which can
+        // hold the write fd open until its own exec and makes this exec fail
+        // with ETXTBSY. `core` then falls back and the test flakes.
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("gray");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\ncase \"$3\" in\n boot) echo '{\"notice\":\"from core\"}';;\n stop) echo '{\"restart\":true,\"active_notice\":\"a\",\"home_notice\":\"h\"}';;\nesac\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-gray-lifecycle.sh");
         assert_eq!(
             boot_via(&bin, tmp.path(), 1).await.as_deref(),
             Some("from core")
