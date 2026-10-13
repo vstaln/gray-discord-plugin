@@ -214,6 +214,9 @@ pub struct Timeline {
     started: f64,
     /// How the turn ended, and when: the status line's time stops there.
     status: Option<(Status, f64)>,
+    /// Quiet mode (`"quiet": true`): the whole turn is one live status
+    /// card — the chip, edited in place — plus the durable answer post.
+    quiet: bool,
     /// `custom_id` of the status chip's Stop button while the turn runs.
     stop: Option<String>,
     media: Vec<Media>,
@@ -232,6 +235,13 @@ impl Timeline {
     /// Offer a Stop button in the status chip while the turn runs.
     pub fn with_stop(mut self, custom_id: String) -> Self {
         self.stop = Some(custom_id);
+        self
+    }
+
+    /// Quiet mode: only the status chip renders, as the turn's one live
+    /// card. Tool rows are still absorbed for its command tally.
+    pub fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
         self
     }
 
@@ -413,6 +423,34 @@ impl Timeline {
                     block: index,
                 });
             }
+        }
+        if self.quiet {
+            // The one live card: just the chip. A finished turn leaves
+            // nothing behind — the durable answer post stands alone.
+            if status == Status::Done {
+                return Vec::new();
+            }
+            let summary = crate::activity::summary(&tool_rows);
+            let elapsed = (now - self.started).max(0.0);
+            let mut text = match &status {
+                Status::Working => format!("Working · started {} ago", duration(elapsed)),
+                Status::Failed(reason) => {
+                    format!("{} after {}", capitalized(reason), duration(elapsed))
+                }
+                Status::Stopped => format!("Stopped after {}", duration(elapsed)),
+                Status::Done => unreachable!(),
+            };
+            if !summary.is_empty() {
+                text.push_str(" · ");
+                text.push_str(&summary);
+            }
+            return vec![Card {
+                components: vec![self.chip(&status, &summary, now)],
+                text,
+                files: Vec::new(),
+                block: self.blocks.len().saturating_sub(1),
+                pager: None,
+            }];
         }
         if units.is_empty() {
             return Vec::new();

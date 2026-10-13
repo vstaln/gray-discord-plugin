@@ -481,7 +481,8 @@ impl<R, D> Runtime<R, D> {
             crate::activity::begin(sink, conversation);
         }
         let key = activity_key(channel, conversation);
-        let mut timeline = crate::stream::Timeline::new(text, self.now_secs());
+        let mut timeline = crate::stream::Timeline::new(text, self.now_secs())
+            .with_quiet(crate::stream::quiet(&self.config));
         if let Some(stop) = buttons.stop {
             timeline = timeline.with_stop(stop);
         }
@@ -633,15 +634,18 @@ impl<R, D> Runtime<R, D> {
         };
         let rows = crate::activity::drain_for(&sink, conversation);
         let narrate = crate::activity::enabled(&self.config);
+        let quiet = crate::stream::quiet(&self.config);
         let key = activity_key(channel, conversation);
         let now = self.now_secs();
         let mut timelines = self.timelines.lock().await;
         let timeline = timelines
             .entry(key)
-            .or_insert_with(|| crate::stream::Timeline::new(false, now));
+            .or_insert_with(|| crate::stream::Timeline::new(false, now).with_quiet(quiet));
         for row in rows {
-            // Narration off hides tool lines, never the reply.
+            // Narration off hides tool lines; quiet still absorbs them —
+            // its status card shows the tally, just never the lines.
             if !narrate
+                && !quiet
                 && !matches!(
                     row.get("phase").and_then(Value::as_str),
                     Some("text") | Some("retract")

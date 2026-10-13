@@ -578,3 +578,60 @@ async fn a_slow_discord_never_holds_up_the_agent() {
     assert_eq!(last.body, "One two\nthree");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
 }
+
+#[tokio::test]
+async fn quiet_posts_one_status_card_and_the_durable_answer() {
+    let stub = common::Stub::start().await;
+    let script = vec![
+        vec![tool("tool_ran", "a", "cargo test")],
+        vec![tool("tool_finished", "a", "")],
+    ];
+    let (rt, store, _) = scripted!(json!({"quiet": true}), stub, script, "All green.");
+    store.enqueue("m1", "42", "run it", None, 1000).unwrap();
+    assert!(rt.generate_one().await.unwrap());
+
+    let sent = stub.sent.lock().unwrap();
+    let posts: Vec<_> = sent
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.starts_with("/api/v10/channels/42/messages"))
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "a quiet turn posts exactly one live card: {sent:?}"
+    );
+    let card = posts[0].body["components"].as_array().unwrap();
+    assert!(
+        chip_of(card).is_some(),
+        "the quiet card is only the chip: {card:?}"
+    );
+    let mut traffic_text = card.iter().map(component_text).collect::<Vec<_>>().join("\n");
+    traffic_text.push_str(
+        &sent
+            .iter()
+            .filter(|s| s.method == "PATCH")
+            .flat_map(|s| s.body["components"].as_array().unwrap().iter().map(component_text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert!(
+        !traffic_text.contains("cargo test"),
+        "tool lines never render in quiet mode: {traffic_text:?}"
+    );
+    assert!(
+        traffic_text.contains("Working · started"),
+        "the chip still tells the turn is live: {traffic_text:?}"
+    );
+    assert_eq!(
+        store.get("m1").unwrap().unwrap().state,
+        "delivery",
+        "the answer waits in the outbox, not the channel"
+    );
+    assert!(
+        sent.iter().any(|s| s.method == "DELETE"),
+        "a finished quiet turn retires its status card: {sent:?}"
+    );
+    drop(sent);
+    assert!(rt.deliver_one().await.unwrap());
+    assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
+}
