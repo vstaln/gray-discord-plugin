@@ -111,6 +111,11 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     {
         return Err("restart_notification must be true or false".to_string());
     }
+    if let Some(mode) = data.get("progress_mode") {
+        if !matches!(mode.as_str(), Some("verbose" | "commands" | "off")) {
+            return Err("progress_mode must be verbose, commands, or off".to_string());
+        }
+    }
     int_in(data, "timeout_seconds", 1, 86400)?;
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;

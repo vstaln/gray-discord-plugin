@@ -40,26 +40,25 @@ use serde_json::{json, Value};
 
 /// The streaming cursor (`DEFAULT_STREAMING_CURSOR`).
 pub const CURSOR: &str = " ▉";
-/// Body text per message, in UTF-16 units. Discord allows 4000 across a V2
-/// message; the rest is the status chip's and the tool log's.
-pub const CARD_TEXT: usize = 3600;
+/// Text per message, in UTF-16 units: the 2000-character message cap. A
+/// message past it rolls over into a new one, never cut mid-block.
+pub const CARD_TEXT: usize = 2000;
+/// Flood-limit replies (HTTP 429) in a row before the turn stops editing and
+/// sends whatever is left as new messages.
+const FLOOD_STRIKES: u32 = 3;
 /// `MAX_SPLIT_MESSAGES`: one runaway run of prose never floods the
 /// channel.
 pub const MAX_SPLIT: usize = 8;
 /// Messages one turn may open. Past it, later steps share the last one.
 pub const MAX_MESSAGES: usize = 30;
-/// A tool group longer than this folds into its tool log.
-const FOLD_LINES: usize = 6;
-/// Lines a folded group still shows, so the live action stays visible.
-const KEEP_LIVE: usize = 2;
-/// The tool log's share of a message's text.
-const LOG_CHARS: usize = 900;
 /// Discord's attachment cap per message.
 pub const MAX_MEDIA: usize = 10;
 /// Refused requests (HTTP 400) tolerated before a message is left as it is.
 const STRIKES: u32 = 3;
 /// Times a deleted newest message is posted again.
 const REPOSTS: u32 = 2;
+/// Longest wait between edits after flood-limit replies, in seconds.
+const MAX_EDIT_INTERVAL: f64 = 10.0;
 
 const WORKING: u32 = 0x4E5058;
 const FAILED: u32 = 0xED4245;
@@ -133,11 +132,15 @@ enum Block {
 struct Posted {
     id: String,
     shown: String,
+    /// The body text as shown: what a remainder is cut from once edits stop.
+    text: String,
     at: f64,
     /// Refused edits in a row.
     strikes: u32,
     /// No edit before this time (backoff after a failure).
     retry_at: f64,
+    /// Seconds between edits after flood-limit replies (0: the base gap).
+    interval: f64,
     /// Left as it is for the rest of the turn.
     frozen: bool,
 }
@@ -192,7 +195,6 @@ pub struct Landed {
 /// One block's share of the layout before it is cut into messages.
 struct Unit {
     text: String,
-    log: Option<(Value, usize)>,
     block: usize,
 }
 
@@ -221,6 +223,12 @@ pub struct Timeline {
     stop: Option<String>,
     media: Vec<Media>,
     retracted: bool,
+    /// How much tool work the chat shows (`progress_mode`).
+    progress: crate::activity::Mode,
+    /// Consecutive flood-limit replies to edits.
+    flood: u32,
+    /// Set after [`FLOOD_STRIKES`]: no more edits; the rest is posted anew.
+    edits_stopped: bool,
 }
 
 impl Timeline {
@@ -242,6 +250,12 @@ impl Timeline {
     /// card. Tool rows are still absorbed for its command tally.
     pub fn with_quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// How tool work shows: full blocks, commands only, or none.
+    pub fn with_progress(mut self, progress: crate::activity::Mode) -> Self {
+        self.progress = progress;
         self
     }
 
@@ -386,13 +400,14 @@ impl Timeline {
     pub fn render(&self, now: f64) -> Vec<Card> {
         let (status, now) = self.status.clone().unwrap_or((Status::Working, now));
         let live = status == Status::Working;
+        let budget = CARD_TEXT;
         let mut units: Vec<Unit> = Vec::new();
         let mut tool_rows: Vec<Value> = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
-            let unit = match block {
+            let texts: Vec<String> = match block {
                 Block::Tools { rows } => {
                     tool_rows.extend(rows.iter().cloned());
-                    tool_unit(rows)
+                    pack(crate::activity::tool_blocks(rows, self.progress), budget)
                 }
                 Block::Text {
                     stable,
@@ -408,21 +423,15 @@ impl Timeline {
                     let prose = crate::text::sanitize(&prose);
                     let prose = prose.trim_end();
                     if prose.trim().is_empty() {
-                        None
+                        Vec::new()
                     } else if live && !done {
-                        Some((format!("{prose}{CURSOR}"), None))
+                        vec![format!("{prose}{CURSOR}")]
                     } else {
-                        Some((prose.to_string(), None))
+                        vec![prose.to_string()]
                     }
                 }
             };
-            if let Some((text, log)) = unit {
-                units.push(Unit {
-                    text,
-                    log,
-                    block: index,
-                });
-            }
+            units.extend(texts.into_iter().map(|text| Unit { text, block: index }));
         }
         if self.quiet {
             // The one live card: just the chip. A finished turn leaves
@@ -465,25 +474,16 @@ impl Timeline {
                 .map(|unit| unit.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            units.push(Unit {
-                text,
-                log: None,
-                block,
-            });
+            units.push(Unit { text, block });
         }
         // A finished turn drops the chip: the answer stands alone.
         let chip = (status != Status::Done)
             .then(|| self.chip(&status, &crate::activity::summary(&tool_rows), now));
         let mut cards: Vec<Card> = Vec::new();
         for unit in units {
-            let log_size = unit.log.as_ref().map_or(0, |(_, size)| *size);
-            let (chunks, overflow) = split_block(&unit.text, CARD_TEXT.saturating_sub(log_size));
-            let last = chunks.len().saturating_sub(1);
-            for (index, chunk) in chunks.into_iter().enumerate() {
-                let mut components = vec![json!({"type": 10, "content": chunk})];
-                if index == last {
-                    components.extend(unit.log.clone().map(|(container, _)| container));
-                }
+            let (chunks, overflow) = split_block(&unit.text, budget);
+            for chunk in chunks {
+                let components = vec![json!({"type": 10, "content": chunk.clone()})];
                 cards.push(Card {
                     components,
                     text: chunk,
@@ -585,18 +585,24 @@ impl Timeline {
     /// The requests due now. Posts go strictly in message order; an edit
     /// waits `gap` seconds after the message's last change (and out any
     /// backoff) unless the turn is `finishing`, when everything settles at
-    /// once.
+    /// once. Tool messages edit no faster than [`crate::activity::TOOL_EDIT_GAP`].
     pub fn plan(&self, now: f64, gap: f64, finishing: bool) -> Vec<Op> {
         if self.lost {
             return Vec::new();
         }
         let cards = self.render(now);
+        let cards = if self.edits_stopped {
+            self.after_stop(cards)
+        } else {
+            cards
+        };
         let mut ops = Vec::new();
         for (index, body) in cards.iter().enumerate() {
             match self.cards.get(index) {
-                Some(posted) if posted.frozen => {}
+                Some(posted) if posted.frozen || self.edits_stopped => {}
                 Some(posted) => {
-                    let due = finishing || (now - posted.at >= gap && now >= posted.retry_at);
+                    let wait = self.gap_for(body, gap).max(posted.interval);
+                    let due = finishing || (now - posted.at >= wait && now >= posted.retry_at);
                     if posted.shown != body.key() && due {
                         ops.push(Op::Edit {
                             card: index,
@@ -628,13 +634,63 @@ impl Timeline {
         ops
     }
 
+    /// Seconds between edits of `body`: tool messages wait longer than prose.
+    fn gap_for(&self, body: &Card, gap: f64) -> f64 {
+        match self.blocks.get(body.block) {
+            Some(Block::Tools { .. }) => gap.max(crate::activity::TOOL_EDIT_GAP),
+            _ => gap,
+        }
+    }
+
+    /// Once edits have stopped, the frozen messages stay as they are, and
+    /// what they have not shown yet goes out as new messages: the last
+    /// frozen message's text is a prefix of what it now renders, and the
+    /// rest of the turn follows it.
+    fn after_stop(&self, cards: Vec<Card>) -> Vec<Card> {
+        let k = self.cards.len();
+        if k == 0 || cards.len() < k {
+            return cards;
+        }
+        let shown = self.cards[k - 1].text.as_str();
+        let now_text = cards[k - 1].text.as_str();
+        let mut rest = now_text.strip_prefix(shown).unwrap_or(now_text).to_string();
+        for card in &cards[k..] {
+            rest.push('\n');
+            rest.push_str(&card.text);
+        }
+        let block = cards[k - 1].block;
+        let extras: Vec<Value> = cards
+            .last()
+            .map(|card| card.components.iter().skip(1).cloned().collect())
+            .unwrap_or_default();
+        let mut out: Vec<Card> = cards.iter().take(k).cloned().collect();
+        let (chunks, overflow) = split_block(&rest, CARD_TEXT);
+        for chunk in chunks.into_iter().chain(overflow) {
+            out.push(Card {
+                components: vec![json!({"type": 10, "content": chunk.clone()})],
+                text: chunk,
+                files: Vec::new(),
+                block,
+                pager: None,
+            });
+        }
+        if out.len() > k || cards.len() > k {
+            if let Some(last) = out.last_mut() {
+                last.components.extend(extras);
+            }
+        }
+        out
+    }
+
     /// A post landed as message `id`.
     pub fn posted(&mut self, card: usize, id: &str, body: &Card, now: f64) {
         self.post_strikes = 0;
+        self.flood = 0;
         if card == self.cards.len() {
             self.cards.push(Posted {
                 id: id.to_string(),
                 shown: body.key(),
+                text: body.text.clone(),
                 at: now,
                 ..Posted::default()
             });
@@ -643,10 +699,13 @@ impl Timeline {
 
     /// An edit landed.
     pub fn edited(&mut self, card: usize, body: &Card, now: f64) {
+        self.flood = 0;
         if let Some(posted) = self.cards.get_mut(card) {
             posted.shown = body.key();
+            posted.text = body.text.clone();
             posted.at = now;
             posted.strikes = 0;
+            posted.interval = 0.0;
         }
     }
 
@@ -670,15 +729,30 @@ impl Timeline {
 
     /// An edit did not land. Only that message is affected: a busy Discord
     /// is waited out, a refused edit is retried with backoff and then left
-    /// as it is, and a deleted newest message is posted again.
+    /// as it is, and a deleted newest message is posted again. Flood-limit
+    /// replies double the edit interval (honouring `retry_after`, at most
+    /// [`MAX_EDIT_INTERVAL`]); after [`FLOOD_STRIKES`] in a row the turn
+    /// stops editing.
     pub fn edit_failed(&mut self, card: usize, failure: Failure, now: f64) {
         let newest = card + 1 == self.cards.len();
         let reposts = self.reposts;
+        if matches!(failure, Failure::Busy(_)) {
+            self.flood += 1;
+            if self.flood >= FLOOD_STRIKES {
+                self.edits_stopped = true;
+            }
+        }
         let Some(posted) = self.cards.get_mut(card) else {
             return;
         };
         match failure {
-            Failure::Busy(secs) => posted.retry_at = now + secs.clamp(0.5, 30.0),
+            Failure::Busy(secs) => {
+                let base = crate::activity::MIN_EDIT_GAP;
+                posted.interval = (posted.interval.max(base) * 2.0)
+                    .max(secs)
+                    .min(MAX_EDIT_INTERVAL);
+                posted.retry_at = now + posted.interval;
+            }
             Failure::Refused => {
                 posted.strikes += 1;
                 if posted.strikes >= STRIKES {
@@ -778,32 +852,33 @@ impl Timeline {
     }
 }
 
-/// One tool group's lines, folded when long, and its tool log.
-fn tool_unit(rows: &[Value]) -> Option<(String, Option<(Value, usize)>)> {
-    let feed = crate::activity::render(rows)?;
-    let feed = crate::text::sanitize(&feed);
-    let lines: Vec<&str> = feed.lines().collect();
-    let (shown, log) = if lines.len() > FOLD_LINES {
-        let mut shown = vec![format!(
-            "{} tool calls · full list in the tool log below",
-            lines.len()
-        )];
-        shown.extend(
-            lines[lines.len() - KEEP_LIVE..]
-                .iter()
-                .map(|line| line.to_string()),
-        );
-        let all: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        (shown, tool_log(&all))
-    } else {
-        (lines.iter().map(|line| line.to_string()).collect(), None)
-    };
-    let text = shown
-        .iter()
-        .map(|line| format!("-# {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some((text, log))
+/// Pack whole tool blocks into messages of at most `budget` units, joined
+/// by a blank line. A block is never cut, unless it alone exceeds the budget.
+fn pack(blocks: Vec<String>, budget: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for block in blocks {
+        let block = if crate::text::utf16_len(&block) > budget {
+            crate::text::prefix_within_limit(&block, budget).to_string()
+        } else {
+            block
+        };
+        let joined = if current.is_empty() {
+            block.clone()
+        } else {
+            format!("{current}\n\n{block}")
+        };
+        if crate::text::utf16_len(&joined) <= budget {
+            current = joined;
+        } else {
+            out.push(std::mem::take(&mut current));
+            current = block;
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Seconds to wait after the `strikes`-th refusal: 2, 4, 8 … capped at 30.
@@ -827,44 +902,6 @@ fn duration(secs: f64) -> String {
     }
     let whole = secs as u64;
     format!("{}m {:02}s", whole / 60, whole % 60)
-}
-
-/// The spoiler container holding every line of the folded tool groups, and
-/// its text size. Bounded: the newest lines win, older ones become a count.
-fn tool_log(lines: &[String]) -> Option<(Value, usize)> {
-    if lines.is_empty() {
-        return None;
-    }
-    let mut kept: Vec<String> = Vec::new();
-    let mut size = 0usize;
-    for line in lines.iter().rev() {
-        let entry = format!("-# {line}");
-        let cost = crate::text::utf16_len(&entry) + 1;
-        if size + cost > LOG_CHARS - 40 {
-            break;
-        }
-        size += cost;
-        kept.push(entry);
-    }
-    kept.reverse();
-    let dropped = lines.len() - kept.len();
-    if dropped > 0 {
-        kept.insert(0, format!("-# … +{dropped} earlier"));
-    }
-    let head = format!("-# Tool log · {} calls", lines.len());
-    let body = kept.join("\n");
-    let size = crate::text::utf16_len(&head) + crate::text::utf16_len(&body);
-    Some((
-        json!({
-            "type": 17,
-            "spoiler": true,
-            "components": [
-                {"type": 10, "content": head},
-                {"type": 10, "content": body},
-            ],
-        }),
-        size,
-    ))
 }
 
 /// The pressed message, flipped to "stopping…" for the interaction's own
@@ -1070,7 +1107,7 @@ mod tests {
         };
         assert_eq!(prose.text, "Let me check.", "closed: cursor gone");
         assert_eq!(prose.components.len(), 1, "the chip moved on");
-        assert_eq!(tools.text, "-# Running `cargo test`");
+        assert_eq!(tools.text, "● Running `cargo test`");
         assert_eq!(
             status_line(tools),
             "-# Working · started <t:0:R> · ran 1 command"
@@ -1102,24 +1139,15 @@ mod tests {
     }
 
     #[test]
-    fn a_long_tool_group_folds_into_a_spoiler_log() {
+    fn tool_calls_are_listed_in_full_not_folded() {
         let mut t = Timeline::new(true, 0.0);
         for i in 0..9 {
             t.absorb(&ran(&format!("c{i}"), &format!("step {i}")));
         }
         let card = &t.render(0.0)[0];
         crate::render::validate_components(&card.components).unwrap();
-        assert_eq!(
-            card.text,
-            "-# 9 tool calls · full list in the tool log below\n\
-             -# Running `step 7`\n-# Running `step 8`"
-        );
-        let log = &card.components[1];
-        assert_eq!(log["type"], 17);
-        assert_eq!(log["spoiler"], true, "tap to reveal");
-        let lines = log["components"][1]["content"].as_str().unwrap();
-        assert!(lines.starts_with("-# Running `step 0`"), "{lines}");
-        assert_eq!(lines.lines().count(), 9);
+        let expected: Vec<String> = (0..9).map(|i| format!("● Running `step {i}`")).collect();
+        assert_eq!(card.text, expected.join("\n\n"));
     }
 
     #[test]
@@ -1334,7 +1362,7 @@ mod tests {
         }
         body.push_str("```\nafter");
         let (chunks, overflow) = split_block(&body, CARD_TEXT);
-        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks.len(), 3, "{chunks:?}");
         assert!(overflow.is_none());
         assert!(chunks[0].ends_with("\n```"), "the cut closes its fence");
         assert!(chunks[1].starts_with("```rust\n"), "and reopens it");
@@ -1348,16 +1376,18 @@ mod tests {
         let mut t = Timeline::new(true, 0.0);
         t.absorb(&text(0, &"word ".repeat(1000), "", false));
         let cards = t.render(0.0);
-        assert_eq!(cards.len(), 2);
+        assert_eq!(cards.len(), 3, "5000 chars at 2000 per message");
         for card in &cards {
             crate::render::validate_components(&card.components).unwrap();
         }
-        assert!(
-            cards[0].components.iter().all(|c| c["type"] == 10),
-            "no chip: {:?}",
-            cards[0].components
-        );
-        assert!(status_line(&cards[1]).starts_with("-# Working · started"));
+        for card in &cards[..2] {
+            assert!(
+                card.components.iter().all(|c| c["type"] == 10),
+                "no chip: {:?}",
+                card.components
+            );
+        }
+        assert!(status_line(&cards[2]).starts_with("-# Working · started"));
     }
 
     #[test]
@@ -1381,7 +1411,7 @@ mod tests {
         assert_eq!(cards.len(), MAX_MESSAGES);
         let last = cards.last().unwrap();
         crate::render::validate_components(&last.components).unwrap();
-        assert!(last.text.ends_with("-# Running `make 39`"), "{}", last.text);
+        assert!(last.text.ends_with("● Running `make 39`"), "{}", last.text);
     }
 
     #[test]
@@ -1389,7 +1419,7 @@ mod tests {
         let mut t = Timeline::new(true, 0.0);
         t.absorb(&text(0, &"y".repeat(5000), "", false));
         land(&mut t, 0.0, false);
-        assert_eq!(t.cards.len(), 2);
+        assert_eq!(t.cards.len(), 3);
         t.adopt("short");
         t.settle(Status::Done, 0.1);
         let ops = land(&mut t, 0.1, true);

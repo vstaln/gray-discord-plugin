@@ -297,7 +297,7 @@ async fn each_step_of_the_turn_is_a_new_message() {
         .collect();
     assert_eq!(
         posted,
-        vec!["Let me check. ▉", "-# Running `cargo test`", "All ▉"],
+        vec!["Let me check. ▉", "● Running `cargo test`", "All ▉"],
         "prose, its tool lines, then the next prose, each a new message: {log:?}"
     );
     // The chip rides the newest message: the older ones lose it.
@@ -312,8 +312,8 @@ async fn each_step_of_the_turn_is_a_new_message() {
     let tools = log
         .iter()
         .rev()
-        .find(|frame| frame.body.starts_with("-# Ran `cargo test` ("))
-        .expect("the tool line gets its duration");
+        .find(|frame| frame.body.starts_with("● Ran `cargo test`"))
+        .expect("the tool line gets its result");
     assert_eq!(tools.status, None, "{tools:?}");
     let last = log.last().unwrap();
     assert_eq!(last.body, "All green.");
@@ -398,7 +398,7 @@ async fn a_gray_without_text_rows_posts_the_answer_below_its_tool_lines() {
         .iter()
         .map(|frame| frame.body.as_str())
         .collect();
-    assert_eq!(posted, vec!["-# Running `cargo test`", "answer"], "{log:?}");
+    assert_eq!(posted, vec!["● Running `cargo test`", "answer"], "{log:?}");
     let last = log.last().unwrap();
     assert_eq!(last.status, None, "the answer stands alone");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
@@ -526,7 +526,7 @@ async fn refused_edits_never_freeze_the_turn() {
         .collect();
     assert_eq!(
         &posted[..3],
-        &["Checking ▉", "-# Running `cargo build`", "Built ▉"],
+        &["Checking ▉", "● Running `cargo build`", "Built ▉"],
         "every step still lands as its own message: {log:?}"
     );
     assert!(
@@ -605,12 +605,22 @@ async fn quiet_posts_one_status_card_and_the_durable_answer() {
         chip_of(card).is_some(),
         "the quiet card is only the chip: {card:?}"
     );
-    let mut traffic_text = card.iter().map(component_text).collect::<Vec<_>>().join("\n");
+    let mut traffic_text = card
+        .iter()
+        .map(component_text)
+        .collect::<Vec<_>>()
+        .join("\n");
     traffic_text.push_str(
         &sent
             .iter()
             .filter(|s| s.method == "PATCH")
-            .flat_map(|s| s.body["components"].as_array().unwrap().iter().map(component_text))
+            .flat_map(|s| {
+                s.body["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(component_text)
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     );

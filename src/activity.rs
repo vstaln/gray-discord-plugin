@@ -39,12 +39,16 @@ const MAX_CARD_ROWS: usize = 5;
 /// stays well under.
 const MAX_CARD_CHARS: usize = 3600;
 
+/// Seconds between edits of a message showing tool blocks.
+pub const TOOL_EDIT_GAP: f64 = 1.5;
+
 /// Suggested cap for a tool preview line
 /// (`display.tool_preview_length: 80`).
 const MAX_PREVIEW_CHARS: usize = 80;
 
-/// Seconds between edits of the same bubble (Discord rate-limits edits).
-pub const MIN_EDIT_GAP: f64 = 1.0;
+/// Seconds between edits of a prose message (Discord rate-limits edits).
+/// Tool messages wait at least [`TOOL_EDIT_GAP`].
+pub const MIN_EDIT_GAP: f64 = 0.8;
 
 #[derive(Default)]
 struct ScopeState {
@@ -112,11 +116,6 @@ pub fn push_for(s: &Sink, scope: &str, row: Value) {
     };
     let scope = state.scopes.entry(scope.to_string()).or_default();
     let mut row = row;
-    // Tool output is never narrated (see the module docs); do not hold
-    // up to a kilobyte of it per queued row.
-    if let Some(map) = row.as_object_mut() {
-        map.remove("output");
-    }
     stamp(&mut row, scope);
     if scope.pending.len() >= MAX_PENDING {
         scope.pending.pop_front();
@@ -369,34 +368,15 @@ fn secs(ms: u64) -> String {
     format!("{:.1}s", ms as f64 / 1000.0)
 }
 
-/// Strip the noise a shell habit leaves in a command line — redirections and
-/// everything after the first separator — so a preview reads as one command.
+/// A shell row's command, whole: its first non-empty line, one line, capped at
+/// [`MAX_COMMAND_CHARS`]. Nothing is shortened (no `… +N`), so a reader sees
+/// exactly what ran.
 fn clean_command(detail: &str) -> String {
-    // `&&` becomes a separator first: splitting on a bare `&` would cut the
-    // redirect `2>&1` in half and leave a stray fragment.
-    let flat = one_line(detail).replace("&&", ";");
-    let parts: Vec<String> = flat
-        .split([';', '|'])
-        .map(|segment| {
-            segment
-                .split_whitespace()
-                .filter(|token| !is_redirect(token))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    let mut out = parts.first().cloned().unwrap_or_default();
-    if parts.len() > 1 {
-        out.push_str(&format!(" … +{}", parts.len() - 1));
-    }
-    out
-}
-
-/// `2>&1`, `>/dev/null`, a bare `&`: noise a status line must not carry.
-fn is_redirect(token: &str) -> bool {
-    let digits = token.trim_start_matches(|c: char| c.is_ascii_digit());
-    digits.starts_with('>') || digits == "&"
+    let first = detail
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    capped(&one_line(first), MAX_COMMAND_CHARS)
 }
 
 fn capped(text: &str, max: usize) -> String {
@@ -634,4 +614,313 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// How much of a turn's tool work a chat surface shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Each call: its command, a result line and a head/tail preview of its output.
+    #[default]
+    Verbose,
+    /// Each call's command and result line; never its output.
+    Commands,
+    /// No tool lines at all.
+    Off,
+}
+
+/// `progress_mode`: `"verbose"` (default), `"commands"` or `"off"`. Narration
+/// switched off (`activity_indicator: false`, or the legacy `quiet: true`) is
+/// `Off` whatever `progress_mode` says.
+pub fn mode(config: &Value) -> Mode {
+    if !enabled(config) {
+        return Mode::Off;
+    }
+    match config.get("progress_mode").and_then(Value::as_str) {
+        Some("commands") => Mode::Commands,
+        Some("off") => Mode::Off,
+        _ => Mode::Verbose,
+    }
+}
+
+/// Output lines shown at each end of a preview.
+const PREVIEW_EDGE: usize = 3;
+/// Output of at most this many lines is shown whole.
+const PREVIEW_WHOLE: usize = 2 * PREVIEW_EDGE;
+/// A command (or a tool's argument) in a block, in characters.
+const MAX_COMMAND_CHARS: usize = 240;
+/// One output line in a preview, in characters.
+const MAX_OUTPUT_LINE_CHARS: usize = 160;
+
+/// One markdown block per tool call, oldest first. A block is the call's
+/// command (or argument) in full, a `-# ⤷` result line with exit status,
+/// duration and line count, and — for shell calls in `Verbose` mode — a fenced
+/// head/tail preview of the output. Rows sharing a `call_id` are one call;
+/// other rows (provider retries, compaction) become one subtext line each.
+pub fn tool_blocks(rows: &[Value], mode: Mode) -> Vec<String> {
+    if mode == Mode::Off {
+        return Vec::new();
+    }
+    let mut blocks = Vec::new();
+    let mut emitted: Vec<&str> = Vec::new();
+    for row in rows {
+        let phase = row.get("phase").and_then(Value::as_str).unwrap_or("");
+        match phase {
+            "tool_ran" | "tool_finished" => {
+                let call = row.get("call_id").and_then(Value::as_str).unwrap_or("");
+                if !call.is_empty() {
+                    if emitted.contains(&call) {
+                        continue;
+                    }
+                    emitted.push(call);
+                }
+                let ran = call_row(rows, call, row, "tool_ran");
+                let fin = call_row(rows, call, row, "tool_finished");
+                blocks.push(call_block(ran, fin, mode));
+            }
+            _ => {
+                if let Some(text) = line(row, None) {
+                    blocks.push(format!("-# {text}"));
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// The last row of `phase` for `call`; an unnamed call is its own row.
+fn call_row<'a>(rows: &'a [Value], call: &str, row: &'a Value, phase: &str) -> Option<&'a Value> {
+    if call.is_empty() {
+        return (row.get("phase").and_then(Value::as_str) == Some(phase)).then_some(row);
+    }
+    rows.iter().rev().find(|r| {
+        r.get("phase").and_then(Value::as_str) == Some(phase)
+            && r.get("call_id").and_then(Value::as_str) == Some(call)
+    })
+}
+
+fn call_block(ran: Option<&Value>, fin: Option<&Value>, mode: Mode) -> String {
+    let base = ran.or(fin).unwrap_or(&Value::Null);
+    let tool = base.get("tool").and_then(Value::as_str).unwrap_or("");
+    let shell = matches!(tool, "bash" | "shell");
+    let detail = ran
+        .and_then(|r| r.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let done = fin.map(|fin| finish_call(fin, shell));
+    let mark = if done.as_ref().is_some_and(|d| d.failed) {
+        "✗"
+    } else {
+        "●"
+    };
+    let mut out = if shell {
+        let cmd = clean_command(detail);
+        match (cmd.is_empty(), done.is_some()) {
+            (true, true) => format!("{mark} Checked background job"),
+            (true, false) => "● Checking background job".to_string(),
+            (false, true) => format!("{mark} Ran {}", code_span(&cmd)),
+            (false, false) => format!("● Running {}", code_span(&cmd)),
+        }
+    } else {
+        let name = name_of(base);
+        let name = if name.is_empty() {
+            "Tool".to_string()
+        } else {
+            name
+        };
+        let arg = capped(&one_line(detail), MAX_COMMAND_CHARS);
+        if arg.is_empty() {
+            format!("{mark} {name}")
+        } else {
+            format!("{mark} {name} {}", code_span(&arg))
+        }
+    };
+    if shell {
+        let cwd = ran
+            .and_then(|r| r.get("cwd"))
+            .and_then(Value::as_str)
+            .map(one_line)
+            .filter(|cwd| !cwd.is_empty() && cwd != ".");
+        if let Some(cwd) = cwd {
+            out.push_str(&format!("  · {}", code_span(&cwd)));
+        }
+    }
+    let Some(done) = done else {
+        return out;
+    };
+    out.push_str(&format!("\n-# ⤷ {}", done.status));
+    if shell && mode == Mode::Verbose && !done.lines.is_empty() {
+        out.push('\n');
+        out.push_str(&output_block(&done.lines));
+    }
+    out
+}
+
+/// A finished call as its result line shows it.
+struct Finished<'a> {
+    /// What follows `⤷` on the result line.
+    status: String,
+    /// A non-zero exit, or gray flagged the call as an error.
+    failed: bool,
+    /// The output body: no header, squeeze note or untrusted-output tags.
+    lines: Vec<&'a str>,
+}
+
+fn finish_call(fin: &Value, shell: bool) -> Finished<'_> {
+    let raw = fin.get("output").and_then(Value::as_str).unwrap_or("");
+    let error = fin.get("error").and_then(Value::as_bool) == Some(true);
+    // Our own timing. A shell header carries its own duration instead.
+    let elapsed = fin.get("elapsed_ms").and_then(Value::as_u64).map(secs);
+    if shell {
+        let shown = split_shell_output(raw);
+        let failed = error || shown.exit.is_some_and(|code| code != 0);
+        let status = shown.summary.unwrap_or_else(|| {
+            let word = if failed { "failed" } else { "done" };
+            match &elapsed {
+                Some(time) => format!("{word} · {time}"),
+                None => word.to_string(),
+            }
+        });
+        return Finished {
+            status,
+            failed,
+            lines: shown.body,
+        };
+    }
+    let mut status = match raw.lines().next() {
+        Some(first) if !error => code_span(&capped(&one_line(first), MAX_OUTPUT_LINE_CHARS)),
+        _ if error => "failed".to_string(),
+        _ => "done".to_string(),
+    };
+    if let Some(time) = elapsed {
+        status = format!("{status} · {time}");
+    }
+    Finished {
+        status,
+        failed: error,
+        lines: Vec::new(),
+    }
+}
+
+/// gray's header line opens a shell call's `output`; the body follows it.
+const SQUEEZE_NOTE: &str = "squeezed by runs";
+const UNTRUSTED_OPEN: &str = "<untrusted-output>";
+const UNTRUSTED_CLOSE: &str = "</untrusted-output>";
+
+/// A shell call's `output` as gray sends it: the header `exit N · time ·
+/// lines · log …`, an optional squeeze note, then the body inside
+/// `<untrusted-output>` tags. The tags are never shown.
+struct ShellOutput<'a> {
+    exit: Option<i64>,
+    /// `exit N · time · lines`, as the result line shows it.
+    summary: Option<String>,
+    body: Vec<&'a str>,
+}
+
+fn split_shell_output(raw: &str) -> ShellOutput<'_> {
+    let mut lines: Vec<&str> = raw.lines().collect();
+    let mut exit = None;
+    let mut summary = None;
+    if let Some((code, text)) = lines.first().and_then(|line| shell_header(line)) {
+        exit = Some(code);
+        summary = Some(text);
+        lines.remove(0);
+        if lines
+            .first()
+            .is_some_and(|line| line.starts_with(SQUEEZE_NOTE))
+        {
+            lines.remove(0);
+        }
+    }
+    if lines
+        .first()
+        .is_some_and(|line| line.trim() == UNTRUSTED_OPEN)
+    {
+        lines.remove(0);
+    }
+    if lines
+        .last()
+        .is_some_and(|line| line.trim() == UNTRUSTED_CLOSE)
+    {
+        lines.pop();
+    }
+    ShellOutput {
+        exit,
+        summary,
+        body: lines,
+    }
+}
+
+/// Parses gray's bash header into its exit code and a summary without the
+/// log path. The masks note (`exit 0 (\`head\` masks …)`) is dropped with
+/// the rest of the first field, so the summary is `exit 0 · 1.2s · 26 lines`.
+fn shell_header(line: &str) -> Option<(i64, String)> {
+    let mut parts = line.split(" · ");
+    let head = parts.next()?.strip_prefix("exit ")?;
+    let end = head
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(head.len());
+    let rest = &head[end..];
+    if !(rest.is_empty() || rest.starts_with(" (")) {
+        return None;
+    }
+    let code: i64 = head[..end].parse().ok()?;
+    let mut summary = format!("exit {code}");
+    for part in parts.filter(|part| !part.starts_with("log ")) {
+        summary.push_str(" · ");
+        summary.push_str(&capped(&one_line(part), MAX_OUTPUT_LINE_CHARS));
+    }
+    Some((code, summary))
+}
+
+/// The head and tail of a shell call's output in one code block, with the
+/// hidden middle counted between them. The fence is longer than any backtick
+/// run in the output, so the output cannot close it.
+fn output_block(lines: &[&str]) -> String {
+    let clean: Vec<String> = lines
+        .iter()
+        .map(|line| capped(&strip_controls(line), MAX_OUTPUT_LINE_CHARS))
+        .collect();
+    let shown: Vec<String> = if clean.len() <= PREVIEW_WHOLE {
+        clean
+    } else {
+        let mut shown = clean[..PREVIEW_EDGE].to_vec();
+        shown.push(format!("… +{} lines", clean.len() - PREVIEW_WHOLE));
+        shown.extend_from_slice(&clean[clean.len() - PREVIEW_EDGE..]);
+        shown
+    };
+    let body = shown.join("\n");
+    let fence = "`".repeat(longest_backtick_run(&body).max(2) + 1);
+    format!("{fence}\n{body}\n{fence}")
+}
+
+/// Inline code that holds `text` whatever backticks it carries.
+fn code_span(text: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(text) + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+fn longest_backtick_run(text: &str) -> usize {
+    let (mut best, mut run) = (0, 0);
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// Tabs become spaces; other control characters are dropped.
+fn strip_controls(line: &str) -> String {
+    line.replace('\t', "    ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }

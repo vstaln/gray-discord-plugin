@@ -92,7 +92,7 @@ async fn invalid_content_rejected_before_http() {
 }
 
 #[test]
-fn chunk_cap_truncates_at_8_parts_with_notice() {
+fn chunk_cap_pages_the_overflow_into_a_read_the_rest_document() {
     let tmp = tempfile::tempdir().unwrap();
     let store = gray_discord::durable::Store::new(&tmp.path().join("queue.sqlite")).unwrap();
     store.enqueue("msg_chunk", "42", "q", None, 100).unwrap();
@@ -109,9 +109,15 @@ fn chunk_cap_truncates_at_8_parts_with_notice() {
             .ack(&part.id, part.part, &format!("m{}", part.part))
             .unwrap();
     }
+    // Seven text parts, then one pager document carrying the rest of the answer.
     assert_eq!(parts.len(), 8);
-    assert!(parts[7].content.contains("… (truncated,"));
-    assert!(parts[7].content.contains("more characters not sent)"));
+    assert!(parts[..7].iter().all(|part| part.document_json.is_none()));
+    assert_eq!(parts[7].document_version, Some(1));
+    let document = parts[7]
+        .document_json
+        .as_deref()
+        .expect("overflow is a pager document");
+    assert!(document.contains("components"), "{document}");
 }
 
 #[tokio::test]
