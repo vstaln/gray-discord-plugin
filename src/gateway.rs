@@ -224,6 +224,38 @@ fn activity_key(channel: &str, conversation: &str) -> String {
     format!("{channel}\u{0}{conversation}")
 }
 
+/// Final delivery that Discord refused, carried off the turn's worker (see
+/// `Runtime::settle_job`).
+struct SettleJob {
+    channel: String,
+    /// The timeline's own slot (see `settle_slot`).
+    slot: String,
+    uploads: Vec<crate::media_tags::Upload>,
+    /// The answer goes out durably instead: its preview is retracted, and its
+    /// messages are left out of the retries.
+    durable_answer: bool,
+    /// The wait Discord asked for when the card was refused, if it was.
+    first_wait: Option<f64>,
+    /// The activity card, sent once the turn's messages have settled.
+    card: Option<String>,
+}
+
+/// Retries for one refused message before a turn is left as it stands.
+const SETTLE_ROUNDS: u32 = 10;
+/// Longest a turn's own Discord send waits on a rate limit. Past it the send
+/// reports busy and the settle path retries, so the worker never sleeps on
+/// Discord's limits.
+const TURN_RATE_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+
+static SETTLE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A slot of its own for a settling timeline: settling never touches the
+/// channel's slot, which the next turn uses.
+fn settle_slot(key: &str) -> String {
+    let seq = SETTLE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("settle\u{0}{seq}\u{0}{key}")
+}
+
 /// The `value` of the modal input `custom_id` anywhere in a submitted
 /// modal's components (a Label wraps its input one level down).
 fn find_value(value: &Value, custom_id: &str) -> Option<String> {
@@ -311,6 +343,8 @@ pub struct Runtime<R, D> {
         tokio::sync::Mutex<std::collections::HashMap<String, crate::stream::Timeline>>,
     >,
     busy_backoff: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    /// Final deliveries Discord refused, waiting for `dispatch_settles`.
+    settle: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SettleJob>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -334,6 +368,7 @@ impl<R, D> Runtime<R, D> {
                 std::collections::HashMap::new(),
             )),
             busy_backoff: Default::default(),
+            settle: Default::default(),
         }
     }
 
@@ -481,8 +516,11 @@ impl<R, D> Runtime<R, D> {
             crate::activity::begin(sink, conversation);
         }
         let key = activity_key(channel, conversation);
+        // A new turn always gets a fresh timeline (`started` = now); any
+        // leftover one for this conversation is replaced, never reused.
         let mut timeline = crate::stream::Timeline::new(text, self.now_secs())
-            .with_quiet(crate::stream::quiet(&self.config));
+            .with_quiet(crate::stream::quiet(&self.config))
+            .with_progress(crate::activity::mode(&self.config));
         if let Some(stop) = buttons.stop {
             timeline = timeline.with_stop(stop);
         }
@@ -541,7 +579,9 @@ impl<R, D> Runtime<R, D> {
     /// tags already taken out) the streamed reply becomes that answer in
     /// place, with `uploads` (the files those tags named) shown inside the
     /// card; `landed` says where it landed, or is `None` when the caller
-    /// must post it durably.
+    /// must post it durably. The worker makes one attempt; a refused card
+    /// settles in the background (see `settle_job`), so Discord's waits
+    /// never hold the worker or the next turn.
     pub async fn finish_turn(
         &self,
         channel: &str,
@@ -552,79 +592,196 @@ impl<R, D> Runtime<R, D> {
     ) -> Settled {
         self.absorb_rows(channel, conversation).await;
         let key = activity_key(channel, conversation);
+        let slot = settle_slot(&key);
         let now = self.now_secs();
         let shown = uploads.len().min(crate::stream::MAX_MEDIA);
+        // The timeline moves to its own slot, so the channel is free for the
+        // next turn at once.
         let adopted = {
             let mut timelines = self.timelines.lock().await;
-            match timelines.get_mut(&key) {
-                Some(timeline) => {
-                    let adopted = answer.is_some_and(|answer| timeline.adopt(answer));
-                    if adopted {
-                        timeline.attach(
-                            uploads[..shown]
-                                .iter()
-                                .map(|upload| crate::stream::Media {
-                                    name: upload.name.clone(),
-                                    visual: upload.is_visual(),
-                                })
-                                .collect(),
-                        );
-                    }
-                    timeline.settle(status, now);
-                    adopted
+            let Some(mut timeline) = timelines.remove(&key) else {
+                drop(timelines);
+                if let Some(card) = self.take_activity_card(conversation) {
+                    self.card_later(channel, &slot, card);
                 }
-                None => false,
-            }
-        };
-        // A busy Discord (rate limit, 5xx, timeout) gets a couple more
-        // chances before the answer falls back to a durable post.
-        for _ in 0..3 {
-            let Some(wait) = self
-                .publish_timeline(channel, conversation, true, uploads)
-                .await
-            else {
-                break;
+                return Settled::default();
             };
-            tokio::time::sleep(std::time::Duration::from_secs_f64(wait.clamp(0.5, 5.0))).await;
-        }
-        let timeline = self.timelines.lock().await.remove(&key);
-        if let Some(ref sink) = self.activity {
-            let history = crate::activity::finish(sink, conversation);
-            if crate::activity::enabled(&self.config) && crate::activity::card_enabled(&self.config)
-            {
-                if let Some(card) = crate::activity::render_card(&history) {
-                    self.publish_activity_card(channel, &card).await;
-                }
+            let adopted = answer.is_some_and(|answer| timeline.adopt(answer));
+            if adopted {
+                timeline.attach(
+                    uploads[..shown]
+                        .iter()
+                        .map(|upload| crate::stream::Media {
+                            name: upload.name.clone(),
+                            visual: upload.is_visual(),
+                        })
+                        .collect(),
+                );
+            }
+            timeline.settle(status, now);
+            timelines.insert(slot.clone(), timeline);
+            adopted
+        };
+        // One attempt: whether the answer landed decides how the item completes.
+        let busy = self.publish_at(channel, &slot, true, uploads, false).await;
+        let (status_card, landed) = match self.timelines.lock().await.get(&slot) {
+            Some(timeline) => (timeline.status_card(now), timeline.landed(now)),
+            None => (None, None),
+        };
+        let durable = adopted && landed.is_none();
+        let card = self.take_activity_card(conversation);
+        if busy.is_some() || durable {
+            self.settle_later(SettleJob {
+                channel: channel.to_string(),
+                slot,
+                uploads: uploads.to_vec(),
+                durable_answer: durable,
+                first_wait: busy,
+                card,
+            });
+        } else {
+            self.timelines.lock().await.remove(&slot);
+            if let Some(card) = card {
+                self.card_later(channel, &slot, card);
             }
         }
-        let Some(timeline) = timeline else {
-            return Settled::default();
-        };
         let mut settled = Settled {
             landed: None,
-            status_card: timeline.status_card(now),
+            status_card,
             media_shown: 0,
         };
         if !adopted {
             return settled;
         }
-        settled.landed = timeline.landed(now);
+        if durable {
+            crate::eprintln_stamped!("[discord] the answer did not land in place in channel {channel}; posting it durably");
+            settled.status_card = None;
+            return settled;
+        }
+        settled.landed = landed;
         if settled.landed.is_some() {
             settled.media_shown = shown;
         }
-        if settled.landed.is_none() {
-            // The answer did not fully land. Retract its preview so the
-            // durable resend does not leave the same words on screen twice;
-            // the tool lines above it stay as the turn's record.
-            crate::eprintln_stamped!("[discord] the answer did not land in place in channel {channel}; posting it durably");
-            if let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) {
-                for id in timeline.answer_ids() {
-                    let _ = rest.delete_message(ch, &id).await;
-                }
-            }
-            settled.status_card = None;
-        }
         settled
+    }
+
+    /// The turn's activity card text, when it shows one. Takes the turn's
+    /// rows out of the sink; no Discord I/O.
+    fn take_activity_card(&self, conversation: &str) -> Option<String> {
+        let sink = self.activity.as_ref()?;
+        let history = crate::activity::finish(sink, conversation);
+        if crate::activity::enabled(&self.config) && crate::activity::card_enabled(&self.config) {
+            crate::activity::render_card(&history)
+        } else {
+            None
+        }
+    }
+
+    /// Queue a turn's activity card for `dispatch_settles`, off the worker.
+    fn card_later(&self, channel: &str, slot: &str, card: String) {
+        self.settle_later(SettleJob {
+            channel: channel.to_string(),
+            slot: slot.to_string(),
+            uploads: Vec::new(),
+            durable_answer: false,
+            first_wait: None,
+            card: Some(card),
+        });
+    }
+
+    /// Queue a turn's remaining delivery for `dispatch_settles`.
+    fn settle_later(&self, job: SettleJob) {
+        self.settle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(job);
+    }
+
+    /// Run every queued settle inline, oldest first. The daemon never
+    /// calls this — `dispatch_settles` drains the queue beside its workers —
+    /// but a runtime driven without it (tests, one-shot turns) still needs
+    /// refused previews retracted and turn cards sent.
+    pub async fn drain_settles(&self) {
+        loop {
+            let next = self
+                .settle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match next {
+                Some(job) => self.settle_job(job).await,
+                None => return,
+            }
+        }
+    }
+
+    /// Finish a turn's delivery off its worker: retract the preview of an
+    /// answer resent durably, retry the card while Discord asks for waits,
+    /// then send the activity card and free the slot.
+    async fn settle_job(&self, job: SettleJob) {
+        if job.durable_answer {
+            let ids = self
+                .timelines
+                .lock()
+                .await
+                .get(&job.slot)
+                .map(|timeline| timeline.answer_ids())
+                .unwrap_or_default();
+            for id in ids {
+                self.retract_message(&job.channel, &id).await;
+            }
+        }
+        let mut wait = job.first_wait;
+        let mut rounds = 0;
+        while let Some(seconds) = wait {
+            if rounds == SETTLE_ROUNDS {
+                crate::eprintln_stamped!(
+                    "[discord] the turn's card in channel {} did not settle; leaving it as is",
+                    job.channel
+                );
+                break;
+            }
+            rounds += 1;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(seconds.clamp(0.5, 30.0))).await;
+            wait = self
+                .publish_at(
+                    &job.channel,
+                    &job.slot,
+                    true,
+                    &job.uploads,
+                    job.durable_answer,
+                )
+                .await;
+        }
+        self.timelines.lock().await.remove(&job.slot);
+        if let Some(card) = &job.card {
+            self.publish_activity_card(&job.channel, card).await;
+        }
+    }
+
+    /// Delete one message, waiting out Discord's rate limit a bounded number
+    /// of times.
+    async fn retract_message(&self, channel: &str, id: &str) {
+        let (Some(rest), Ok(ch)) = (self.rest.as_ref(), channel.parse::<u64>()) else {
+            return;
+        };
+        for _ in 0..SETTLE_ROUNDS {
+            match rest.delete_message(ch, id).await {
+                Ok(()) => return,
+                Err(error) => match failure(&error) {
+                    crate::stream::Failure::Busy(wait) => {
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(
+                            wait.clamp(0.5, 30.0),
+                        ))
+                        .await;
+                    }
+                    _ => {
+                        log_failure("delete", channel, &error);
+                        return;
+                    }
+                },
+            }
+        }
     }
 
     /// Move the rows the runner has read into this turn's timeline.
@@ -638,9 +795,11 @@ impl<R, D> Runtime<R, D> {
         let key = activity_key(channel, conversation);
         let now = self.now_secs();
         let mut timelines = self.timelines.lock().await;
-        let timeline = timelines
-            .entry(key)
-            .or_insert_with(|| crate::stream::Timeline::new(false, now).with_quiet(quiet));
+        let timeline = timelines.entry(key).or_insert_with(|| {
+            crate::stream::Timeline::new(false, now)
+                .with_quiet(quiet)
+                .with_progress(crate::activity::mode(&self.config))
+        });
         for row in rows {
             // Narration off hides tool lines; quiet still absorbs them —
             // its status card shows the tally, just never the lines.
@@ -667,6 +826,26 @@ impl<R, D> Runtime<R, D> {
         finishing: bool,
         uploads: &[crate::media_tags::Upload],
     ) -> Option<f64> {
+        self.publish_at(
+            channel,
+            &activity_key(channel, conversation),
+            finishing,
+            uploads,
+            false,
+        )
+        .await
+    }
+
+    /// `publish_timeline` for the timeline at `key`. With `hold_answer` the
+    /// turn's answer is left out: it is being sent durably instead.
+    async fn publish_at(
+        &self,
+        channel: &str,
+        key: &str,
+        finishing: bool,
+        uploads: &[crate::media_tags::Upload],
+        hold_answer: bool,
+    ) -> Option<f64> {
         let files_for = |body: &crate::stream::Card| -> Vec<crate::media_tags::Upload> {
             body.files
                 .iter()
@@ -677,12 +856,32 @@ impl<R, D> Runtime<R, D> {
         let Ok(ch) = channel.parse::<u64>() else {
             return None;
         };
-        let key = activity_key(channel, conversation);
         let now = self.now_secs();
-        let ops = match self.timelines.lock().await.get(&key) {
-            Some(timeline) => timeline.plan(now, crate::activity::MIN_EDIT_GAP, finishing),
+        let rest = self
+            .rest
+            .as_ref()
+            .map(|rest| rest.with_budget(TURN_RATE_BUDGET));
+        let (ops, held) = match self.timelines.lock().await.get(key) {
+            Some(timeline) => {
+                let ops = timeline.plan(now, crate::activity::MIN_EDIT_GAP, finishing);
+                // The answer is the turn's last block: its messages are the
+                // ones in the newest block.
+                let held = hold_answer
+                    .then(|| timeline.render(now).iter().map(|card| card.block).max())
+                    .flatten();
+                (ops, held)
+            }
             None => return None,
         };
+        let ops: Vec<crate::stream::Op> = ops
+            .into_iter()
+            .filter(|op| match op {
+                crate::stream::Op::Post { body, .. } | crate::stream::Op::Edit { body, .. } => {
+                    Some(body.block) != held
+                }
+                crate::stream::Op::Delete { .. } => true,
+            })
+            .collect();
         let components_for = |body: &crate::stream::Card| -> Vec<Value> {
             let mut components = body.components.clone();
             if let Some(pages) = &body.pager {
@@ -707,7 +906,7 @@ impl<R, D> Runtime<R, D> {
                 crate::stream::Op::Post { card, body } => {
                     let files = files_for(&body);
                     let components = components_for(&body);
-                    let sent = match self.rest {
+                    let sent = match rest {
                         Some(ref rest) if files.is_empty() => {
                             rest.send_v2(ch, &components, None).await
                         }
@@ -717,7 +916,7 @@ impl<R, D> Runtime<R, D> {
                     };
                     let at = self.now_secs();
                     let mut timelines = self.timelines.lock().await;
-                    let timeline = timelines.get_mut(&key)?;
+                    let timeline = timelines.get_mut(key)?;
                     match sent {
                         Ok(id) => timeline.posted(card, &id, &body, at),
                         Err(error) => {
@@ -746,7 +945,7 @@ impl<R, D> Runtime<R, D> {
                 crate::stream::Op::Edit { card, id, body } => {
                     let files = files_for(&body);
                     let components = components_for(&body);
-                    let outcome = match self.rest {
+                    let outcome = match rest {
                         Some(ref rest) if files.is_empty() => {
                             rest.edit_v2(ch, &id, &components).await
                         }
@@ -755,7 +954,7 @@ impl<R, D> Runtime<R, D> {
                     };
                     let at = self.now_secs();
                     let mut timelines = self.timelines.lock().await;
-                    let timeline = timelines.get_mut(&key)?;
+                    let timeline = timelines.get_mut(key)?;
                     match outcome {
                         Ok(()) => timeline.edited(card, &body, at),
                         // Only this message is affected: the turn goes on,
@@ -781,7 +980,7 @@ impl<R, D> Runtime<R, D> {
                             log_failure("delete", channel, &error);
                         }
                     }
-                    if let Some(timeline) = self.timelines.lock().await.get_mut(&key) {
+                    if let Some(timeline) = self.timelines.lock().await.get_mut(key) {
                         timeline.deleted(card);
                     }
                 }
@@ -880,7 +1079,7 @@ where
             .config
             .get("timeout_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(600)
+            .unwrap_or(crate::runner::DEFAULT_HARD_CAP_SECS)
             .saturating_add(120);
         let mint = |kind: &str, resource: &str, ttl: u64| {
             self.store
@@ -904,10 +1103,27 @@ where
         }
 
         let input = match item.input_json.as_deref() {
-            Some(encoded) => RunInput::Structured(
-                serde_json::from_str(encoded)
-                    .map_err(|_| "queued structured input is invalid".to_string())?,
-            ),
+            Some(encoded) => match serde_json::from_str(encoded) {
+                Ok(input) => RunInput::Structured(input),
+                Err(_) => {
+                    // The turn never ran. Settle its card and fail the item
+                    // here: a bare `?` would leave the card "Working" and
+                    // kill the worker.
+                    let settled = self
+                        .finish_turn(
+                            &item.channel,
+                            &item.conversation,
+                            None,
+                            &[],
+                            crate::stream::Status::Failed("queued input is invalid".to_string()),
+                        )
+                        .await;
+                    self.fail_turn(&item.id, "agent_failed", &settled)?;
+                    self.remove_reaction(&item.channel, &item.id, "👀").await;
+                    self.add_reaction(&item.channel, &item.id, "❌").await;
+                    return Ok(true);
+                }
+            },
             None => RunInput::Text(item.prompt.clone()),
         };
         let mut run_fut = Box::pin((self.runner)(
@@ -999,11 +1215,19 @@ where
         let status = match &result {
             Ok(_) => crate::stream::Status::Done,
             Err(RunError::Budget(_)) => crate::stream::Status::Failed("hit the budget".to_string()),
-            Err(RunError::Timeout) => crate::stream::Status::Failed("timed out".to_string()),
+            Err(RunError::Timeout) => {
+                crate::stream::Status::Failed("hit the time limit".to_string())
+            }
+            Err(RunError::Stalled(secs)) => crate::stream::Status::Failed(format!(
+                "No activity for {} — stopped",
+                crate::runner::human_duration(*secs)
+            )),
             Err(RunError::RequestLimit(n)) => {
                 crate::stream::Status::Failed(format!("hit the {n}-request limit"))
             }
-            Err(_) => crate::stream::Status::Failed("failed".to_string()),
+            Err(e) => {
+                crate::stream::Status::Failed(e.reason().unwrap_or_else(|| "failed".to_string()))
+            }
         };
         let loaded = crate::media_tags::load_pairs(&media);
         let uploads: Vec<crate::media_tags::Upload> =
@@ -1049,6 +1273,11 @@ where
             }
             Err(RunError::Timeout) => {
                 self.fail_turn(&item.id, "timeout", &settled)?;
+                self.remove_reaction(&item.channel, &item.id, "👀").await;
+                self.add_reaction(&item.channel, &item.id, "❌").await;
+            }
+            Err(RunError::Stalled(_)) => {
+                self.fail_turn(&item.id, "stalled", &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
@@ -1144,13 +1373,32 @@ where
     D: Fn(OutboxPart) -> FutD + Send + Sync + Clone + 'static,
     FutD: std::future::Future<Output = Result<String, String>> + Send + 'static,
 {
+    /// Hands each queued settle to a task of its own, so one turn's card
+    /// retries never hold up another turn's.
+    async fn dispatch_settles(self: std::sync::Arc<Self>) -> Result<(), String> {
+        loop {
+            let next = self
+                .settle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match next {
+                Some(job) => {
+                    let runtime = self.clone();
+                    tokio::spawn(async move { runtime.settle_job(job).await });
+                }
+                None => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+    }
+
     pub async fn run(&self) -> Result<(), String> {
         self.store.recover()?;
         let concurrency = self
             .config
             .get("concurrency")
             .and_then(Value::as_u64)
-            .unwrap_or(2) as usize;
+            .unwrap_or(4) as usize;
         let channel_id = self
             .config
             .get("channel_id")
@@ -1186,6 +1434,8 @@ where
                 }
             }
         });
+        let r = rt.clone();
+        set.spawn(async move { r.dispatch_settles().await });
         let r = rt.clone();
         let ch = channel_id.clone();
         set.spawn(async move {

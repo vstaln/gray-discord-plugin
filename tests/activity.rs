@@ -515,6 +515,7 @@ async fn the_opt_in_card_still_follows_the_bubble() {
     );
     rt.report_activity_for("42", "chat:one", false).await;
     rt.report_activity_for("42", "chat:one", true).await;
+    rt.drain_settles().await;
 
     rt.begin_activity("42", "chat:one").await;
     activity::push_for(
@@ -562,6 +563,7 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
     );
     rt.report_activity_for("42", "chat:rest", false).await;
     rt.report_activity_for("42", "chat:rest", true).await;
+    rt.drain_settles().await;
 
     let sent: Vec<common::Sent> = stub
         .sent

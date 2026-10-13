@@ -117,6 +117,7 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
         }
     }
     int_in(data, "timeout_seconds", 1, 86400)?;
+    int_in(data, "inactivity_seconds", 1, 86400)?;
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;
     int_in(data, "queue_capacity", 1, 100000)?;

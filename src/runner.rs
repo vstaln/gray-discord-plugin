@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 
 use crate::budget::{Budget, BudgetBlocked};
 
+/// Hard cap on one turn when config has no `timeout_seconds`.
+pub const DEFAULT_HARD_CAP_SECS: u64 = 14_400;
+/// Silence from gray that ends a turn when config has no `inactivity_seconds`.
+pub const DEFAULT_INACTIVITY_SECS: u64 = 600;
+
 /// Cap on one NDJSON stdout line (matches the Python `limit=1024*1024`).
 const LINE_CAP: usize = 1024 * 1024;
 
@@ -14,12 +19,18 @@ const LINE_CAP: usize = 1024 * 1024;
 pub enum RunError {
     Busy,
     Budget(BudgetBlocked),
+    /// The hard cap on the whole turn (`timeout_seconds`) was reached.
     Timeout,
+    /// No output from gray for the inactivity window (`inactivity_seconds`).
+    Stalled(u64),
     /// The turn used all `max_requests` provider requests and was stopped.
     RequestLimit(u64),
     Spawn(String),
     Protocol(String),
-    Exit(Option<i32>),
+    /// gray exited non-zero; the last stderr line, when there was one.
+    Exit(Option<i32>, Option<String>),
+    /// gray finished with an `error` row; its one-line reason.
+    Agent(String),
     Incomplete,
     Empty,
     Io(String),
@@ -30,28 +41,47 @@ impl std::fmt::Display for RunError {
         match self {
             Self::Busy => f.write_str("This conversation is busy"),
             Self::Budget(e) => write!(f, "{e}"),
-            Self::Timeout => f.write_str("gray turn timed out"),
+            Self::Timeout => f.write_str("gray turn hit its time limit"),
+            Self::Stalled(secs) => write!(
+                f,
+                "gray turn stalled: no activity for {}",
+                human_duration(*secs)
+            ),
             Self::RequestLimit(n) => write!(f, "gray turn hit its {n}-request limit"),
             Self::Spawn(_) => f.write_str("cannot start gray agent"),
             Self::Protocol(_) => {
                 f.write_str("Invalid agent JSON output; upgrade gray to a compatible version")
             }
-            Self::Exit(Some(n)) => write!(
+            Self::Exit(Some(n), _) => write!(
                 f,
                 "gray exited with code {n}; not retrying possible side effects"
             ),
-            Self::Exit(None) => {
+            Self::Exit(None, _) => {
                 f.write_str("gray exited without a status; not retrying possible side effects")
             }
             Self::Incomplete => f.write_str(
                 "Agent did not return a completed result; actions may already have occurred",
             ),
             Self::Empty => f.write_str("Agent returned no final answer"),
+            Self::Agent(_) => f.write_str("gray turn failed"),
             Self::Io(_) => f.write_str("gray turn failed; check connectivity"),
         }
     }
 }
 impl std::error::Error for RunError {}
+
+impl RunError {
+    /// One line on why the turn failed, for the card footer, when known.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Agent(reason) => Some(reason.clone()),
+            Self::Exit(code, reason) => reason
+                .clone()
+                .or_else(|| code.map(|n| format!("gray exited with code {n}"))),
+            _ => None,
+        }
+    }
+}
 
 /// Boxed progress callback: one `--json` progress row in, nothing out,
 /// never fails. The whole disclosed row (phase, tool, safe detail/output,
@@ -154,6 +184,9 @@ pub async fn steer(conversation: &str, text: &str) -> bool {
 #[derive(Default)]
 pub struct RunOpts<'a> {
     pub timeout_secs: Option<u64>,
+    /// Stop after this long with no output from gray. Defaults to
+    /// `inactivity_seconds` from config (600 when absent).
+    pub inactivity_secs: Option<u64>,
     pub progress: Option<ProgressFn<'a>>,
     pub receipt: Option<&'a mut Value>,
     /// Per-turn model override (`/model set`). Appended as `--model` only
@@ -222,10 +255,22 @@ pub async fn run_gray_input(
         None => config
             .get("timeout_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(600),
+            .unwrap_or(DEFAULT_HARD_CAP_SECS),
     };
     if timeout_secs == 0 {
         return Err(RunError::Io("Timeout must be positive".to_string()));
+    }
+    let inactivity_secs = match opts.inactivity_secs {
+        Some(n) => n,
+        None => config
+            .get("inactivity_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_INACTIVITY_SECS),
+    };
+    if inactivity_secs == 0 {
+        return Err(RunError::Io(
+            "Inactivity window must be positive".to_string(),
+        ));
     }
     match &input {
         RunInput::Text(prompt) if prompt.trim().is_empty() || prompt.chars().count() > 32000 => {
@@ -435,7 +480,13 @@ pub async fn run_gray_input(
         }
         ledger = Some(budget);
     }
-    let session_id = state
+    let mut base_args = args;
+    if let Some(model) = opts.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        base_args.push("--model".to_string());
+        base_args.push(model.clone());
+    }
+    // Resume the pinned session, else the newest transcript in the home.
+    let mut session_arg = state
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -445,104 +496,6 @@ pub async fn run_gray_input(
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
         });
-    if let Some(sid) = &session_id {
-        args.push("--session".to_string());
-        args.push(sid.clone());
-    }
-    if let Some(model) = opts.model.as_ref().filter(|m| !m.trim().is_empty()) {
-        args.push("--model".to_string());
-        args.push(model.clone());
-    }
-
-    let mut cmd = tokio::process::Command::new(&args[0]);
-    cmd.args(&args[1..]);
-    cmd.current_dir(&work);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
-    // Own process group so a timeout SIGKILL reaches grandchildren too.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
-    }
-    cmd.env_clear();
-    for (k, v) in std::env::vars_os() {
-        let Some(k_str) = k.to_str() else { continue };
-        if k_str.starts_with("GRAY_")
-            || k_str.starts_with("DISCORD_")
-            || k_str.starts_with("OPENAI_")
-        {
-            continue;
-        }
-        cmd.env(k, v);
-    }
-    cmd.env("GRAY_HOME", &home);
-    cmd.env(
-        "PATH",
-        child_path(
-            std::env::var_os("PATH"),
-            std::env::var_os("HOME").map(PathBuf::from),
-            Path::new(gray_bin),
-        ),
-    );
-    // A job the model adds with a plain `gray cron add` inherits this
-    // conversation's binding, so it comes back to the channel it was added
-    // from. Absent outside a chat: the job is just local.
-    if let Some(origin) = crate::cron::origin_env(&home) {
-        cmd.env("GRAY_CRON_ORIGIN", origin);
-    }
-    cmd.env("GRAY_SKILLS_ONLY", "1");
-    // Tool narration is safe to show; raw model reasoning is not. Keep the
-    // wire quiet even when the activity bubble is enabled, matching the bridge.
-    cmd.env("GRAY_SHOW_REASONING", "0");
-    // Live replies: gray streams the prose as `text` rows and
-    // the gateway edits the reply in place. A gray without the flag just
-    // ignores it, and the answer is posted whole at the end as before.
-    if crate::stream::enabled(config) {
-        cmd.env("GRAY_STREAM_TEXT", "1");
-    }
-    cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
-    cmd.env("GRAY_STDIN_STEER", "1");
-    if opts.ask.is_some() {
-        cmd.env("GRAY_JSON_ASK", "1");
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
-    let pid = child.id().unwrap_or(0);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RunError::Spawn("no stdout".to_string()))?;
-    let stdin: Option<SharedStdin> = child
-        .stdin
-        .take()
-        .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(Some(s))));
-    let live = stdin.clone().map(|s| LiveStdin::register(conversation, s));
-    let turn_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let asks = match (opts.ask.take(), stdin.clone()) {
-        (Some(handler), Some(stdin)) => Some(AskWire {
-            handler,
-            stdin,
-            turn_over: turn_over.clone(),
-        }),
-        _ => None,
-    };
-    // Whatever way the turn ends, an open question card closes with it.
-    struct TurnOver(std::sync::Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for TurnOver {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    let _turn_over = TurnOver(turn_over);
-    // Move progress into an owned callback struct so the consume future
-    // captures locals — never `opts` itself (receipt is only touched after
-    // the await, like the Python's post-turn `receipt.update(final)`).
     let mut progress_cb = ProgressCb {
         call: |ctx, row| {
             if let Some(inner) = ctx.inner.as_deref_mut() {
@@ -553,104 +506,376 @@ pub async fn run_gray_input(
             inner: opts.progress.take(),
         },
     };
-    let consume = async {
-        consume_ndjson(
-            stdout,
-            &state_path,
-            &generation,
-            &mut state,
-            Some(&mut progress_cb),
-            asks.as_ref(),
-        )
-        .await
-    };
-    let outcome =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await;
-    // However the read ended, the child takes no more input: unregister it so
-    // a later message is not steered into it, then close its stdin.
-    drop(live);
-    if let Some(stdin) = stdin {
-        tokio::spawn(async move {
-            *stdin.lock().await = None;
-        });
-    }
-    let consumed = match outcome {
-        Ok(Ok(consumed)) => consumed,
-        Ok(Err(e)) => {
-            kill_group(pid);
-            let _ = child.wait().await;
-            return Err(e);
+    let ask = opts.ask.take();
+    let mut lock = Some(_lock);
+    let spawn_cmd = |args: &[String]| -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&args[0]);
+        cmd.args(&args[1..]);
+        cmd.current_dir(&work);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        // Own process group so a timeout SIGKILL reaches grandchildren too.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
         }
-        // Timeout: kill the whole process group (Python: killpg SIGKILL).
-        Err(_) => {
-            kill_group(pid);
-            let _ = child.wait().await;
-            return Err(RunError::Timeout);
+        cmd.env_clear();
+        for (k, v) in std::env::vars_os() {
+            let Some(k_str) = k.to_str() else { continue };
+            if k_str.starts_with("GRAY_")
+                || k_str.starts_with("DISCORD_")
+                || k_str.starts_with("OPENAI_")
+            {
+                continue;
+            }
+            cmd.env(k, v);
         }
+        cmd.env("GRAY_HOME", &home);
+        cmd.env(
+            "PATH",
+            child_path(
+                std::env::var_os("PATH"),
+                std::env::var_os("HOME").map(PathBuf::from),
+                Path::new(gray_bin),
+            ),
+        );
+        // A job the model adds with a plain `gray cron add` inherits this
+        // conversation's binding, so it comes back to the channel it was added
+        // from. Absent outside a chat: the job is just local.
+        if let Some(origin) = crate::cron::origin_env(&home) {
+            cmd.env("GRAY_CRON_ORIGIN", origin);
+        }
+        cmd.env("GRAY_SKILLS_ONLY", "1");
+        // Tool narration is safe to show; raw model reasoning is not. Keep the
+        // wire quiet even when the activity bubble is enabled, matching the bridge.
+        cmd.env("GRAY_SHOW_REASONING", "0");
+        // Live replies: gray streams the prose as `text` rows and
+        // the gateway edits the reply in place. A gray without the flag just
+        // ignores it, and the answer is posted whole at the end as before.
+        if crate::stream::enabled(config) {
+            cmd.env("GRAY_STREAM_TEXT", "1");
+        }
+        cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
+        cmd.env("GRAY_STDIN_STEER", "1");
+        if ask.is_some() {
+            cmd.env("GRAY_JSON_ASK", "1");
+        }
+        cmd
     };
-    if consumed.terminal.is_some() {
-        // The terminal row is the answer and is published now. The child gets
-        // a short grace period to exit on its own; the reaper kills it after
-        // that and keeps the conversation lock until the child is gone.
-        set_reaping(conversation, true);
-        tokio::spawn(reap_after_result(child, pid, _lock, conversation.to_string()));
-    } else {
-        let status = match tokio::time::timeout(TURN_EXIT_GRACE, child.wait()).await {
-            Ok(status) => status.map_err(|_| RunError::Spawn("wait failed".to_string()))?,
+
+    loop {
+        let mut args = base_args.clone();
+        if let Some(sid) = &session_arg {
+            args.push("--session".to_string());
+            args.push(sid.clone());
+        }
+        let mut child = spawn_cmd(&args[..])
+            .spawn()
+            .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
+        let pid = child.id().unwrap_or(0);
+        let mut stderr_tail = StderrTail::start(child.stderr.take());
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RunError::Spawn("no stdout".to_string()))?;
+        let stdin: Option<SharedStdin> = child
+            .stdin
+            .take()
+            .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(Some(s))));
+        let live = stdin.clone().map(|s| LiveStdin::register(conversation, s));
+        let turn_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asks = match (ask.clone(), stdin.clone()) {
+            (Some(handler), Some(stdin)) => Some(AskWire {
+                handler,
+                stdin,
+                turn_over: turn_over.clone(),
+            }),
+            _ => None,
+        };
+        // Whatever way the turn ends, an open question card closes with it.
+        struct TurnOver(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for TurnOver {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _turn_over = TurnOver(turn_over);
+        let consume = async {
+            consume_ndjson(
+                stdout,
+                &state_path,
+                &generation,
+                &mut state,
+                Some(&mut progress_cb),
+                asks.as_ref(),
+                inactivity_secs,
+            )
+            .await
+        };
+        // Hard cap on the whole turn; the inactivity watchdog inside
+        // `consume_ndjson` is what stops a turn that has gone quiet.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), consume).await;
+        // However the read ended, the child takes no more input: unregister it so
+        // a later message is not steered into it, then close its stdin.
+        drop(live);
+        if let Some(stdin) = stdin {
+            tokio::spawn(async move {
+                *stdin.lock().await = None;
+            });
+        }
+        let consumed = match outcome {
+            Ok(Ok(consumed)) => consumed,
+            Ok(Err(e)) => {
+                kill_group(pid);
+                let _ = child.wait().await;
+                log_failed_turn(pid, &e, &stderr_tail.text().await);
+                return Err(e);
+            }
+            // Hard cap: kill the whole process group (Python: killpg SIGKILL).
             Err(_) => {
                 kill_group(pid);
-                child
-                    .wait()
-                    .await
-                    .map_err(|_| RunError::Spawn("wait failed".to_string()))?
+                let _ = child.wait().await;
+                let e = RunError::Timeout;
+                log_failed_turn(pid, &e, &stderr_tail.text().await);
+                return Err(e);
             }
         };
-        if !status.success() {
-            return Err(RunError::Exit(status.code()));
-        }
-    }
-    if let Some(final_row) = &consumed.terminal {
-        if let Some(receipt) = opts.receipt.as_deref_mut() {
-            for (k, v) in final_row.as_object().cloned().unwrap_or_default() {
-                receipt[k] = v;
-            }
-        }
-        if ledger.is_some() && consumed.protocol_ok {
-            let accounting = final_row.get("accounting").cloned().unwrap_or(Value::Null);
+        // A resumed session gray no longer knows about: nothing ran, so drop
+        // the pointer and start once as a new session. The reservation is
+        // settled at zero because no provider request was made.
+        if session_arg.is_some() && consumed.terminal.as_ref().is_some_and(is_stale_session) {
+            kill_group(pid);
+            let _ = child.wait().await;
             if let Some(budget) = &ledger {
-                budget.settle(&reservation, &accounting);
+                budget.settle(
+                    &reservation,
+                    &serde_json::json!({"usage_complete": true, "cost_micros": 0}),
+                );
+            }
+            if let Some(map) = state.as_object_mut() {
+                map.remove("session_id");
+            }
+            crate::config::atomic_json(&state_path, &state).map_err(RunError::Io)?;
+            crate::eprintln_stamped!(
+                "[discord] gray child {pid}: stale session pointer dropped; retrying once as a new session"
+            );
+            session_arg = None;
+            continue;
+        }
+        if consumed.terminal.is_some() {
+            // The terminal row is the answer and is published now. The child gets
+            // a short grace period to exit on its own; the reaper kills it after
+            // that and keeps the conversation lock until the child is gone.
+            set_reaping(conversation, true);
+            let lock = lock
+                .take()
+                .ok_or_else(|| RunError::Io("conversation lock missing".to_string()))?;
+            tokio::spawn(reap_after_result(
+                child,
+                pid,
+                lock,
+                conversation.to_string(),
+            ));
+        } else {
+            let status = match tokio::time::timeout(TURN_EXIT_GRACE, child.wait()).await {
+                Ok(status) => status.map_err(|_| RunError::Spawn("wait failed".to_string()))?,
+                Err(_) => {
+                    kill_group(pid);
+                    child
+                        .wait()
+                        .await
+                        .map_err(|_| RunError::Spawn("wait failed".to_string()))?
+                }
+            };
+            if !status.success() {
+                let tail = stderr_tail.text().await;
+                let e = RunError::Exit(status.code(), last_line(&tail));
+                log_failed_turn(pid, &e, &tail);
+                return Err(e);
             }
         }
-    }
-    // gray reports its request cap as a generic error row; the accounting
-    // beside it says whether the cap is what stopped the turn.
-    if let Some(row) = consumed.terminal.as_ref().filter(|r| r["type"] == "error") {
-        if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
-            return Err(RunError::RequestLimit(max_requests));
+        if let Some(final_row) = &consumed.terminal {
+            if let Some(receipt) = opts.receipt.as_deref_mut() {
+                for (k, v) in final_row.as_object().cloned().unwrap_or_default() {
+                    receipt[k] = v;
+                }
+            }
+            if ledger.is_some() && consumed.protocol_ok {
+                let accounting = final_row.get("accounting").cloned().unwrap_or(Value::Null);
+                if let Some(budget) = &ledger {
+                    budget.settle(&reservation, &accounting);
+                }
+            }
         }
+        // gray reports its request cap as a generic error row; the accounting
+        // beside it says whether the cap is what stopped the turn.
+        if let Some(row) = consumed.terminal.as_ref().filter(|r| r["type"] == "error") {
+            if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
+                return Err(RunError::RequestLimit(max_requests));
+            }
+        }
+        if !consumed.protocol_ok {
+            let e = RunError::Protocol(
+                "Invalid agent JSON output; upgrade gray to a compatible version".to_string(),
+            );
+            log_failed_turn(pid, &e, &stderr_tail.text().await);
+            return Err(e);
+        }
+        let Some(final_row) = consumed.terminal else {
+            let e = RunError::Incomplete;
+            log_failed_turn(pid, &e, &stderr_tail.text().await);
+            return Err(e);
+        };
+        if final_row.get("type").and_then(Value::as_str) == Some("error") {
+            let e = RunError::Agent(error_reason(&final_row));
+            log_failed_turn(pid, &e, &stderr_tail.text().await);
+            return Err(e);
+        }
+        if final_row.get("type").and_then(Value::as_str) != Some("result")
+            || final_row
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(RunError::Incomplete);
+        }
+        return match final_row.get("text").and_then(Value::as_str) {
+            Some(t) if !t.trim().is_empty() => Ok(t.to_string()),
+            _ => Err(RunError::Empty),
+        };
     }
-    if !consumed.protocol_ok {
-        return Err(RunError::Protocol(
-            "Invalid agent JSON output; upgrade gray to a compatible version".to_string(),
-        ));
-    }
-    let Some(final_row) = consumed.terminal else {
-        return Err(RunError::Incomplete);
-    };
-    if final_row.get("type").and_then(Value::as_str) != Some("result")
-        || final_row
-            .get("session_id")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-    {
-        return Err(RunError::Incomplete);
-    }
-    let answer = match final_row.get("text").and_then(Value::as_str) {
-        Some(t) if !t.trim().is_empty() => Ok(t.to_string()),
-        _ => Err(RunError::Empty),
-    };
-    answer
 }
+
+/// A resumed session that gray reports as missing before any model work:
+/// zero requests and the `no session matching` error. Safe to retry once.
+fn is_stale_session(row: &Value) -> bool {
+    row.get("type").and_then(Value::as_str) == Some("error")
+        && row["accounting"]["requests"].as_u64().unwrap_or(0) == 0
+        && row
+            .get("detail")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.contains("no session matching") && d.contains("not found"))
+}
+
+/// The error row's one-line reason, for the card and the log.
+fn error_reason(row: &Value) -> String {
+    let text = row
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| row.get("message").and_then(Value::as_str))
+        .unwrap_or("gray stopped without an answer");
+    clip(
+        text.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or(text),
+    )
+}
+
+/// Last non-empty stderr line, one line for the card.
+fn last_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(clip)
+}
+
+/// Keep a reason short enough for a card footer.
+fn clip(text: &str) -> String {
+    const MAX: usize = 200;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(MAX).collect::<String>())
+    }
+}
+
+/// Failed turns go to the daemon log with gray's own stderr tail, so the
+/// cause is on record and not only the `agent_failed` code.
+fn log_failed_turn(pid: u32, error: &RunError, stderr: &str) {
+    let why = error
+        .reason()
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    let tail = stderr.trim();
+    if tail.is_empty() {
+        crate::eprintln_stamped!("[discord] gray child {pid} failed: {error}{why}");
+    } else {
+        crate::eprintln_stamped!(
+            "[discord] gray child {pid} failed: {error}{why}; stderr tail: {tail}"
+        );
+    }
+}
+
+/// Human duration for a card or a log line: `10m`, `4h`, `1h 30m`, `45s`.
+pub fn human_duration(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    if h > 0 && m > 0 {
+        format!("{h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h")
+    } else if m > 0 && s > 0 {
+        format!("{m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The last bytes of a child's stderr. Read by its own task so a chatty
+/// child can never block on a full pipe, and kept bounded.
+struct StderrTail {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StderrTail {
+    fn start(stderr: Option<tokio::process::ChildStderr>) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = stderr.map(|mut err| {
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match err.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut tail) = buf.lock() {
+                                tail.extend_from_slice(&chunk[..n]);
+                                let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                                tail.drain(..excess);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        Self { buf, reader }
+    }
+
+    /// The captured tail. Gives the reader a moment to drain what the child
+    /// wrote before it exited; never waits longer than that.
+    async fn text(&mut self) -> String {
+        if let Some(reader) = self.reader.as_mut() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(300), reader).await;
+        }
+        let bytes = self.buf.lock().map(|t| t.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Bytes of gray's stderr kept for a failed turn.
+const STDERR_TAIL_BYTES: usize = 4096;
 
 #[derive(Default)]
 struct InputFileGuard {
@@ -775,6 +1000,7 @@ async fn consume_ndjson(
     state: &mut Value,
     mut progress: Option<&mut ProgressCb<'_>>,
     asks: Option<&AskWire>,
+    inactivity_secs: u64,
 ) -> Result<Consume, RunError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stdout).lines();
@@ -782,6 +1008,9 @@ async fn consume_ndjson(
     let mut terminal: Option<Value> = None;
     let mut protocol_ok = true;
     let mut after_terminal = 0usize;
+    // The newest session id gray named, pinned at the end if it never got a
+    // transcript mid-turn.
+    let mut named_session: Option<String> = None;
     loop {
         let read = if terminal.is_some() {
             // The turn ended with the terminal row. Only rows already buffered
@@ -796,7 +1025,13 @@ async fn consume_ndjson(
                 Err(_) => break,
             }
         } else {
-            lines.next_line().await
+            // Every row restarts the window: a long run that keeps talking is
+            // never cut off; one that goes quiet for the whole window is.
+            let window = std::time::Duration::from_secs(inactivity_secs);
+            match tokio::time::timeout(window, lines.next_line()).await {
+                Ok(read) => read,
+                Err(_) => return Err(RunError::Stalled(inactivity_secs)),
+            }
         };
         let line = read.map_err(|_| RunError::Io("cannot read agent output".to_string()))?;
         let Some(line) = line else { break };
@@ -846,16 +1081,20 @@ async fn consume_ndjson(
                     protocol_ok = false;
                     continue;
                 }
-                let pinned = state
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !pinned.is_empty() && pinned != sid {
+                // One turn names one session: compare with what this turn
+                // already named, else with the pinned id.
+                let expected = named_session.clone().or_else(|| {
+                    state
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+                if expected.as_deref().is_some_and(|e| e != sid) {
                     protocol_ok = false;
                     continue;
                 }
-                state["session_id"] = Value::String(sid.to_string());
-                let _ = crate::config::atomic_json(state_path, state);
+                named_session = Some(sid.to_string());
             } else {
                 protocol_ok = false;
                 continue;
@@ -880,10 +1119,53 @@ async fn consume_ndjson(
             }
         }
     }
+    // Pin the session the turn named only when it finished cleanly, or gray
+    // wrote its transcript: a turn that failed before its first write leaves
+    // no session to resume, and a stale pointer would fail every later turn.
+    if let Some(sid) = named_session {
+        let succeeded = protocol_ok
+            && terminal
+                .as_ref()
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str)
+                == Some("result");
+        let pinned = state
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.is_empty());
+        if !pinned && (succeeded || transcript_exists(state_path, &sid)) {
+            state["session_id"] = Value::String(sid);
+            let _ = crate::config::atomic_json(state_path, state);
+        }
+    }
     Ok(Consume {
         terminal,
         protocol_ok,
     })
+}
+
+/// Whether gray has written a transcript for this session in the home.
+fn transcript_exists(state_path: &Path, sid: &str) -> bool {
+    fn walk(dir: &Path, name: &str, depth: u8) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, name, depth + 1)
+            } else {
+                p.file_name().and_then(|f| f.to_str()) == Some(name)
+            }
+        })
+    }
+    let Some(home) = state_path.parent() else {
+        return false;
+    };
+    walk(&home.join("sessions"), &format!("{sid}.jsonl"), 0)
 }
 
 /// Answer one `ask` row on its own task, so gray's output keeps flowing
@@ -979,9 +1261,7 @@ fn set_reaping(conversation: &str, on: bool) {
 }
 
 fn is_reaping(conversation: &str) -> bool {
-    reaping()
-        .lock()
-        .is_ok_and(|set| set.contains(conversation))
+    reaping().lock().is_ok_and(|set| set.contains(conversation))
 }
 
 /// Wait (bounded) for a previous child's grace period to end, so that a turn

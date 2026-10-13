@@ -124,6 +124,9 @@ pub struct Rest {
     base: String,
     client: reqwest::Client,
     rate_limits: Arc<Mutex<RateState>>,
+    /// Longest a send waits on a rate limit before it returns instead (see
+    /// `with_budget`). `None` waits as long as Discord asks.
+    budget: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +197,18 @@ impl Rest {
             base: base.trim_end_matches('/').to_string(),
             client,
             rate_limits: Arc::new(Mutex::new(RateState::new())),
+            budget: None,
         }
+    }
+
+    /// A client whose message sends wait at most `budget` on a rate limit.
+    /// Over it they return `RateLimited` with Discord's wait, nothing sent,
+    /// for the caller to retry off the path that is waiting. Shares buckets
+    /// with `self`.
+    pub fn with_budget(&self, budget: Duration) -> Self {
+        let mut rest = self.clone();
+        rest.budget = Some(budget);
+        rest
     }
 
     pub fn production(token: &str) -> Self {
@@ -253,21 +267,30 @@ impl Rest {
     }
 
     async fn wait_for_rate_limit(&self, route: &str) {
-        self.wait_for_rate_limit_bounded(route, None, true).await;
+        let _ = self.wait_for_rate_limit_bounded(route, None, true).await;
     }
 
+    /// `wait_for_rate_limit` within this client's budget (see `with_budget`).
+    async fn wait_within_budget(&self, route: &str) -> Result<(), TransportError> {
+        self.wait_for_rate_limit_bounded(route, self.budget, true)
+            .await
+            .map_err(|wait| TransportError::RateLimited(Some(wait.as_secs_f64())))
+    }
+
+    /// Waits until the route and global buckets allow a request. Over
+    /// `budget` it returns the wait without sleeping and takes no slot.
     async fn wait_for_rate_limit_bounded(
         &self,
         route: &str,
         budget: Option<Duration>,
         include_global: bool,
-    ) -> bool {
+    ) -> Result<(), Duration> {
         let deadline = budget.map(|max| Instant::now() + max);
         loop {
             let wait = {
                 let mut state = match self.rate_limits.lock() {
                     Ok(state) => state,
-                    Err(_) => return true,
+                    Err(_) => return Ok(()),
                 };
                 let now = Instant::now();
                 if now >= state.global.reset_at {
@@ -311,12 +334,12 @@ impl Rest {
                 wait
             };
             if wait.is_zero() {
-                return true;
+                return Ok(());
             }
             if deadline
                 .is_some_and(|deadline| wait >= deadline.saturating_duration_since(Instant::now()))
             {
-                return false;
+                return Err(wait);
             }
             tokio::time::sleep(wait).await;
         }
@@ -395,7 +418,7 @@ impl Rest {
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, TransportError> {
         let route = format!("POST {path}");
-        self.wait_for_rate_limit(&route).await;
+        self.wait_within_budget(&route).await?;
         let url = format!("{}{}", self.base, path);
         let resp = self
             .client
@@ -411,7 +434,7 @@ impl Rest {
 
     async fn patch(&self, path: &str, body: &Value) -> Result<Value, TransportError> {
         let route = format!("PATCH {path}");
-        self.wait_for_rate_limit(&route).await;
+        self.wait_within_budget(&route).await?;
         let url = format!("{}{}", self.base, path);
         let resp = self
             .client
@@ -969,7 +992,7 @@ impl Rest {
             form = form.part(field, part);
         }
         let route = format!("{method} {path}");
-        self.wait_for_rate_limit(&route).await;
+        self.wait_within_budget(&route).await?;
         let url = format!("{}{}", self.base, path);
         let request = match method {
             "PATCH" => self.client.patch(url).multipart(form),
@@ -1101,7 +1124,7 @@ impl Rest {
             form = form.part(format!("files[{index}]"), part);
         }
         let route = format!("{method} {path}");
-        self.wait_for_rate_limit(&route).await;
+        self.wait_within_budget(&route).await?;
         let response = self
             .client
             .request(method, format!("{}{}", self.base, path))
@@ -1438,9 +1461,10 @@ impl Rest {
     ) -> Result<(), TransportError> {
         let path = format!("/interactions/{id}/{token}/callback");
         let route = format!("POST {path}");
-        if !self
+        if self
             .wait_for_rate_limit_bounded(&route, Some(Duration::from_millis(750)), false)
             .await
+            .is_err()
         {
             return Err(TransportError::RateLimited(Some(0.75)));
         }

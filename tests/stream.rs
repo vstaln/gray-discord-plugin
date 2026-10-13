@@ -518,6 +518,7 @@ async fn refused_edits_never_freeze_the_turn() {
     let (rt, store, _) = scripted!(json!({}), stub, script, "Built fine.");
     store.enqueue("m1", "42", "build", None, 1000).unwrap();
     assert!(rt.generate_one().await.unwrap());
+    rt.drain_settles().await;
 
     let log = traffic(&stub);
     let posted: Vec<&str> = posts(&log)
