@@ -1118,7 +1118,12 @@ where
                             crate::stream::Status::Failed("queued input is invalid".to_string()),
                         )
                         .await;
-                    self.fail_turn(&item.id, "agent_failed", &settled)?;
+                    self.fail_turn(
+                        &item.id,
+                        "agent_failed",
+                        Some("queued input is invalid"),
+                        &settled,
+                    )?;
                     self.remove_reaction(&item.channel, &item.id, "👀").await;
                     self.add_reaction(&item.channel, &item.id, "❌").await;
                     return Ok(true);
@@ -1178,7 +1183,7 @@ where
                     crate::stream::Status::Stopped,
                 )
                 .await;
-            self.fail_turn(&item.id, "cancelled", &settled)?;
+            self.fail_turn(&item.id, "cancelled", None, &settled)?;
             self.remove_reaction(&item.channel, &item.id, "👀").await;
             self.add_reaction(&item.channel, &item.id, "❌").await;
             return Ok(true);
@@ -1229,6 +1234,14 @@ where
                 crate::stream::Status::Failed(e.reason().unwrap_or_else(|| "failed".to_string()))
             }
         };
+        let failure_reason = match (&result, &status) {
+            (Err(RunError::Stalled(secs)), _) => Some(format!(
+                "no output from the agent for {}",
+                crate::runner::human_duration(*secs)
+            )),
+            (_, crate::stream::Status::Failed(reason)) => Some(reason.clone()),
+            _ => None,
+        };
         let loaded = crate::media_tags::load_pairs(&media);
         let uploads: Vec<crate::media_tags::Upload> =
             loaded.iter().map(|(_, upload)| upload.clone()).collect();
@@ -1267,22 +1280,32 @@ where
                 }
             }
             Err(RunError::Budget(_)) => {
-                self.fail_turn(&item.id, "budget_blocked", &settled)?;
+                self.fail_turn(
+                    &item.id,
+                    "budget_blocked",
+                    failure_reason.as_deref(),
+                    &settled,
+                )?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Err(RunError::Timeout) => {
-                self.fail_turn(&item.id, "timeout", &settled)?;
+                self.fail_turn(&item.id, "timeout", failure_reason.as_deref(), &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Err(RunError::Stalled(_)) => {
-                self.fail_turn(&item.id, "stalled", &settled)?;
+                self.fail_turn(&item.id, "stalled", failure_reason.as_deref(), &settled)?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
             Err(_) => {
-                self.fail_turn(&item.id, "agent_failed", &settled)?;
+                self.fail_turn(
+                    &item.id,
+                    "agent_failed",
+                    failure_reason.as_deref(),
+                    &settled,
+                )?;
                 self.remove_reaction(&item.channel, &item.id, "👀").await;
                 self.add_reaction(&item.channel, &item.id, "❌").await;
             }
@@ -1292,11 +1315,15 @@ where
 
     /// Record a failed turn. When its card's footer already says how it
     /// ended, that card is the notice; otherwise the notice is posted.
-    fn fail_turn(&self, id: &str, code: &str, settled: &Settled) -> Result<(), String> {
-        match settled.status_card.as_deref() {
-            Some(card) => self.store.fail_shown(id, code, card),
-            None => self.store.fail(id, code),
-        }
+    fn fail_turn(
+        &self,
+        id: &str,
+        code: &str,
+        reason: Option<&str>,
+        settled: &Settled,
+    ) -> Result<(), String> {
+        self.store
+            .fail_reason(id, code, reason, settled.status_card.as_deref())
     }
 
     pub async fn deliver_one(&self) -> Result<bool, String> {
@@ -1515,6 +1542,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| "provider model is missing".to_string())?;
+    let model = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(model);
     // Budget gates only when a policy exists (gray's setup writes none);
     // `budget set` stays the opt-in accounting path.
     config["budget_required"] = Value::Bool(crate::budget::gate(&config, model)?);

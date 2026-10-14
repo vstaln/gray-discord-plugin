@@ -410,10 +410,17 @@ async fn the_second_line_edits_the_first_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], ("● Running `ls`".to_string(), false), "first post");
+    assert_eq!(
+        log[0],
+        ("**Running** `ls`".to_string(), false),
+        "first post"
+    );
     assert_eq!(
         log[1],
-        ("● Running `ls`\n\n● Running `cargo test`".to_string(), true),
+        (
+            "**Running** `ls`\n\n**Running** `cargo test`".to_string(),
+            true
+        ),
         "then an edit"
     );
 }
@@ -444,13 +451,13 @@ async fn gated_rows_are_kept_until_the_gap_passes() {
     assert_eq!(log.len(), 2, "{log:?}");
     assert_eq!(
         log[0],
-        ("● Running `cargo build`".to_string(), false),
+        ("**Running** `cargo build`".to_string(), false),
         "first post"
     );
     assert_eq!(
         log[1],
         (
-            "● Running `cargo build`\n\n● Running `cargo test`".to_string(),
+            "**Running** `cargo build`\n\n**Running** `cargo test`".to_string(),
             true
         ),
         "the gated row joins the bubble on the next tick"
@@ -487,9 +494,9 @@ async fn final_flush_settles_the_card_and_next_turn_gets_a_new_one() {
     assert_eq!(
         log,
         vec![
-            ("● Running `cargo test`".to_string(), false),
-            ("● Running `cargo test`".to_string(), true),
-            ("● Running `pwd`".to_string(), false),
+            ("**Running** `cargo test`".to_string(), false),
+            ("**Running** `cargo test`".to_string(), true),
+            ("**Running** `pwd`".to_string(), false),
         ],
         "post, settle in place, then a fresh card for the next turn"
     );
@@ -527,7 +534,7 @@ async fn the_opt_in_card_still_follows_the_bubble() {
 
     let log = seen.lock().unwrap().clone();
     assert_eq!(log.len(), 4, "{log:?}");
-    assert!(log[0].0.starts_with("● Ran `ls`"), "first post: {log:?}");
+    assert!(log[0].0.starts_with("**Ran** `ls`"), "first post: {log:?}");
     assert!(log[1].1, "the turn's card settles in place: {log:?}");
     assert!(log[2].0.starts_with("⋯ "), "tally card: {log:?}");
     assert!(
@@ -536,7 +543,7 @@ async fn the_opt_in_card_still_follows_the_bubble() {
     );
     assert_eq!(
         log[3],
-        ("● Running `pwd`".to_string(), false),
+        ("**Running** `pwd`".to_string(), false),
         "new turn card"
     );
 }
@@ -575,7 +582,7 @@ async fn final_card_reaches_the_discord_rest_endpoint() {
         .collect();
     assert_eq!(sent.len(), 2, "expected the turn card plus the tally card");
     let turn = sent[0].body["components"].as_array().unwrap();
-    assert_eq!(turn[0]["type"], 10, "the tool lines as V2 text");
+    assert_eq!(turn[0]["type"], 17, "the tool lines in a V2 Container");
     assert_eq!(
         turn.last().unwrap()["type"],
         17,

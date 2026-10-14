@@ -46,11 +46,15 @@ pub fn roots_from_config(config: &Value) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Split `text` into its prose and the deliverable files its `MEDIA:` tags
-/// name. Relative paths resolve against `cwd`.
-pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBuf>) {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Part {
+    Text(String),
+    Media(PathBuf),
+}
+
+pub fn extract_parts(text: &str, cwd: &Path, roots: &[PathBuf]) -> Vec<Part> {
+    let mut parts = Vec::new();
     let mut out = String::with_capacity(text.len());
-    let mut paths = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("MEDIA:") {
         let (before, after) = rest.split_at(at);
@@ -67,8 +71,9 @@ pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBu
             Some(path) => {
                 // Drop markdown emphasis or code ticks wrapped around the tag.
                 out.push_str(before.trim_end_matches(['*', '_', '`']));
-                if !paths.contains(&path) {
-                    paths.push(path);
+                if !parts.contains(&Part::Media(path.clone())) {
+                    parts.push(Part::Text(std::mem::take(&mut out)));
+                    parts.push(Part::Media(path));
                 }
                 rest = body[consumed..].trim_start_matches(['*', '_', '`']);
             }
@@ -80,7 +85,43 @@ pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBu
         }
     }
     out.push_str(rest);
-    (tidy(&out), paths)
+    parts.push(Part::Text(out));
+    parts
+        .into_iter()
+        .filter_map(|part| match part {
+            Part::Text(text) => {
+                let text = tidy(&text);
+                (!text.is_empty()).then_some(Part::Text(text))
+            }
+            media => Some(media),
+        })
+        .collect()
+}
+
+pub fn extract(text: &str, cwd: &Path, roots: &[PathBuf]) -> (String, Vec<PathBuf>) {
+    let parts = extract_parts(text, cwd, roots);
+    (prose(&parts), media_paths(&parts))
+}
+
+pub fn prose(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text(text) => Some(text.as_str()),
+            Part::Media(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+pub fn media_paths(parts: &[Part]) -> Vec<PathBuf> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Media(path) => Some(path.clone()),
+            Part::Text(_) => None,
+        })
+        .collect()
 }
 
 /// Hide `MEDIA:` tags from a reply that is still streaming (the bridge's

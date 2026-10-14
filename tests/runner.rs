@@ -1,4 +1,4 @@
-use gray_discord::runner::{default_opts, run_gray, RunError, RunOpts};
+use gray_discord::runner::{RunError, RunOpts, default_opts, run_gray};
 use std::path::Path;
 
 fn write_exe(path: &Path, script: &str) {
@@ -320,6 +320,61 @@ async fn no_override_means_no_model_flag() {
     .unwrap();
     let argv = std::fs::read_to_string(&out).unwrap();
     assert!(!argv.lines().any(|l| l == "--model"), "argv was:\n{argv}");
+}
+
+#[tokio::test]
+async fn gateway_model_overrides_the_snapshotted_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let (exe, _out) = argv_capture(root);
+    let mut config = base_config(&exe, &home);
+    config["model"] = serde_json::json!("openai/gpt-5");
+    run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:one",
+        "hello",
+        default_opts(),
+    )
+    .await
+    .unwrap();
+    let conv = std::fs::read_dir(root.join("conversations"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(conv.join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["model"].as_str(), Some("openai/gpt-5"));
+}
+
+#[tokio::test]
+async fn no_gateway_model_keeps_the_provider_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = gray_home(root);
+    let (exe, _out) = argv_capture(root);
+    let config = base_config(&exe, &home);
+    run_gray(
+        &config,
+        &root.join("plugin.json"),
+        "chat:one",
+        "hello",
+        default_opts(),
+    )
+    .await
+    .unwrap();
+    let conv = std::fs::read_dir(root.join("conversations"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(conv.join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["model"].as_str(), Some("test"));
 }
 
 /// A plugin's question arrives as an `ask` row; the handler's answers go

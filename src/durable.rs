@@ -577,28 +577,39 @@ impl Store {
     }
 
     pub fn fail(&self, id: &str, code: &str) -> Result<(), String> {
-        self.fail_with(id, code, None)
+        self.fail_with(id, code, None, None)
+    }
+
+    pub fn fail_reason(
+        &self,
+        id: &str,
+        code: &str,
+        reason: Option<&str>,
+        shown: Option<&str>,
+    ) -> Result<(), String> {
+        self.fail_with(id, code, reason, shown)
     }
 
     /// [`Self::fail`] for a turn whose live card already shows the failure
     /// (message `shown`): the notice is recorded as delivered there instead
     /// of being posted a second time.
     pub fn fail_shown(&self, id: &str, code: &str, shown: &str) -> Result<(), String> {
-        self.fail_with(id, code, Some(shown))
+        self.fail_with(id, code, None, Some(shown))
     }
 
-    fn fail_with(&self, id: &str, code: &str, shown: Option<&str>) -> Result<(), String> {
+    fn fail_with(
+        &self,
+        id: &str,
+        code: &str,
+        reason: Option<&str>,
+        shown: Option<&str>,
+    ) -> Result<(), String> {
         let code = match code {
-            "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,
+            "interrupted" | "cancelled" | "timeout" | "stalled" | "agent_failed"
+            | "budget_blocked" => code,
             _ => "agent_failed",
         };
-        // `interrupted` only comes from boot recovery: the gateway stopped
-        // mid-turn, so say that instead of a bare code.
-        let notice = if code == "interrupted" {
-            format!("Turn {id}: interrupted because the gateway stopped mid-turn. Actions may already have happened; send a message to continue.")
-        } else {
-            format!("Turn {id}: {code}. Actions may already have happened; no automatic retry.")
-        };
+        let notice = failure_notice(code, reason);
         with_conn(&self.path, |db| {
             db.execute(
                 "UPDATE inbox SET state='uncertain',error=?1 WHERE id=?2 AND state='running'",
@@ -1387,4 +1398,65 @@ impl<T> OptionalStr<T> for Result<T, rusqlite::Error> {
             Err(e) => Err(format!("queue query failed: {e}")),
         }
     }
+}
+
+pub fn failure_notice(code: &str, reason: Option<&str>) -> String {
+    let reason = reason
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            if r.chars().count() > 300 {
+                format!("{}…", r.chars().take(300).collect::<String>())
+            } else {
+                r
+            }
+        });
+    let headline = match (code, reason.as_deref()) {
+        ("interrupted", _) => "The gateway restarted in the middle of this".to_string(),
+        ("cancelled", _) => "Stopped".to_string(),
+        ("timeout", _) => "Gave up: this hit the turn time limit".to_string(),
+        ("stalled", Some(r)) => format!("Gave up: {}", lowercase_first(r)),
+        ("stalled", None) => "Gave up: no output from the agent for too long".to_string(),
+        ("budget_blocked", Some(r)) => format!("Stopped: {}", lowercase_first(r)),
+        ("budget_blocked", None) => "Stopped: the budget is used up".to_string(),
+        (_, Some(r)) => format!("That failed: {}", lowercase_first(r)),
+        (_, None) => "That failed before it could answer".to_string(),
+    };
+    let next = match code {
+        "cancelled" => "",
+        "budget_blocked" => "",
+        "interrupted" => " Send a message to pick it up.",
+        _ => " Send a message to try again.",
+    };
+    let headline = headline.trim_end_matches('.');
+    format!("{headline}. Some steps may already have run.{next}")
+}
+
+fn lowercase_first(s: &str) -> String {
+    let first_word = s.split_whitespace().next().unwrap_or("");
+    let mut chars = first_word.chars();
+    let sentence_case = matches!(
+        (chars.next(), chars.next()),
+        (Some(a), Some(b)) if a.is_uppercase() && b.is_lowercase()
+    );
+    let name = [
+        "Claude",
+        "Devin",
+        "Discord",
+        "GitHub",
+        "OpenAI",
+        "Gemini",
+        "Anthropic",
+    ]
+    .contains(&first_word.trim_matches(|c: char| !c.is_alphanumeric()));
+    if !sentence_case || name {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    if let Some(c) = it.next() {
+        out.extend(c.to_lowercase());
+    }
+    out.extend(it);
+    out
 }

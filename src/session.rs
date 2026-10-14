@@ -122,7 +122,16 @@ pub fn conversation_key(channel_id: &str, user_id: &str, is_dm: bool) -> String 
 pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     let sessions = home.join("sessions");
     if sessions.is_dir() {
-        clear_jsonl(&sessions)?;
+        let stamp = local_at(now)
+            .map(|t| t.format("%Y%m%d-%H%M%S").to_string())
+            .unwrap_or_else(|| format!("{}", now as i64));
+        let mut archive = home.join("sessions-archive").join(&stamp);
+        let mut n = 1;
+        while archive.exists() {
+            n += 1;
+            archive = home.join("sessions-archive").join(format!("{stamp}-{n}"));
+        }
+        archive_jsonl(&sessions, &archive)?;
     }
     let state = json!({
         "generation": crate::durable::uuid_hex(),
@@ -131,7 +140,7 @@ pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     crate::config::atomic_json(&home.join("session.json"), &state)
 }
 
-fn clear_jsonl(dir: &Path) -> Result<(), String> {
+fn archive_jsonl(dir: &Path, archive: &Path) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|_| "cannot list conversation sessions".to_string())?;
     for entry in entries {
@@ -141,10 +150,17 @@ fn clear_jsonl(dir: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|_| "cannot inspect conversation session".to_string())?;
         if file_type.is_dir() {
-            clear_jsonl(&path)?;
+            archive_jsonl(&path, &archive.join(entry.file_name()))?;
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            std::fs::remove_file(path)
-                .map_err(|_| "cannot clear conversation session".to_string())?;
+            std::fs::create_dir_all(archive)
+                .map_err(|_| "cannot create conversation session archive".to_string())?;
+            let dest = archive.join(entry.file_name());
+            if std::fs::rename(&path, &dest).is_err() {
+                std::fs::copy(&path, &dest)
+                    .map_err(|_| "cannot archive conversation session".to_string())?;
+                std::fs::remove_file(&path)
+                    .map_err(|_| "cannot clear conversation session".to_string())?;
+            }
         }
     }
     Ok(())

@@ -359,10 +359,17 @@ pub async fn run_gray_input(
         .get("gray_home")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
+    let mut provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| RunError::Io("gray provider configuration is missing".to_string()))?;
+    if let Some(model) = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        provider["model"] = Value::String(model.to_string());
+    }
     crate::config::atomic_json(&home.join("config.json"), &provider).map_err(RunError::Io)?;
 
     // Dedicated workdir/profile: no lockfile plugins that might start
@@ -565,6 +572,13 @@ pub async fn run_gray_input(
             cmd.env(k, v);
         }
         cmd.env("GRAY_HOME", &home);
+        if let Some(user_home) = config
+            .get("gray_home")
+            .and_then(Value::as_str)
+            .filter(|h| !h.trim().is_empty())
+        {
+            cmd.env("GRAY_USER_HOME", user_home);
+        }
         cmd.env(
             "PATH",
             child_path(

@@ -107,10 +107,20 @@ struct Frame {
 }
 
 /// The status chip is the accented, non-spoiler Container at the end.
+fn is_tool_group(c: &Value) -> bool {
+    c["type"] == 17
+        && c["components"].as_array().is_some_and(|k| k.len() == 1)
+        && c["components"][0]["type"] == 10
+        && !c["components"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("-# ")
+}
+
 fn chip_of(components: &[Value]) -> Option<&Value> {
     components
         .last()
-        .filter(|last| last["type"] == 17 && last["spoiler"] != json!(true))
+        .filter(|last| last["type"] == 17 && last["spoiler"] != json!(true) && !is_tool_group(last))
 }
 
 /// Message posts and edits the stub saw, in order.
@@ -146,8 +156,14 @@ fn traffic(stub: &common::Stub) -> Vec<Frame> {
                     .to_string(),
                 body: components
                     .iter()
-                    .filter(|child| child["type"] == 10)
-                    .map(component_text)
+                    .filter(|child| child["type"] == 10 || is_tool_group(child))
+                    .map(|child| {
+                        if is_tool_group(child) {
+                            component_text(&child["components"][0])
+                        } else {
+                            component_text(child)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n"),
                 status,
@@ -297,7 +313,7 @@ async fn each_step_of_the_turn_is_a_new_message() {
         .collect();
     assert_eq!(
         posted,
-        vec!["Let me check. ▉", "● Running `cargo test`", "All ▉"],
+        vec!["Let me check. ▉", "**Running** `cargo test`", "All ▉"],
         "prose, its tool lines, then the next prose, each a new message: {log:?}"
     );
     // The chip rides the newest message: the older ones lose it.
@@ -312,7 +328,7 @@ async fn each_step_of_the_turn_is_a_new_message() {
     let tools = log
         .iter()
         .rev()
-        .find(|frame| frame.body.starts_with("● Ran `cargo test`"))
+        .find(|frame| frame.body.starts_with("**Ran** `cargo test`"))
         .expect("the tool line gets its result");
     assert_eq!(tools.status, None, "{tools:?}");
     let last = log.last().unwrap();
@@ -398,7 +414,11 @@ async fn a_gray_without_text_rows_posts_the_answer_below_its_tool_lines() {
         .iter()
         .map(|frame| frame.body.as_str())
         .collect();
-    assert_eq!(posted, vec!["● Running `cargo test`", "answer"], "{log:?}");
+    assert_eq!(
+        posted,
+        vec!["**Running** `cargo test`", "answer"],
+        "{log:?}"
+    );
     let last = log.last().unwrap();
     assert_eq!(last.status, None, "the answer stands alone");
     assert_eq!(store.get("m1").unwrap().unwrap().state, "sent");
@@ -527,7 +547,7 @@ async fn refused_edits_never_freeze_the_turn() {
         .collect();
     assert_eq!(
         &posted[..3],
-        &["Checking ▉", "● Running `cargo build`", "Built ▉"],
+        &["Checking ▉", "**Running** `cargo build`", "Built ▉"],
         "every step still lands as its own message: {log:?}"
     );
     assert!(

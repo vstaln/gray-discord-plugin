@@ -64,6 +64,15 @@ const WORKING: u32 = 0x4E5058;
 const FAILED: u32 = 0xED4245;
 const STOPPED: u32 = 0x80848E;
 
+fn tool_group(text: &str) -> Value {
+    let accent = if crate::activity::group_failed(text) {
+        FAILED
+    } else {
+        crate::render::QUIET_ACCENT
+    };
+    json!({"type": 17, "accent_color": accent, "components": [{"type": 10, "content": text}]})
+}
+
 /// Quiet mode (`"quiet": true`): one durable post per turn. Flips the
 /// defaults for `stream_replies`, `activity_indicator` and the queued ack
 /// to off; an explicit key always wins over the meta flag. The typing
@@ -196,6 +205,7 @@ pub struct Landed {
 struct Unit {
     text: String,
     block: usize,
+    tools: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -435,7 +445,12 @@ impl Timeline {
                     }
                 }
             };
-            units.extend(texts.into_iter().map(|text| Unit { text, block: index }));
+            let tools = matches!(block, Block::Tools { .. });
+            units.extend(texts.into_iter().map(|text| Unit {
+                text,
+                block: index,
+                tools,
+            }));
         }
         if self.quiet {
             // The one live card: just the chip. A finished turn leaves
@@ -478,7 +493,11 @@ impl Timeline {
                 .map(|unit| unit.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            units.push(Unit { text, block });
+            units.push(Unit {
+                text,
+                block,
+                tools: false,
+            });
         }
         // A finished turn drops the chip: the answer stands alone.
         let chip = (status != Status::Done)
@@ -487,7 +506,11 @@ impl Timeline {
         for unit in units {
             let (chunks, overflow) = split_block(&unit.text, budget);
             for chunk in chunks {
-                let components = vec![json!({"type": 10, "content": chunk.clone()})];
+                let components = if unit.tools {
+                    vec![tool_group(&chunk)]
+                } else {
+                    vec![json!({"type": 10, "content": chunk.clone()})]
+                };
                 cards.push(Card {
                     components,
                     text: chunk,
@@ -838,9 +861,7 @@ impl Timeline {
             // Equal text with only the chip or a pager mint behind is the
             // answer on screen already; a message carrying files must match
             // exactly so they are known delivered.
-            if posted.shown == card.key()
-                || (card.files.is_empty() && posted.text == card.text)
-            {
+            if posted.shown == card.key() || (card.files.is_empty() && posted.text == card.text) {
                 parts.push((card.text.clone(), posted.id.clone()));
                 continue;
             }
@@ -946,7 +967,7 @@ pub fn stopping(components: &Value, pressed: &str) -> Option<Vec<Value>> {
         {
             continue;
         }
-        top["accent_color"] = json!(STOPPED);
+        let mut here = false;
         let Some(children) = top.get_mut("components").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -958,8 +979,12 @@ pub fn stopping(components: &Value, pressed: &str) -> Option<Vec<Value>> {
                     == Some(pressed);
             if is_stop {
                 *child = json!({"type": 10, "content": "-# Stopping…"});
-                found = true;
+                here = true;
             }
+        }
+        if here {
+            top["accent_color"] = json!(STOPPED);
+            found = true;
         }
     }
     found.then_some(out)
@@ -1135,7 +1160,7 @@ mod tests {
         };
         assert_eq!(prose.text, "Let me check.", "closed: cursor gone");
         assert_eq!(prose.components.len(), 1, "the chip moved on");
-        assert_eq!(tools.text, "● Running `cargo test`");
+        assert_eq!(tools.text, "**Running** `cargo test`");
         assert_eq!(
             status_line(tools),
             "-# Working · started <t:0:R> · ran 1 command"
@@ -1174,7 +1199,7 @@ mod tests {
         }
         let card = &t.render(0.0)[0];
         crate::render::validate_components(&card.components).unwrap();
-        let expected: Vec<String> = (0..9).map(|i| format!("● Running `step {i}`")).collect();
+        let expected: Vec<String> = (0..9).map(|i| format!("**Running** `step {i}`")).collect();
         assert_eq!(card.text, expected.join("\n\n"));
     }
 
@@ -1439,7 +1464,11 @@ mod tests {
         assert_eq!(cards.len(), MAX_MESSAGES);
         let last = cards.last().unwrap();
         crate::render::validate_components(&last.components).unwrap();
-        assert!(last.text.ends_with("● Running `make 39`"), "{}", last.text);
+        assert!(
+            last.text.ends_with("**Running** `make 39`"),
+            "{}",
+            last.text
+        );
     }
 
     #[test]

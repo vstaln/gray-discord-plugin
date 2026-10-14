@@ -642,6 +642,13 @@ pub fn mode(config: &Value) -> Mode {
     }
 }
 
+pub const FAILED_MARK: &str = "✗";
+
+pub fn group_failed(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with(&format!("-# {FAILED_MARK} ")))
+}
+
 /// Output lines shown at each end of a preview.
 const PREVIEW_EDGE: usize = 3;
 /// Output of at most this many lines is shown whole.
@@ -707,18 +714,13 @@ fn call_block(ran: Option<&Value>, fin: Option<&Value>, mode: Mode) -> String {
         .and_then(Value::as_str)
         .unwrap_or("");
     let done = fin.map(|fin| finish_call(fin, shell));
-    let mark = if done.as_ref().is_some_and(|d| d.failed) {
-        "✗"
-    } else {
-        "●"
-    };
     let mut out = if shell {
         let cmd = clean_command(detail);
         match (cmd.is_empty(), done.is_some()) {
-            (true, true) => format!("{mark} Checked background job"),
-            (true, false) => "● Checking background job".to_string(),
-            (false, true) => format!("{mark} Ran {}", code_span(&cmd)),
-            (false, false) => format!("● Running {}", code_span(&cmd)),
+            (true, true) => "**Checked** background job".to_string(),
+            (true, false) => "**Checking** background job".to_string(),
+            (false, true) => format!("**Ran** {}", code_span(&cmd)),
+            (false, false) => format!("**Running** {}", code_span(&cmd)),
         }
     } else {
         let name = name_of(base);
@@ -729,9 +731,9 @@ fn call_block(ran: Option<&Value>, fin: Option<&Value>, mode: Mode) -> String {
         };
         let arg = capped(&one_line(detail), MAX_COMMAND_CHARS);
         if arg.is_empty() {
-            format!("{mark} {name}")
+            format!("**{name}**")
         } else {
-            format!("{mark} {name} {}", code_span(&arg))
+            format!("**{name}** {}", code_span(&arg))
         }
     };
     if shell {
@@ -747,7 +749,8 @@ fn call_block(ran: Option<&Value>, fin: Option<&Value>, mode: Mode) -> String {
     let Some(done) = done else {
         return out;
     };
-    out.push_str(&format!("\n-# ⤷ {}", done.status));
+    let mark = if done.failed { FAILED_MARK } else { "⤷" };
+    out.push_str(&format!("\n-# {mark} {}", done.status));
     if shell && mode == Mode::Verbose && !done.lines.is_empty() {
         out.push('\n');
         out.push_str(&output_block(&done.lines));
