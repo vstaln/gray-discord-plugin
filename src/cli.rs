@@ -314,6 +314,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             Ok(())
         }
         Command::Install => {
+            let _ = crate::config::load_config(config_path)?;
             let line = crate::service::install(config_path)?;
             println!("{line}");
             if matches!(
