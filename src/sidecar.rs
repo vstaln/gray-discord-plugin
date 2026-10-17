@@ -64,6 +64,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "name": "discord",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
+        "requires_plugins": ["gateway"],
         "commands": [],
         "hooks": ["prompt/context"],
         "tools": [{
@@ -140,6 +141,20 @@ fn is_error() -> Value {
     })
 }
 
+fn unknown_tool(name: &str) -> Value {
+    json!({
+        "content": format!("unknown tool {name}; tools: discord_send, discord_send_ui, discord_open_modal, discord_file, discord_ui_schema"),
+        "is_error": true
+    })
+}
+
+fn not_configured() -> Value {
+    json!({
+        "content": "Discord is not configured — run `gray discord setup`. Nothing was sent.",
+        "is_error": true
+    })
+}
+
 /// A specific, fixable failure. `detail` must never contain config values.
 fn not_sent(detail: impl std::fmt::Display) -> Value {
     json!({
@@ -173,7 +188,7 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
             "discord_open_modal" => open_modal(params, config_path).await,
             "discord_file" => file_tool(params, config_path).await,
             "discord_ui_schema" => ui_schema(params),
-            _ => is_error(),
+            other => unknown_tool(other),
         };
     }
     json!({"error": "Unsupported method"})
@@ -193,17 +208,17 @@ fn session_cwd(params: &Value) -> std::path::PathBuf {
 
 /// Token and channel from config; `None` means the bridge is not set up.
 fn delivery_target(config_path: &Path) -> Result<(Value, String, u64), Value> {
-    let config = crate::config::load_config(config_path).map_err(|_| is_error())?;
+    let config = crate::config::load_config(config_path).map_err(|_| not_configured())?;
     let token = config
         .get("token")
         .and_then(Value::as_str)
-        .ok_or_else(is_error)?
+        .ok_or_else(not_configured)?
         .to_string();
     let channel = config
         .get("channel_id")
         .and_then(Value::as_str)
         .and_then(|channel| channel.parse::<u64>().ok())
-        .ok_or_else(is_error)?;
+        .ok_or_else(not_configured)?;
     Ok((config, token, channel))
 }
 
