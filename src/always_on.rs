@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 pub const PUMP_EVERY: Duration = Duration::from_secs(3);
 
 /// One request/response on the gateway's control socket (one JSON line each
-/// way). `None` when the gateway is not answering.
+/// way). `None` when the gateway is not answering — which is always on
+/// Windows, where gray runs no native gateway to ask.
+#[cfg(unix)]
 pub async fn request(sock: &Path, req: &Value) -> Option<Value> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     let io = async {
@@ -35,6 +37,11 @@ pub async fn request(sock: &Path, req: &Value) -> Option<Value> {
     tokio::time::timeout(Duration::from_secs(5), io)
         .await
         .ok()?
+}
+
+#[cfg(not(unix))]
+pub async fn request(_sock: &Path, _req: &Value) -> Option<Value> {
+    None
 }
 
 /// The channel an intent goes to: its route's opaque `route` token, else

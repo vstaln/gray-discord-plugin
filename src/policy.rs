@@ -107,14 +107,30 @@ pub fn code_matches(text: &str, code: &str) -> bool {
 /// 18 random bytes, base64url without padding — like secrets.token_urlsafe(18).
 fn random_code() -> String {
     let mut buf = [0u8; 18];
-    let mut ok = false;
     #[cfg(unix)]
-    {
+    let ok = {
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            ok = f.read_exact(&mut buf).is_ok();
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .is_ok()
+    };
+    #[cfg(windows)]
+    let ok = {
+        use windows_sys::Win32::Security::Cryptography::BCryptGenRandom;
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        // SAFETY: buf is writable for its length; a null provider handle asks
+        // for the system-preferred RNG. Returns an NTSTATUS (0 = success).
+        unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            ) == 0
         }
-    }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let ok = false;
     if !ok {
         // Degraded entropy path (no OS RNG readable): hash pid + time so the
         // code is still unpredictable to a remote peer. Documented fallback.

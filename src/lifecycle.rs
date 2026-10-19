@@ -277,6 +277,9 @@ mod tests {
             .starts_with("Gateway online"));
     }
 
+    // The checked-in fake is a `#!/bin/sh` script — nothing on Windows can
+    // exec it, so this coverage is unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn core_answers_win() {
         // A checked-in fake, not a script written here: exec'ing a file this

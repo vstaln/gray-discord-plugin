@@ -13,12 +13,20 @@ fn config_with_home(tmp: &tempfile::TempDir, body: serde_json::Value) -> std::pa
     path
 }
 
+fn fake_bin() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32\cmd.exe"
+    } else {
+        "/bin/true"
+    }
+}
+
 fn valid_config(tmp: &tempfile::TempDir, owner: Option<&str>) -> serde_json::Value {
     let mut c = json!({
         "token": "FAKE.TOKEN.NOTREAL",
         "owner_id": owner.unwrap_or("111"),
         "channel_id": "222",
-        "gray_bin": "/bin/true",
+        "gray_bin": fake_bin(),
         "gray_home": tmp.path().to_str().unwrap(),
         "workdir": tmp.path().to_str().unwrap(),
     });

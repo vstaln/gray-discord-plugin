@@ -74,7 +74,14 @@ pub fn prepare(config: &Value, home: &Path) -> Result<String, String> {
         let entry = entry.map_err(|_| "cannot list skills".to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if entry.path().is_symlink() && !desired.contains_key(&name) {
-            std::fs::remove_file(entry.path()).map_err(|_| "cannot prune skill".to_string())?;
+            #[cfg(unix)]
+            let pruned = std::fs::remove_file(entry.path());
+            // Skill links point at directories; on Windows a directory
+            // symlink is removed with remove_dir, not remove_file.
+            #[cfg(windows)]
+            let pruned = std::fs::remove_dir(entry.path())
+                .or_else(|_| std::fs::remove_file(entry.path()));
+            pruned.map_err(|_| "cannot prune skill".to_string())?;
         }
     }
     for (name, path) in &desired {

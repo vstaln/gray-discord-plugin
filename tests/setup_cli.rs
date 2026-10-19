@@ -5,6 +5,14 @@ use gray_discord::setup::{
 use std::collections::VecDeque;
 use std::path::Path;
 
+fn fake_bin() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32\cmd.exe"
+    } else {
+        "/bin/true"
+    }
+}
+
 /// Scripted prompter: pops canned answers, records prompts. `tty: false`
 /// reproduces the non-terminal guard without a real terminal.
 struct Fake {
@@ -106,7 +114,7 @@ fn wiring(pairing: &'static gray_discord::setup::WaitForPairing, home: &Path) ->
         dm: &stub_dm as &DmStep,
         verify: &verify_ok as &VerifyStep,
         pairing,
-        gray_bin: Some("/bin/true".to_string()),
+        gray_bin: Some(fake_bin().to_string()),
         gray_home: Some(home.to_string_lossy().into_owned()),
     }
 }
@@ -178,7 +186,7 @@ async fn default_path_is_token_plus_your_id() {
     assert_eq!(saved["channel_id"], "222");
     assert_eq!(saved["allowed_users"][0], "333");
     assert_eq!(saved["allowed_users"][1], "444");
-    assert_eq!(saved["gray_bin"], "/bin/true");
+    assert_eq!(saved["gray_bin"], fake_bin());
     // Budget is not part of the wizard; validate_config would reject a null.
     assert!(saved.get("budget").is_none());
     // The doctor ran and agreed; the token never appeared anywhere.
