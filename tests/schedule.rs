@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use gray_discord::config::save_config;
 use gray_discord::gateway::open_store;
 use serde_json::json;

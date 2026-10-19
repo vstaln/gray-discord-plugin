@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use gray_discord::runner::{default_opts, run_gray_input, RunInput};
 use serde_json::json;
 

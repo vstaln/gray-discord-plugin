@@ -4,6 +4,7 @@
 use gray_discord::cron;
 use serde_json::json;
 
+#[cfg(unix)]
 fn write_exe(path: &std::path::Path, script: &str) {
     std::fs::write(path, script).expect("fixture write");
     #[cfg(unix)]
@@ -86,6 +87,7 @@ fn tick_output_routes_by_channel_and_ignores_everything_else() {
     assert!(got[0].text.starts_with("Cronjob Response:"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_tick_posts_back_through_gray_itself() {
     let tmp = tempfile::tempdir().unwrap();
@@ -109,6 +111,7 @@ JSON
     assert_eq!(got[0].channel, "1234567890");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failing_tick_is_not_a_delivery() {
     let tmp = tempfile::tempdir().unwrap();
@@ -120,6 +123,7 @@ async fn a_failing_tick_is_not_a_delivery() {
         .is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_turn_hands_its_cron_binding_to_the_child() {
     // The whole point: the model runs a plain `gray cron add` and the job

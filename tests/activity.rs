@@ -635,6 +635,7 @@ async fn an_unchanged_card_is_not_reposted() {
 
 // ── the wire: real gray rows, through the real runner, into the bubble ──
 
+#[cfg(unix)]
 fn write_exe(path: &std::path::Path, script: &str) {
     std::fs::write(path, script).expect("fixture write");
     #[cfg(unix)]
@@ -658,6 +659,7 @@ cat <<'JSON'
 JSON
 "#;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_real_gray_turn_narrates_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
