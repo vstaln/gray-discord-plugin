@@ -367,6 +367,7 @@ pub async fn run_gray_input(
     // Dedicated workdir/profile: no lockfile plugins that might start
     // another gateway.
     let work = home.join("work");
+    #[allow(unused_mut)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -993,6 +994,7 @@ mod child_path_tests {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_private_file(path: &Path) -> Result<(), RunError> {
     #[cfg(unix)]
     {

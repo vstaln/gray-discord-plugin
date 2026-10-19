@@ -649,6 +649,7 @@ fn write_exe(path: &std::path::Path, script: &str) {
 /// call narrated, its completed output, a thinking batch, then the answer.
 /// If gray changes the shape, this fails here rather than silently going
 /// quiet on Discord.
+#[cfg(unix)]
 const GRAY_TURN: &str = r#"#!/bin/sh
 cat <<'JSON'
 {"protocol":1,"turn_id":"t","session_id":"11111111-1111-1111-1111-111111111111","type":"progress","phase":"tool_started","call_id":"c1","tool":"bash"}
