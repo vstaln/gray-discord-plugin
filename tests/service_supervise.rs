@@ -71,7 +71,7 @@ fn unit_mentions_the_config_and_binary() {
     let body = service::unit(&cfg).unwrap();
     assert!(body.contains("ExecStart="));
     assert!(body.contains("\"run\" \"--config\" "));
-    assert!(body.contains(&format!("\"{}\"", cfg.display())));
+    assert!(body.contains(&service::quote(&cfg.to_string_lossy()).unwrap()));
     assert!(body.contains("WantedBy=default.target"));
 }
 
