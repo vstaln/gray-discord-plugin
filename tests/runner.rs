@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use gray_discord::runner::{RunError, RunOpts, default_opts, run_gray};
 use std::path::Path;
 
