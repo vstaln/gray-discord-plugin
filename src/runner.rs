@@ -982,15 +982,21 @@ mod child_path_tests {
 
     #[test]
     fn bare_supervisor_path_gains_user_bins() {
+        let existing =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let got = child_path(
-            Some("/usr/bin:/bin".into()),
+            Some(existing),
             Some(PathBuf::from("/home/u")),
             Path::new("/home/u/.local/bin/gray"),
         );
-        assert_eq!(
-            got.to_str().unwrap(),
-            "/home/u/.local/bin:/home/u/.cargo/bin:/usr/bin:/bin"
-        );
+        let want = std::env::join_paths([
+            PathBuf::from("/home/u/.local/bin"),
+            Path::new("/home/u").join(".cargo/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        assert_eq!(got, want);
     }
 }
 
