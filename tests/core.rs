@@ -1,9 +1,17 @@
 use gray_discord::{config, policy, text};
 use serde_json::json;
 
+fn fake_bin() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32\cmd.exe"
+    } else {
+        "/bin/true"
+    }
+}
+
 fn base(tmp: &std::path::Path) -> serde_json::Value {
     json!({"token": "fixture", "owner_id": "123456789", "channel_id": "987654321",
-           "gray_bin": "/bin/true", "gray_home": tmp.join("gray"), "workdir": tmp.join("work")})
+           "gray_bin": fake_bin(), "gray_home": tmp.join("gray"), "workdir": tmp.join("work")})
 }
 
 #[test]

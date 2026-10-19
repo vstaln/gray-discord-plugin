@@ -92,7 +92,7 @@ async fn delivery_failure_is_not_success_or_secret_disclosure() {
         "token": token,
         "owner_id": "123",
         "channel_id": "42",
-        "gray_bin": "/bin/false",
+        "gray_bin": tmp.path().join("missing-bin"),
         "gray_home": tmp.path().join("gray"),
         "workdir": tmp.path().join("work")
     });
