@@ -406,7 +406,10 @@ pub async fn run_gray_input(
         shell_word(&abs_config)
     );
     #[cfg(windows)]
-    let script = format!("@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n", exe, abs_config);
+    let script = format!(
+        "@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n",
+        exe, abs_config
+    );
     std::fs::write(&launcher, script)
         .map_err(|_| RunError::Io("cannot write launcher".to_string()))?;
     #[cfg(unix)]
@@ -987,8 +990,7 @@ mod child_path_tests {
 
     #[test]
     fn bare_supervisor_path_gains_user_bins() {
-        let existing =
-            std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let existing = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let got = child_path(
             Some(existing),
             Some(PathBuf::from("/home/u")),

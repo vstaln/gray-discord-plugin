@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use gray_discord::runner::{RunError, RunOpts, default_opts, run_gray};
+use gray_discord::runner::{default_opts, run_gray, RunError, RunOpts};
 use std::path::Path;
 
 fn write_exe(path: &Path, script: &str) {

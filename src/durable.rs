@@ -1169,7 +1169,6 @@ impl Store {
     }
 }
 
-
 /// Fill `buf` from `/dev/urandom` where it exists; elsewhere mix pid +
 /// time + RandomState so ids and pairing codes still differ.
 pub(crate) fn fill_entropy(buf: &mut [u8]) {

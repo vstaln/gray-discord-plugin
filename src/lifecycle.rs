@@ -287,8 +287,8 @@ mod tests {
         // hold the write fd open until its own exec and makes this exec fail
         // with ETXTBSY. `core` then falls back and the test flakes.
         let tmp = tempfile::tempdir().unwrap();
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake-gray-lifecycle.sh");
+        let bin =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gray-lifecycle.sh");
         assert_eq!(
             boot_via(&bin, tmp.path(), 1).await.as_deref(),
             Some("from core")

@@ -79,8 +79,8 @@ pub fn prepare(config: &Value, home: &Path) -> Result<String, String> {
             // Skill links point at directories; on Windows a directory
             // symlink is removed with remove_dir, not remove_file.
             #[cfg(windows)]
-            let pruned = std::fs::remove_dir(entry.path())
-                .or_else(|_| std::fs::remove_file(entry.path()));
+            let pruned =
+                std::fs::remove_dir(entry.path()).or_else(|_| std::fs::remove_file(entry.path()));
             pruned.map_err(|_| "cannot prune skill".to_string())?;
         }
     }
