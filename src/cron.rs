@@ -232,7 +232,9 @@ pub async fn post_delivery(
         card.components().unwrap_or_default()
     };
     if components.is_empty() {
-        crate::eprintln_stamped!("[discord] cron delivery for channel {channel} has an empty body; not posting");
+        crate::eprintln_stamped!(
+            "[discord] cron delivery for channel {channel} has an empty body; not posting"
+        );
         return true;
     }
     let mut retried = false;
@@ -245,19 +247,27 @@ pub async fn post_delivery(
                     .filter(|s| s.is_finite())
                     .unwrap_or(1.0)
                     .clamp(0.0, 30.0);
-                crate::eprintln_stamped!("[discord] cron delivery rate limited; retrying in {secs:.1}s");
+                crate::eprintln_stamped!(
+                    "[discord] cron delivery rate limited; retrying in {secs:.1}s"
+                );
                 tokio::time::sleep(Duration::from_secs_f64(secs)).await;
             }
             Err(TransportError::Http(400, body)) => {
-                crate::eprintln_stamped!("[discord] cron card rejected (HTTP 400): {body}; sending plain text");
+                crate::eprintln_stamped!(
+                    "[discord] cron card rejected (HTTP 400): {body}; sending plain text"
+                );
                 return send_plain(rest, channel, &card).await;
             }
             Err(TransportError::Invalid(msg)) => {
-                crate::eprintln_stamped!("[discord] cron card refused locally: {msg}; sending plain text");
+                crate::eprintln_stamped!(
+                    "[discord] cron card refused locally: {msg}; sending plain text"
+                );
                 return send_plain(rest, channel, &card).await;
             }
             Err(e) => {
-                crate::eprintln_stamped!("[discord] cron delivery to channel {channel} failed: {e:?}");
+                crate::eprintln_stamped!(
+                    "[discord] cron delivery to channel {channel} failed: {e:?}"
+                );
                 return false;
             }
         }
@@ -272,7 +282,9 @@ async fn send_plain(
     let pages = crate::pager::paginate(&card.parsed.body, 1900);
     for page in &pages {
         if let Err(e) = rest.send(channel, page, None).await {
-            crate::eprintln_stamped!("[discord] cron plain fallback to channel {channel} failed: {e:?}");
+            crate::eprintln_stamped!(
+                "[discord] cron plain fallback to channel {channel} failed: {e:?}"
+            );
             return false;
         }
     }

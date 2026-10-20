@@ -243,7 +243,9 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                 ) {
                     Ok(token) => state_tokens.push(token),
                     Err(e) => {
-                        crate::eprintln_stamped!("[discord] could not create cron button state: {e}");
+                        crate::eprintln_stamped!(
+                            "[discord] could not create cron button state: {e}"
+                        );
                         state_tokens.clear();
                         break;
                     }

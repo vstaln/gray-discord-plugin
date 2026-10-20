@@ -310,7 +310,9 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
         Command::Uninstall => {
             let line = crate::service::uninstall(config_path)?;
             println!("{line}");
-            println!("Private configuration and sessions retained; registered outgoing tool retained.");
+            println!(
+                "Private configuration and sessions retained; registered outgoing tool retained."
+            );
             Ok(())
         }
         Command::Install => {
