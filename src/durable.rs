@@ -974,6 +974,27 @@ impl Store {
         })
     }
 
+    /// Every `meta` row whose key starts with `prefix`, as (key, value)
+    /// pairs. `instr` is a starts-with test, so the prefix needs no
+    /// LIKE-wildcard escaping.
+    pub fn meta_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        with_conn(&self.path, |db| {
+            let mut stmt = db
+                .prepare("SELECT key, value FROM meta WHERE instr(key, ?1) = 1")
+                .map_err(|_| "cannot read meta".to_string())?;
+            let rows = stmt
+                .query_map(params![prefix], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|_| "cannot read meta".to_string())?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|_| "cannot read meta".to_string())?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Attach slash followup routing to an enqueued row (`/ask` path).
     pub fn set_interaction(&self, id: &str, token: &str, app_id: &str) -> Result<(), String> {
         with_conn(&self.path, |db| {

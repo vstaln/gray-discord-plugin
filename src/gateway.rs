@@ -1906,6 +1906,29 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         bot_id = ready.user.id.to_string();
                         app_id = Some(r_app_id.clone());
 
+                        // Messages sent while the daemon was down never
+                        // reach the shard — a sleeping hosted seat is the
+                        // common case — so replay them off the REST cursor
+                        // before live traffic resumes. Inbox dedupe covers
+                        // anything Discord also delivered live.
+                        let backfilled = crate::backfill::run(
+                            &rest,
+                            &store,
+                            &owner_id,
+                            &allowed,
+                            &bot_id,
+                            config
+                                .get("queue_capacity")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(1000),
+                        )
+                        .await;
+                        if backfilled > 0 {
+                            crate::eprintln_stamped!(
+                                "[discord] backfilled {backfilled} missed message(s)"
+                            );
+                        }
+
                         // `gray cmd` discovers what the binary answers
                         // headlessly; an old gray's failed fetch caches as
                         // a negative and the table stays static.
@@ -1928,6 +1951,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         let author_id = m.author.id.to_string();
                         let channel_id = m.channel_id.to_string();
                         let is_dm = m.guild_id.is_none();
+                        // Reconnect-backfill cursor: stamped on every seen
+                        // message, admitted or not, so replay only ever
+                        // picks up what arrived while we were down.
+                        crate::backfill::note_message(&store, &channel_id, &m.id.to_string());
                         // Receipt log: every message the gateway sees, by ID
                         // and surface. Never the content — this is the only
                         // way to tell "never DM'd" from "event never arrived".

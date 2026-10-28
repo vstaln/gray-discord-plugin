@@ -518,6 +518,26 @@ impl Rest {
         })
     }
 
+    /// GET /channels/{id}/messages?after=&limit= — the backfill cursor
+    /// replay. Discord serves newest-first; callers get oldest-first so a
+    /// cursor only ever moves forward.
+    pub async fn messages_after(
+        &self,
+        channel: u64,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<Value>, TransportError> {
+        let limit = limit.clamp(1, 100);
+        let value = self
+            .get(&format!(
+                "/channels/{channel}/messages?after={after}&limit={limit}"
+            ))
+            .await?;
+        let mut list = value.as_array().cloned().unwrap_or_default();
+        list.reverse();
+        Ok(list)
+    }
+
     /// GET channel + guild + member, then apply Discord's ordered channel
     /// overwrites (and the parent chain used by threads/categories).
     pub async fn effective_channel_permissions(

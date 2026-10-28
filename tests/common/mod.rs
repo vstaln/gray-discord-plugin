@@ -30,6 +30,10 @@ pub struct Stub {
     /// When set, `/channels/42` reports a guild channel (id 77) so doctor's
     /// permission path runs; the guild has a permissions-bearing role 78.
     pub channel_guild: Arc<Mutex<bool>>,
+    /// `GET /channels/{id}/messages` answers this object: {channel_id:
+    /// [message, ...]} in Discord's newest-first wire order. Backfill tests
+    /// seed the gap a cursor replays.
+    pub backfill_messages: Arc<Mutex<serde_json::Value>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -168,6 +172,7 @@ impl Stub {
         let edit_status: Arc<Mutex<Option<u16>>> = Arc::default();
         let edit_delay_ms: Arc<Mutex<u64>> = Arc::default();
         let channel_guild: Arc<Mutex<bool>> = Arc::default();
+        let backfill_messages: Arc<Mutex<serde_json::Value>> = Arc::default();
         let task = {
             let sent = sent.clone();
             let fail_auth = fail_auth.clone();
@@ -175,6 +180,7 @@ impl Stub {
             let edit_status = edit_status.clone();
             let edit_delay_ms = edit_delay_ms.clone();
             let channel_guild = channel_guild.clone();
+            let backfill_messages = backfill_messages.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -186,6 +192,7 @@ impl Stub {
                     let edit_status = edit_status.clone();
                     let edit_delay_ms = edit_delay_ms.clone();
                     let channel_guild = channel_guild.clone();
+                    let backfill_messages = backfill_messages.clone();
                     tokio::spawn(async move {
                         let Some((method, path, headers, body)) = read_request(&mut stream).await
                         else {
@@ -218,6 +225,25 @@ impl Stub {
                             .await;
                         } else if path == "/api/v10/guilds/77/members/123" {
                             respond(&mut stream, 200, r#"{"roles":["78"]}"#).await;
+                        } else if method == "GET"
+                            && path.split('?').next().is_some_and(|p| {
+                                p.starts_with("/api/v10/channels/") && p.ends_with("/messages")
+                            })
+                        {
+                            let channel = path
+                                .split('?')
+                                .next()
+                                .and_then(|p| p.strip_prefix("/api/v10/channels/"))
+                                .and_then(|p| p.strip_suffix("/messages"))
+                                .unwrap_or_default();
+                            let body = backfill_messages
+                                .lock()
+                                .unwrap()
+                                .get(channel)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]))
+                                .to_string();
+                            respond(&mut stream, 200, &body).await;
                         } else if (method == "PATCH" || method == "DELETE")
                             && path
                                 .strip_prefix("/api/v10/channels/42/messages/")
@@ -357,6 +383,7 @@ impl Stub {
             edit_status,
             edit_delay_ms,
             channel_guild,
+            backfill_messages,
             _task: task,
         }
     }
