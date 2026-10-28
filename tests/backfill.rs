@@ -56,6 +56,25 @@ fn cursor_roundtrip_and_ignores_garbage() {
     );
 }
 
+#[test]
+fn inbox_seeds_cursor_for_channels_never_seen_live() {
+    let (_dir, store) = store();
+    store.enqueue("500", "9", "old", Some("chat:9"), 1).unwrap();
+    store
+        .enqueue("700", "9", "newer", Some("chat:9"), 2)
+        .unwrap();
+    store
+        .enqueue("600", "10", "other", Some("chat:10"), 3)
+        .unwrap();
+    backfill::note_message(&store, "10", "650"); // stamped cursor wins
+    let mut got = backfill::cursors(&store);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("10".to_string(), 650u64), ("9".to_string(), 700u64)]
+    );
+}
+
 #[tokio::test]
 async fn enqueues_missed_dm_and_advances_cursor() {
     let (_dir, store) = store();
