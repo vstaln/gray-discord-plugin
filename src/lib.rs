@@ -2,6 +2,7 @@ pub mod activity;
 pub mod always_on;
 pub mod ask;
 pub mod attachments;
+pub mod backfill;
 pub mod budget;
 pub mod capabilities;
 pub mod cli;
