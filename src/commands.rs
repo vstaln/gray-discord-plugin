@@ -194,6 +194,12 @@ pub const COMMANDS: &[Command] = &[
         options: &[],
     },
     Command {
+        name: "sethome",
+        description: "Make this chat gray's home: where proactive messages go",
+        subcommands: &[],
+        options: &[],
+    },
+    Command {
         name: "steer",
         description: "Add guidance to the running turn",
         subcommands: &[],
@@ -280,6 +286,7 @@ pub enum Request {
     Steer {
         text: String,
     },
+    SetHome,
     /// A registry command `gray cmd` answers; built by `graycmd::route`.
     CmdRun {
         name: String,
@@ -334,6 +341,7 @@ pub fn parse(command: &str, subcommand: Option<&str>, values: &[(&str, &str)]) -
         ("status", _) => Some(Request::Status),
         ("new", _) | ("reset", _) => Some(Request::Reset),
         ("stop", _) => Some(Request::Stop),
+        ("sethome", _) => Some(Request::SetHome),
         ("steer", _) => needed("text").map(|text| Request::Steer { text }),
         _ => None,
     }

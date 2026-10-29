@@ -28,11 +28,20 @@ fn route_path(home: &Path) -> PathBuf {
     home.join("route.json")
 }
 
-pub fn write_route(home: &Path, channel: &str, chat: &str) {
+/// `dm` or `channel` for a conversation key (`session::conversation_key`):
+/// DMs are keyed `chat:{channel}`, server channels `chat:{channel}:user:{id}`.
+/// Plugins read it from route.json to keep personal data out of shared
+/// channels (gray-life, memory-style context).
+pub fn route_kind(conversation: &str) -> &'static str {
+    if conversation.contains(":user:") { "channel" } else { "dm" }
+}
+
+pub fn write_route(home: &Path, channel: &str, chat: &str, kind: &str) {
     let route = serde_json::json!({
         "platform": "discord",
         "chat": chat,
         "route": channel,
+        "kind": kind,
     });
     let _ = crate::config::atomic_json(&route_path(home), &route);
     #[cfg(unix)]
