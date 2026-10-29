@@ -1099,7 +1099,7 @@ where
             let chat = self
                 .session_id(&item.conversation)
                 .unwrap_or_else(|| item.conversation.clone());
-            crate::cron::write_route(&home, &item.channel, &chat);
+            crate::cron::write_route(&home, &item.channel, &chat, crate::cron::route_kind(&item.conversation));
         }
 
         let input = match item.input_json.as_deref() {
