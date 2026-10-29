@@ -70,10 +70,10 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "tools": [{
             "name": "discord_send",
             "label": "Discord Send",
-            "description": "Send markdown text to the owner's Discord channel. Put MEDIA:/absolute/path.png on its own line to upload files with it (images show as a gallery).",
+            "description": "Send markdown text to Discord: the home channel by default, or `target` dm / a channel ID. Put MEDIA:/absolute/path.png on its own line to upload files with it (images show as a gallery).",
             "parameters": {
                 "type": "object",
-                "properties": {"content": {"type": "string"}},
+                "properties": {"content": {"type": "string"}, "target": target_schema()},
                 "required": ["content"]
             }
         }, {
@@ -85,6 +85,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
                 "type": "object",
                 "properties": {
                     "document": message_document_schema(),
+                    "target": target_schema(),
                     "interaction_id": {"type": "string", "description": "Only when answering a Discord component interaction"}
                 },
                 "required": ["document"]
@@ -117,7 +118,8 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "send only: up to 10 files in one message"},
                     "caption": {"type": "string", "description": "send only: markdown shown above the files"},
                     "file_id": {"type": "string", "description": "Managed file ID; metadata/path actions only"},
-                    "conversation": {"type": "string", "description": "Conversation key used to scope a safe path"}
+                    "conversation": {"type": "string", "description": "Conversation key used to scope a safe path"},
+                    "target": target_schema()
                 }
             }
         }, {
@@ -206,19 +208,74 @@ fn session_cwd(params: &Value) -> std::path::PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// The `target` property every send tool shares.
+fn target_schema() -> Value {
+    json!({"type": "string", "description": "Where to post: \"home\" (default: the home channel set by /sethome or setup), \"dm\" (the owner's DM), or a channel ID"})
+}
+
+/// The `target` a tool call asked for, if any.
+fn requested_target(params: &Value) -> Option<String> {
+    params
+        .get("args")
+        .and_then(|a| a.get("target"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve a send `target` to a channel: `home`/absent is the configured
+/// `channel_id`, `dm` opens (or reuses) the owner's DM, anything else must
+/// be a channel ID. The bot's own Discord permissions bound where an
+/// explicit ID can actually land.
+pub(crate) async fn resolve_target(
+    config: &Value,
+    token: &str,
+    target: Option<&str>,
+) -> Result<u64, Value> {
+    let home = || {
+        config
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .and_then(|channel| channel.parse::<u64>().ok())
+            .ok_or_else(not_configured)
+    };
+    match target.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("home") => home(),
+        Some("dm") => {
+            let owner = config
+                .get("owner_id")
+                .and_then(Value::as_str)
+                .and_then(|o| o.parse::<u64>().ok())
+                .ok_or_else(|| not_sent("no owner is configured, so there is no DM to send to"))?;
+            let rest = crate::transport::Rest::production(token);
+            match tokio::time::timeout(std::time::Duration::from_secs(20), rest.create_dm(owner))
+                .await
+            {
+                Ok(Ok(channel)) => Ok(channel),
+                _ => Err(is_error()),
+            }
+        }
+        Some(other) => other
+            .parse::<u64>()
+            .ok()
+            .filter(|_| crate::config::snowflake(&Value::String(other.to_string())))
+            .ok_or_else(|| not_sent("target must be \"home\", \"dm\", or a Discord channel ID")),
+    }
+}
+
 /// Token and channel from config; `None` means the bridge is not set up.
-fn delivery_target(config_path: &Path) -> Result<(Value, String, u64), Value> {
+async fn delivery_target(
+    config_path: &Path,
+    target: Option<&str>,
+) -> Result<(Value, String, u64), Value> {
     let config = crate::config::load_config(config_path).map_err(|_| not_configured())?;
     let token = config
         .get("token")
         .and_then(Value::as_str)
         .ok_or_else(not_configured)?
         .to_string();
-    let channel = config
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .and_then(|channel| channel.parse::<u64>().ok())
-        .ok_or_else(not_configured)?;
+    let channel = resolve_target(&config, &token, target).await?;
     Ok((config, token, channel))
 }
 
@@ -231,10 +288,11 @@ async fn send_text(params: &Value, config_path: &Path) -> Value {
     if content.trim().is_empty() {
         return not_sent("content is empty");
     }
-    let (config, token, channel) = match delivery_target(config_path) {
-        Ok(target) => target,
-        Err(error) => return error,
-    };
+    let (config, token, channel) =
+        match delivery_target(config_path, requested_target(params).as_deref()).await {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
     let roots = crate::media_tags::roots_from_config(&config);
     let (prose, media) = crate::media_tags::extract(content, &session_cwd(params), &roots);
     let rest = crate::transport::Rest::production(&token);
@@ -326,10 +384,17 @@ async fn send_ui(params: &Value, config_path: &Path) -> Value {
     let Some(token) = config.get("token").and_then(Value::as_str) else {
         return is_error();
     };
-    let channel = config
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let channel = match requested_target(params) {
+        None => config
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Some(target) => match resolve_target(&config, token, Some(&target)).await {
+            Ok(channel) => channel.to_string(),
+            Err(error) => return error,
+        },
+    };
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let store = match Store::new(&parent.join("queue.sqlite")) {
         Ok(store) => store,
@@ -387,7 +452,7 @@ async fn send_ui(params: &Value, config_path: &Path) -> Value {
     {
         return is_error();
     }
-    let mut allocator = StoreAllocator::new(&store, &files, &document_id, owner.clone(), channel);
+    let mut allocator = StoreAllocator::new(&store, &files, &document_id, owner.clone(), &channel);
     allocator.one_shot = !matches!(
         request.document,
         UiDocument::Message(ref document) if document.lifecycle == crate::component_protocol::Lifecycle::Repeatable
@@ -599,10 +664,11 @@ async fn file_tool(params: &Value, config_path: &Path) -> Value {
         if raw_paths.is_empty() {
             return not_sent("action=send needs `path` or `paths`");
         }
-        let (config, token, channel) = match delivery_target(config_path) {
-            Ok(target) => target,
-            Err(error) => return error,
-        };
+        let (config, token, channel) =
+            match delivery_target(config_path, requested_target(params).as_deref()).await {
+                Ok(target) => target,
+                Err(error) => return error,
+            };
         let roots = crate::media_tags::roots_from_config(&config);
         let mut paths = Vec::new();
         for raw in &raw_paths {
