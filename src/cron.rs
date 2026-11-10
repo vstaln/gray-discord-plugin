@@ -33,7 +33,11 @@ fn route_path(home: &Path) -> PathBuf {
 /// Plugins read it from route.json to keep personal data out of shared
 /// channels (gray-life, memory-style context).
 pub fn route_kind(conversation: &str) -> &'static str {
-    if conversation.contains(":user:") { "channel" } else { "dm" }
+    if conversation.contains(":user:") {
+        "channel"
+    } else {
+        "dm"
+    }
 }
 
 pub fn write_route(home: &Path, channel: &str, chat: &str, kind: &str) {
