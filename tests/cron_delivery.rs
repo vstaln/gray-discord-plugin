@@ -19,7 +19,10 @@ fn the_route_becomes_the_origin_env() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     assert!(cron::origin_env(home).is_none(), "no route, no binding");
-    cron::write_route(home, "1234567890", "4f3c2b1a");
+    cron::write_route(home, "1234567890", "4f3c2b1a", "dm");
+    assert_eq!(cron::read_route(home).unwrap()["kind"], "dm");
+    assert_eq!(cron::route_kind("chat:1"), "dm");
+    assert_eq!(cron::route_kind("chat:1:user:2"), "channel");
     let raw = cron::origin_env(home).expect("bound");
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["platform"], "discord");
@@ -54,7 +57,7 @@ fn only_conversations_with_jobs_and_a_route_are_ticked() {
             std::fs::create_dir_all(home.join("cron")).unwrap();
         }
         if route {
-            cron::write_route(&home, "1", name);
+            cron::write_route(&home, "1", name, "dm");
         }
         home
     };
@@ -93,7 +96,7 @@ async fn a_tick_posts_back_through_gray_itself() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(home.join("cron")).unwrap();
-    cron::write_route(&home, "1234567890", "4f3c");
+    cron::write_route(&home, "1234567890", "4f3c", "dm");
     let exe = tmp.path().join("gray");
     write_exe(
         &exe,
@@ -159,7 +162,7 @@ JSON
         .join("conversations")
         .join(gray_discord::runner::hex_sha256(b"chat:one"));
     std::fs::create_dir_all(&conv_home).unwrap();
-    cron::write_route(&conv_home, "1234567890", "4f3c2b1a");
+    cron::write_route(&conv_home, "1234567890", "4f3c2b1a", "dm");
 
     let answer = gray_discord::runner::run_gray(
         &config,

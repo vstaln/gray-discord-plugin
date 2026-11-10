@@ -413,6 +413,31 @@ pub async fn handle(ctx: &Ctx<'_>, request: Request) {
                 .await;
             }
         }
+        Request::SetHome => {
+            let owner = ctx
+                .config
+                .get("owner_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if owner.is_empty() || owner != ctx.user_id {
+                let embed =
+                    commands::embed("Home", "Only the owner can move gray's home channel.", &[]);
+                return answer(ctx, &embed, &[], false).await;
+            }
+            let saved = crate::config::load_config(ctx.config_path).and_then(|mut config| {
+                config["channel_id"] = Value::String(ctx.channel_id.to_string());
+                crate::config::save_config(ctx.config_path, &config)
+            });
+            let embed = match saved {
+                Ok(()) => commands::embed(
+                    "Home set",
+                    "This chat is now gray's home. `discord_send` and `discord_file` post here unless they name another `target`.",
+                    &[],
+                ),
+                Err(e) => commands::embed("Home", format!("Could not save the home channel: {e}"), &[]),
+            };
+            answer(ctx, &embed, &[], false).await;
+        }
         Request::Status => {
             let depth = ctx.store.pending_count().unwrap_or(0);
             let (override_model, provider_model) = current_model(ctx);
