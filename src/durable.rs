@@ -995,6 +995,30 @@ impl Store {
         })
     }
 
+    /// Newest numeric inbox id per channel. Inbox ids are Discord message
+    /// (or interaction) snowflakes, so this is the last message the bot
+    /// handled there — the backfill cursor for channels that predate cursors
+    /// or were only ever written to while the daemon was down.
+    pub fn inbox_heads(&self) -> Result<Vec<(String, u64)>, String> {
+        with_conn(&self.path, |db| {
+            let mut stmt = db
+                .prepare(
+                    "SELECT channel, MAX(CAST(id AS INTEGER)) FROM inbox \
+                     WHERE id GLOB '[0-9]*' AND id NOT GLOB '*[^0-9]*' GROUP BY channel",
+                )
+                .map_err(|_| "cannot read inbox".to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|_| "cannot read inbox".to_string())?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (channel, id) = row.map_err(|_| "cannot read inbox".to_string())?;
+                out.push((channel, id as u64));
+            }
+            Ok(out)
+        })
+    }
+
     /// Attach slash followup routing to an enqueued row (`/ask` path).
     pub fn set_interaction(&self, id: &str, token: &str, app_id: &str) -> Result<(), String> {
         with_conn(&self.path, |db| {

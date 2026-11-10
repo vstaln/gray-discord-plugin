@@ -44,9 +44,12 @@ pub fn note_message(store: &Store, channel: &str, message_id: &str) {
     let _ = store.meta_set(&format!("{CURSOR_PREFIX}{channel}"), message_id);
 }
 
-/// Channel cursors as (channel_id, last_seen_message_id) pairs.
+/// Channel cursors as (channel_id, last_seen_message_id) pairs. A channel
+/// with no stamped cursor falls back to the newest message the inbox holds
+/// for it: a seat that only ever hears messages while asleep would otherwise
+/// never get a cursor and never backfill.
 pub fn cursors(store: &Store) -> Vec<(String, u64)> {
-    store
+    let mut out: Vec<(String, u64)> = store
         .meta_prefix(CURSOR_PREFIX)
         .unwrap_or_default()
         .into_iter()
@@ -54,7 +57,13 @@ pub fn cursors(store: &Store) -> Vec<(String, u64)> {
             let channel = key.strip_prefix(CURSOR_PREFIX)?.to_string();
             Some((channel, value.parse::<u64>().ok()?))
         })
-        .collect()
+        .collect();
+    for (channel, head) in store.inbox_heads().unwrap_or_default() {
+        if !channel.is_empty() && !out.iter().any(|(c, _)| *c == channel) {
+            out.push((channel, head));
+        }
+    }
+    out
 }
 
 /// Run a fetched message through the live admission policy. `None` means
