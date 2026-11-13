@@ -1747,6 +1747,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let runner_sink = activity.clone();
     let ask_rest = rest.clone();
     let ask_store = store.clone();
+    let model_store = store.clone();
     let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
@@ -1754,8 +1755,15 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let input = input.clone();
         let sink = runner_sink.clone();
         let ask = ask_handler(&ask_rest, &ask_store, &pth, &conv);
+        let store = model_store.clone();
         Box::pin(async move {
+            let model = store
+                .meta_get(&crate::commands::model_key(&conv))
+                .ok()
+                .flatten()
+                .filter(|m| !m.trim().is_empty());
             let opts = crate::runner::RunOpts {
+                model,
                 progress: Some(crate::activity::callback_for(sink, conv.clone())),
                 ask,
                 ..crate::runner::default_opts()
