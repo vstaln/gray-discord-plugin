@@ -194,9 +194,11 @@ pub fn deliverable(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
         return Err(format!("{} is larger than 25 MiB", canonical.display()));
     }
     if !roots.is_empty() && !roots.iter().any(|root| canonical.starts_with(root)) {
+        let allowed: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
         return Err(format!(
-            "{} is outside the configured media_roots",
-            canonical.display()
+            "{} is outside the configured media_roots (allowed: {}); copy it under one of those or add its folder to media_roots",
+            canonical.display(),
+            allowed.join(", ")
         ));
     }
     if is_sensitive(&canonical) {
