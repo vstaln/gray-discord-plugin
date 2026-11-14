@@ -1522,6 +1522,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     }
     let _remove_pid = RemovePid(pid_path);
 
+    let host_lock_dir = host_lock_dir();
+    let _host_lock = acquire_host_lock(&host_lock_dir, "discord", config_path)?;
     let Some(lock_file) = crate::runner::open_lock_file(&parent.join("gateway.lock"))
         .map_err(|_| "cannot open gateway lock".to_string())?
     else {
@@ -1747,6 +1749,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let runner_sink = activity.clone();
     let ask_rest = rest.clone();
     let ask_store = store.clone();
+    let model_store = store.clone();
     let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
@@ -1754,8 +1757,15 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let input = input.clone();
         let sink = runner_sink.clone();
         let ask = ask_handler(&ask_rest, &ask_store, &pth, &conv);
+        let store = model_store.clone();
         Box::pin(async move {
+            let model = store
+                .meta_get(&crate::commands::model_key(&conv))
+                .ok()
+                .flatten()
+                .filter(|m| !m.trim().is_empty());
             let opts = crate::runner::RunOpts {
+                model,
                 progress: Some(crate::activity::callback_for(sink, conv.clone())),
                 ask,
                 ..crate::runner::default_opts()
@@ -2397,4 +2407,68 @@ mod component_tests {
             Some("the hotfix branch")
         );
     }
+}
+
+fn host_lock_dir() -> PathBuf {
+    for key in ["GRAY_HOST_LOCK_DIR", "XDG_STATE_HOME"] {
+        if let Ok(v) = std::env::var(key) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return if key == "GRAY_HOST_LOCK_DIR" {
+                    PathBuf::from(t)
+                } else {
+                    PathBuf::from(t).join("gray").join("locks")
+                };
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t).join("gray").join("locks");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("gray")
+            .join("locks");
+    }
+    std::env::temp_dir().join("gray-locks")
+}
+
+fn acquire_host_lock(dir: &Path, role: &str, config_path: &Path) -> Result<std::fs::File, String> {
+    let mut db = std::fs::DirBuilder::new();
+    db.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        db.mode(0o700);
+    }
+    db.create(dir)
+        .map_err(|e| format!("cannot create host lock dir: {e}"))?;
+    let lock_path = dir.join(format!("{role}.lock"));
+    let Some(f) = crate::runner::open_lock_file(&lock_path)
+        .map_err(|e| format!("cannot open host lock: {e}"))?
+    else {
+        let rec_path = dir.join(format!("{role}.json"));
+        if let Ok(body) = std::fs::read_to_string(&rec_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                if let Some(pid) = v.get("pid").and_then(Value::as_u64) {
+                    return Err(format!(
+                        "Another {role} gateway is already running (pid {pid})"
+                    ));
+                }
+            }
+        }
+        return Err(format!("Another {role} gateway is already running"));
+    };
+    let rec = serde_json::json!({
+        "pid": std::process::id(),
+        "config": config_path.display().to_string(),
+    });
+    let _ = std::fs::write(dir.join(format!("{role}.json")), rec.to_string());
+    Ok(f)
 }
