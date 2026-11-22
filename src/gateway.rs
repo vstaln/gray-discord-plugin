@@ -2370,45 +2370,6 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod component_tests {
-    use super::autocomplete_choices;
-    use serde_json::json;
-
-    #[test]
-    fn autocomplete_choices_are_filtered_and_bounded() {
-        let state = json!({"options": [
-            {"label": "Gray Cloud", "value": "gray"},
-            {"label": "Local", "value": "local"},
-            {"label": "Other", "value": "other"}
-        ]});
-        let choices = autocomplete_choices(&json!({"query": "gr"}), &state);
-        assert_eq!(
-            choices,
-            vec![("Gray Cloud".to_string(), "gray".to_string())]
-        );
-    }
-
-    #[test]
-    fn a_label_wrapped_text_box_survives_twilight() {
-        // Discord's modal submit for the question card's text box.
-        let submit = serde_json::json!({
-            "custom_id": "ask:abc123:0:note",
-            "components": [{
-                "type": 18, "id": 1,
-                "component": {"type": 4, "id": 2, "custom_id": "note", "value": "the hotfix branch"}
-            }]
-        });
-        let data: twilight_model::application::interaction::modal::ModalInteractionData =
-            serde_json::from_value(submit).unwrap();
-        let raw = serde_json::to_value(&data.components).unwrap();
-        assert_eq!(
-            super::find_value(&raw, "note").as_deref(),
-            Some("the hotfix branch")
-        );
-    }
-}
-
 fn host_lock_dir() -> PathBuf {
     for key in ["GRAY_HOST_LOCK_DIR", "XDG_STATE_HOME"] {
         if let Ok(v) = std::env::var(key) {
@@ -2471,4 +2432,43 @@ fn acquire_host_lock(dir: &Path, role: &str, config_path: &Path) -> Result<std::
     });
     let _ = std::fs::write(dir.join(format!("{role}.json")), rec.to_string());
     Ok(f)
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::autocomplete_choices;
+    use serde_json::json;
+
+    #[test]
+    fn autocomplete_choices_are_filtered_and_bounded() {
+        let state = json!({"options": [
+            {"label": "Gray Cloud", "value": "gray"},
+            {"label": "Local", "value": "local"},
+            {"label": "Other", "value": "other"}
+        ]});
+        let choices = autocomplete_choices(&json!({"query": "gr"}), &state);
+        assert_eq!(
+            choices,
+            vec![("Gray Cloud".to_string(), "gray".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_label_wrapped_text_box_survives_twilight() {
+        // Discord's modal submit for the question card's text box.
+        let submit = serde_json::json!({
+            "custom_id": "ask:abc123:0:note",
+            "components": [{
+                "type": 18, "id": 1,
+                "component": {"type": 4, "id": 2, "custom_id": "note", "value": "the hotfix branch"}
+            }]
+        });
+        let data: twilight_model::application::interaction::modal::ModalInteractionData =
+            serde_json::from_value(submit).unwrap();
+        let raw = serde_json::to_value(&data.components).unwrap();
+        assert_eq!(
+            super::find_value(&raw, "note").as_deref(),
+            Some("the hotfix branch")
+        );
+    }
 }
