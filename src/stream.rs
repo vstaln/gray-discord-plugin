@@ -682,7 +682,10 @@ impl Timeline {
     /// frozen message's text is a prefix of what it now renders, and the
     /// rest of the turn follows it.
     fn after_stop(&self, cards: Vec<Card>) -> Vec<Card> {
-        let k = self.stop_prefix.unwrap_or(self.cards.len());
+        let k = self
+            .stop_prefix
+            .unwrap_or(self.cards.len())
+            .min(self.cards.len());
         if k == 0 || cards.len() < k {
             return cards;
         }
